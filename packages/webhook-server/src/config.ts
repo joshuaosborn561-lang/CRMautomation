@@ -29,6 +29,13 @@ const envSchema = z.object({
   ZOOM_ACCOUNT_ID: z.string().min(1),
   ZOOM_WEBHOOK_SECRET_TOKEN: z.string().optional(),
   ZOOM_WEBHOOK_VERIFICATION_TOKEN: z.string().optional(),
+
+  // Google Workspace / Gmail
+  GOOGLE_CLIENT_ID: z.string().min(1),
+  GOOGLE_CLIENT_SECRET: z.string().min(1),
+  GOOGLE_REFRESH_TOKEN: z.string().min(1),
+  GMAIL_USER_EMAIL: z.string().email().optional(),
+  GOOGLE_PUBSUB_TOPIC: z.string().optional(),
 });
 
 export type Config = z.infer<typeof envSchema>;

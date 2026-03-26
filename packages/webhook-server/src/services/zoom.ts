@@ -133,6 +133,21 @@ export async function getMeetingTranscript(meetingId: string): Promise<string | 
 }
 
 export async function getPhoneCallTranscript(callId: string): Promise<string | null> {
+  // Try the dedicated transcript download endpoint first
+  try {
+    const token = await getZoomAccessToken();
+    const response = await fetch(
+      `https://api.zoom.us/v2/phone/call_history/${callId}/recordings/transcript?access_token=${token}`
+    );
+    if (response.ok) {
+      const text = await response.text();
+      if (text && text.trim().length > 0) return text;
+    }
+  } catch {
+    // Fall through to recording-based approach
+  }
+
+  // Fallback: try to get transcript from recording files
   try {
     const recording = await getCallRecording(callId);
     if (!recording.download_url) return null;
@@ -146,6 +161,27 @@ export async function getPhoneCallTranscript(callId: string): Promise<string | n
     return await response.text();
   } catch (err) {
     logger.warn("Could not fetch phone call transcript", { callId, error: String(err) });
+    return null;
+  }
+}
+
+// Fetch full call details for enriching webhook events
+export async function getPhoneCallDetails(callId: string): Promise<{
+  call_id: string;
+  caller_number?: string;
+  callee_number?: string;
+  caller_name?: string;
+  callee_name?: string;
+  direction?: string;
+  duration?: number;
+  date_time?: string;
+  result?: string;
+} | null> {
+  try {
+    const data = await zoomFetch(`/phone/call_history/${callId}`);
+    return data as ReturnType<typeof getPhoneCallDetails> extends Promise<infer T> ? T : never;
+  } catch (err) {
+    logger.warn("Could not fetch phone call details", { callId, error: String(err) });
     return null;
   }
 }

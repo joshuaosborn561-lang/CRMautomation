@@ -2,7 +2,7 @@
 
 ## Overview
 
-A fully automated personal CRM system that eliminates manual data entry from a B2B outbound sales workflow. The system captures events from SmartLead, HeyReach, Zoom Phone, Zoom Meetings, and Zoom Mail — uses Claude to interpret each event — and updates Attio CRM automatically.
+A fully automated personal CRM system that eliminates manual data entry from a B2B outbound sales workflow. The system captures events from SmartLead, HeyReach, Zoom Phone, Zoom Meetings, and Gmail (Google Workspace) — uses Claude to interpret each event — and updates Attio CRM automatically.
 
 ## System Components
 
@@ -11,7 +11,7 @@ SmartLead ──webhook──┐
 HeyReach ──webhook──┤
 Zoom Phone ─webhook─┤    ┌──────────────┐    ┌───────────┐    ┌───────┐
 Zoom Meetings─wh────┼───>│ Webhook      │───>│ Claude AI │───>│ Attio │
-Zoom Mail ──polling─┘    │ Server       │    │ Processor │    │ CRM   │
+Gmail ──Pub/Sub push┘    │ Server       │    │ Processor │    │ CRM   │
                          │ (Railway)    │    └───────────┘    └───────┘
                          │              │
                          │ Supabase DB  │<── Nurture Engine (cron)

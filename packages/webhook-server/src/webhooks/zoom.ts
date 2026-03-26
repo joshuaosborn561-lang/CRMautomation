@@ -49,8 +49,13 @@ zoomRouter.post("/", async (req: Request, res: Response) => {
       const callId =
         payload.payload?.object?.call_id || payload.payload?.object?.id;
       if (callId) {
-        const transcript = await zoomService.getPhoneCallTranscript(callId);
+        // Fetch transcript and call details in parallel
+        const [transcript, callDetails] = await Promise.all([
+          zoomService.getPhoneCallTranscript(callId),
+          zoomService.getPhoneCallDetails(callId),
+        ]);
         if (transcript) enrichedPayload.transcript = transcript;
+        if (callDetails) enrichedPayload.call_details = callDetails;
       }
     }
 

@@ -9,7 +9,7 @@ CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
 -- ============================================================
 CREATE TABLE webhook_events (
   id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-  source TEXT NOT NULL CHECK (source IN ('smartlead', 'heyreach', 'zoom_phone', 'zoom_meeting', 'zoom_mail')),
+  source TEXT NOT NULL CHECK (source IN ('smartlead', 'heyreach', 'zoom_phone', 'zoom_meeting', 'gmail')),
   event_type TEXT NOT NULL,
   payload JSONB NOT NULL,
   received_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -115,3 +115,15 @@ ALTER TABLE review_queue ENABLE ROW LEVEL SECURITY;
 CREATE POLICY "Service role full access" ON webhook_events FOR ALL USING (true);
 CREATE POLICY "Service role full access" ON interaction_log FOR ALL USING (true);
 CREATE POLICY "Service role full access" ON review_queue FOR ALL USING (true);
+
+-- ============================================================
+-- Gmail Sync State (tracks Pub/Sub history ID per account)
+-- ============================================================
+CREATE TABLE gmail_sync_state (
+  email TEXT PRIMARY KEY,
+  history_id TEXT NOT NULL,
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+ALTER TABLE gmail_sync_state ENABLE ROW LEVEL SECURITY;
+CREATE POLICY "Service role full access" ON gmail_sync_state FOR ALL USING (true);

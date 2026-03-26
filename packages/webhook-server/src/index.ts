@@ -7,6 +7,7 @@ import { logger } from "./utils/logger";
 import { smartleadRouter } from "./webhooks/smartlead";
 import { heyreachRouter } from "./webhooks/heyreach";
 import { zoomRouter } from "./webhooks/zoom";
+import { gmailRouter } from "./webhooks/gmail";
 
 // API routes
 import { reviewRouter } from "./routes/review";
@@ -15,6 +16,7 @@ import { queryRouter } from "./routes/query";
 // Background jobs
 import { processEventQueue } from "./processors/event-pipeline";
 import { runNurtureCheck } from "./jobs/nurture-engine";
+import { setupGmailWatch } from "./services/gmail";
 
 const app = express();
 
@@ -30,6 +32,7 @@ app.get("/health", (_req, res) => {
 app.use("/webhooks/smartlead", smartleadRouter);
 app.use("/webhooks/heyreach", heyreachRouter);
 app.use("/webhooks/zoom", zoomRouter);
+app.use("/webhooks/gmail", gmailRouter);
 
 // API endpoints
 app.use("/api/review", reviewRouter);
@@ -56,6 +59,7 @@ app.listen(port, () => {
   logger.info("  POST /webhooks/smartlead");
   logger.info("  POST /webhooks/heyreach");
   logger.info("  POST /webhooks/zoom");
+  logger.info("  POST /webhooks/gmail");
   logger.info("API endpoints:");
   logger.info("  GET  /api/review");
   logger.info("  POST /api/review/:id/approve");
@@ -64,6 +68,12 @@ app.listen(port, () => {
   logger.info("  POST /api/query");
   logger.info("  GET  /api/status");
 });
+
+// --- Gmail Watch Setup ---
+// Gmail push notifications expire every 7 days, so set up on boot and renew daily
+setupGmailWatch().catch((err) =>
+  logger.warn("Gmail watch setup failed (will retry via cron)", { error: String(err) })
+);
 
 // --- Background Jobs ---
 
@@ -85,6 +95,17 @@ cron.schedule("0 * * * *", async () => {
   }
 });
 
+// Renew Gmail watch daily (expires every 7 days)
+cron.schedule("0 3 * * *", async () => {
+  try {
+    await setupGmailWatch();
+    logger.info("Gmail watch renewed");
+  } catch (err) {
+    logger.error("Gmail watch renewal failed", { error: String(err) });
+  }
+});
+
 logger.info("Background jobs scheduled:");
 logger.info("  Event queue processing: every 30 seconds");
 logger.info("  Nurture engine: every hour");
+logger.info("  Gmail watch renewal: daily at 3 AM");

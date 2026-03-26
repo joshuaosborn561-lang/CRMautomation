@@ -35,7 +35,7 @@ export const EVENT_SOURCES = [
   "heyreach",
   "zoom_phone",
   "zoom_meeting",
-  "zoom_mail",
+  "gmail",
 ] as const;
 
 export type EventSource = (typeof EVENT_SOURCES)[number];

@@ -106,8 +106,8 @@ function buildPrompt(event: WebhookEvent): string {
     case "zoom_meeting":
       context = buildZoomMeetingContext(payload);
       break;
-    case "zoom_mail":
-      context = buildZoomMailContext(payload);
+    case "gmail":
+      context = buildGmailContext(payload);
       break;
     default:
       context = `Unknown source: ${source}\n${JSON.stringify(payload, null, 2)}`;
@@ -174,36 +174,86 @@ function buildHeyReachContext(payload: Record<string, unknown>): string {
 function buildZoomPhoneContext(payload: Record<string, unknown>): string {
   const p = payload.payload as Record<string, unknown> | undefined;
   const obj = p?.object as Record<string, unknown> | undefined;
-  return `Zoom Phone Call Event:
-- Caller: ${obj?.caller_number || "unknown"} (${obj?.caller_name || "unknown"})
-- Callee: ${obj?.callee_number || "unknown"} (${obj?.callee_name || "unknown"})
-- Direction: ${obj?.direction || "unknown"}
-- Duration: ${obj?.duration || "unknown"} seconds
-- Date/Time: ${obj?.date_time || "unknown"}
-- Transcript: ${(payload as Record<string, unknown>).transcript || "Not available"}`;
+  const callDetails = payload.call_details as Record<string, unknown> | undefined;
+  const transcript = payload.transcript as string | undefined;
+
+  let context = `Zoom Phone Call Event:
+- Caller: ${callDetails?.caller_number || obj?.caller_number || "unknown"} (${callDetails?.caller_name || obj?.caller_name || "unknown"})
+- Callee: ${callDetails?.callee_number || obj?.callee_number || "unknown"} (${callDetails?.callee_name || obj?.callee_name || "unknown"})
+- Direction: ${callDetails?.direction || obj?.direction || "unknown"}
+- Duration: ${callDetails?.duration || obj?.duration || "unknown"} seconds
+- Date/Time: ${callDetails?.date_time || obj?.date_time || "unknown"}
+- Call Result: ${callDetails?.result || "unknown"}`;
+
+  if (transcript) {
+    context += `
+
+FULL CALL TRANSCRIPT:
+${transcript}
+
+IMPORTANT: You have the full transcript above. Please:
+1. Summarize the key points of the conversation (not a verbatim recap — a concise executive summary)
+2. Identify the prospect's level of interest and any objections raised
+3. Note any specific commitments, next steps, or action items discussed
+4. Flag if pricing, budget, timeline, or decision-makers were mentioned
+5. Determine the appropriate deal stage based on what was discussed`;
+  } else {
+    context += `\n- Transcript: Not available (call may not have been recorded, or transcript is still processing)`;
+  }
+
+  return context;
 }
 
 function buildZoomMeetingContext(payload: Record<string, unknown>): string {
   const p = payload.payload as Record<string, unknown> | undefined;
   const obj = p?.object as Record<string, unknown> | undefined;
-  return `Zoom Meeting Event:
+  const transcript = payload.transcript as string | undefined;
+
+  let context = `Zoom Meeting Event:
 - Meeting Topic: ${obj?.topic || "unknown"}
 - Meeting ID: ${obj?.id || "unknown"}
 - Host: ${obj?.host_email || "unknown"}
 - Duration: ${obj?.duration || "unknown"} minutes
 - Participants: ${JSON.stringify((obj as Record<string, unknown>)?.participants || [])}
-- Start Time: ${obj?.start_time || "unknown"}
-- Transcript: ${(payload as Record<string, unknown>).transcript || "Not available"}
-- AI Summary: ${(payload as Record<string, unknown>).ai_summary || "Not available"}`;
+- Start Time: ${obj?.start_time || "unknown"}`;
+
+  if (transcript) {
+    context += `
+
+FULL MEETING TRANSCRIPT:
+${transcript}
+
+IMPORTANT: You have the full meeting transcript above. Please:
+1. Provide a concise executive summary of the meeting (key discussion points, not verbatim)
+2. Identify the prospect's interest level, concerns, and objections
+3. Note any commitments, next steps, or action items agreed upon
+4. Flag if pricing, budget, timeline, authority, or decision process were discussed
+5. Determine the appropriate deal stage based on what was discussed
+6. If this was a discovery call, capture the prospect's pain points and needs`;
+  } else {
+    context += `\n- Transcript: Not available (recording may still be processing — transcripts can take up to 2x the meeting duration)`;
+  }
+
+  return context;
 }
 
-function buildZoomMailContext(payload: Record<string, unknown>): string {
-  return `Zoom Mail Event:
+function buildGmailContext(payload: Record<string, unknown>): string {
+  return `Gmail Email Event:
 - From: ${payload.from || "unknown"}
 - To: ${payload.to || "unknown"}
 - Subject: ${payload.subject || "unknown"}
-- Body Preview: ${payload.body || payload.text || "Not available"}
-- Date: ${payload.date || "unknown"}`;
+- Date: ${payload.date || "unknown"}
+- Thread ID: ${payload.thread_id || "unknown"}
+
+Email Body:
+${payload.body || payload.snippet || "Not available"}
+
+IMPORTANT: Analyze this email in the context of a B2B sales pipeline. Determine:
+1. Is this from a prospect or someone relevant to a deal?
+2. What is the sentiment and intent of the email?
+3. Were any commitments, next steps, or action items mentioned?
+4. Was pricing, timeline, or decision-making discussed?
+If this appears to be a non-sales email (newsletter, notification, internal), set sentiment to "neutral" and note it in the summary.`;
 }
 
 // --- Query Processing ---
