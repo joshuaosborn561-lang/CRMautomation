@@ -1,0 +1,17 @@
+{
+  "name": "crm-autopilot",
+  "private": true,
+  "workspaces": [
+    "packages/*"
+  ],
+  "scripts": {
+    "dev:server": "npm run dev --workspace=packages/webhook-server",
+    "dev:query": "npm run dev --workspace=packages/query-app",
+    "build": "npm run build --workspaces",
+    "build:server": "npm run build --workspace=packages/webhook-server",
+    "build:query": "npm run build --workspace=packages/query-app"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  }
+}
