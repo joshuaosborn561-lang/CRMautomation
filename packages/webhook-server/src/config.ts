@@ -20,6 +20,7 @@ const envSchema = z.object({
 
   SMARTLEAD_API_KEY: z.string().min(1),
   SMARTLEAD_WEBHOOK_SECRET: z.string().optional(),
+  SMARTLEAD_NURTURE_CAMPAIGN_ID: z.string().optional(),
 
   HEYREACH_API_KEY: z.string().min(1),
   HEYREACH_WEBHOOK_SECRET: z.string().optional(),

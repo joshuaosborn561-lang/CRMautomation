@@ -117,6 +117,34 @@ CREATE POLICY "Service role full access" ON interaction_log FOR ALL USING (true)
 CREATE POLICY "Service role full access" ON review_queue FOR ALL USING (true);
 
 -- ============================================================
+-- Nurture Queue (prospects pending your approval to push to SmartLead)
+-- ============================================================
+CREATE TABLE nurture_queue (
+  id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+  contact_email TEXT NOT NULL,
+  contact_first_name TEXT,
+  contact_last_name TEXT,
+  contact_company TEXT,
+  deal_id TEXT NOT NULL,
+  smartlead_campaign_id INTEGER,
+  nurture_reason TEXT NOT NULL,
+  last_positive_summary TEXT NOT NULL,
+  last_positive_source TEXT NOT NULL,
+  last_positive_at TIMESTAMPTZ NOT NULL,
+  days_silent INTEGER NOT NULL,
+  status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'approved', 'rejected', 'pushed')),
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  reviewed_at TIMESTAMPTZ,
+  pushed_at TIMESTAMPTZ
+);
+
+CREATE INDEX idx_nurture_queue_status ON nurture_queue(status) WHERE status = 'pending';
+CREATE INDEX idx_nurture_queue_email ON nurture_queue(contact_email);
+
+ALTER TABLE nurture_queue ENABLE ROW LEVEL SECURITY;
+CREATE POLICY "Service role full access" ON nurture_queue FOR ALL USING (true);
+
+-- ============================================================
 -- Gmail Sync State (tracks Pub/Sub history ID per account)
 -- ============================================================
 CREATE TABLE gmail_sync_state (

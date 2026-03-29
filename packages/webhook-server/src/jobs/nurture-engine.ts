@@ -1,30 +1,33 @@
 import { logger } from "../utils/logger";
 import { getSupabase } from "../utils/supabase";
 import {
-  getLastPositiveInteraction,
   getInteractionsByContact,
   logInteraction,
+  addToNurtureQueue,
 } from "../services/event-store";
 import {
   findContact,
   findDealByContact,
   updateDealStage,
   createNote,
-  createTask,
 } from "../services/attio";
-import { DEAL_STAGE_LABELS } from "@crm-autopilot/shared";
 
-const SILENCE_THRESHOLD_DAYS = 5;
+const SILENCE_THRESHOLD_DAYS = 2;
 
 // Nurture rules:
-// A deal moves to Nurture ONLY if the prospect showed genuine interest first,
-// then went silent for 5+ days. Someone who never responded is NOT a nurture.
+// A deal is eligible for nurture ONLY if the prospect showed genuine interest
+// first, then went silent for 2+ days. Someone who never responded is NOT a nurture.
 //
 // Specific triggers:
-// 1. Replied positively to cold email -> we followed up -> silent 5 days
-// 2. Booked meeting -> no-showed -> no follow-up response after 5 days
-// 3. Cold call -> agreed to next steps -> never replied to follow-up email after 5 days
-// 4. LinkedIn message expressing interest -> we replied -> silent 5 days
+// 1. Replied positively to cold email -> we followed up -> silent 2 days
+// 2. Booked meeting -> no-showed -> no follow-up response after 2 days
+// 3. Cold call -> agreed to next steps -> never replied to follow-up email after 2 days
+// 4. LinkedIn message expressing interest -> we replied -> silent 2 days
+//
+// When detected, the system:
+// 1. Queues the prospect for YOUR APPROVAL in the nurture queue
+// 2. When you approve, pushes them into your SmartLead nurture campaign
+// 3. Updates the deal stage to Nurture in Attio with full context
 
 export async function runNurtureCheck(): Promise<void> {
   logger.info("Running nurture engine check");
@@ -85,7 +88,7 @@ async function checkContactForNurture(
   // Check if the last positive interaction was before the silence threshold
   if (lastPositiveDate >= silenceThreshold) return;
 
-  // Check if there have been any interactions (from them) after the positive one
+  // Check if there have been any positive interactions after the last one
   const interactionsAfterPositive = interactions.filter((i) => {
     const iDate = new Date(i.occurred_at);
     return iDate > lastPositiveDate && i.sentiment === "positive";
@@ -94,14 +97,13 @@ async function checkContactForNurture(
   // If they've had subsequent positive interactions, they're not silent
   if (interactionsAfterPositive.length > 0) return;
 
-  // This contact qualifies for nurture — check if they're already in nurture
+  // Check if they're already in nurture or closed
   const contact = await findContact(email);
   if (!contact) return;
 
   const deal = await findDealByContact(contact.id);
   if (!deal) return;
 
-  // Don't move closed deals to nurture
   if (
     deal.stage === "Closed Won" ||
     deal.stage === "Closed Lost" ||
@@ -114,70 +116,114 @@ async function checkContactForNurture(
     (Date.now() - lastPositiveDate.getTime()) / (1000 * 60 * 60 * 24)
   );
 
+  const sourceLabel = getSourceLabel(lastPositive.source);
   const nurtureReason = buildNurtureReason(lastPositive, daysSilent);
 
-  logger.info("Moving deal to nurture", {
+  logger.info("Queueing prospect for nurture approval", {
     email,
     dealId: deal.id,
     daysSilent,
-    lastPositive: lastPositive.summary,
   });
 
-  // Move to nurture
-  await updateDealStage(deal.id, "nurture");
+  // Queue for approval — don't auto-push
+  await addToNurtureQueue({
+    contact_email: email,
+    contact_first_name: undefined,
+    contact_last_name: undefined,
+    contact_company: undefined,
+    deal_id: deal.id,
+    nurture_reason: nurtureReason,
+    last_positive_summary: lastPositive.summary,
+    last_positive_source: lastPositive.source,
+    last_positive_at: lastPositive.occurred_at,
+    days_silent: daysSilent,
+  });
+}
 
-  // Log a detailed note with full context
+// Called when you approve a nurture — pushes to SmartLead and updates Attio
+export async function executeNurture(
+  nurtureItem: {
+    contact_email: string;
+    contact_first_name?: string;
+    contact_last_name?: string;
+    contact_company?: string;
+    deal_id: string;
+    nurture_reason: string;
+    days_silent: number;
+    last_positive_summary: string;
+    last_positive_source: string;
+  },
+  smartleadCampaignId: number
+): Promise<void> {
+  const { addLeadToCampaign } = await import("../services/smartlead");
+
+  // 1. Push lead into SmartLead nurture campaign
+  await addLeadToCampaign(smartleadCampaignId, {
+    email: nurtureItem.contact_email,
+    first_name: nurtureItem.contact_first_name,
+    last_name: nurtureItem.contact_last_name,
+    company: nurtureItem.contact_company,
+    custom_fields: {
+      nurture_reason: nurtureItem.nurture_reason,
+      last_interaction: nurtureItem.last_positive_summary,
+    },
+  });
+
+  // 2. Move deal to Nurture in Attio
+  await updateDealStage(nurtureItem.deal_id, "nurture");
+
+  // 3. Log a note on the deal
   await createNote({
     parent_object: "deals",
-    parent_id: deal.id,
-    title: `Moved to Nurture — ${daysSilent} days silent`,
-    content: nurtureReason,
+    parent_id: nurtureItem.deal_id,
+    title: `Moved to Nurture — ${nurtureItem.days_silent} days silent — added to SmartLead sequence`,
+    content: `${nurtureItem.nurture_reason}\n\nACTION TAKEN: Added to SmartLead nurture campaign #${smartleadCampaignId}`,
   });
 
-  // Create a re-engagement task with full context
-  await createTask({
-    title: `Re-engage: ${email}`,
-    description: `This prospect went silent after showing interest.\n\n${nurtureReason}\n\nSuggested action: Reference their original interest and provide additional value.`,
-    linked_deal_id: deal.id,
-    due_date: new Date(Date.now() + 2 * 24 * 60 * 60 * 1000).toISOString(), // 2 days from now
-  });
-
-  // Log this as an interaction
+  // 4. Log the interaction
   await logInteraction({
-    contact_email: email,
-    source: lastPositive.source,
-    event_type: "nurture_triggered",
-    summary: `Automatically moved to Nurture after ${daysSilent} days of silence following positive engagement.`,
+    contact_email: nurtureItem.contact_email,
+    deal_id: nurtureItem.deal_id,
+    source: nurtureItem.last_positive_source as any,
+    event_type: "nurture_sequence_started",
+    summary: `Approved for nurture. Added to SmartLead campaign #${smartleadCampaignId} after ${nurtureItem.days_silent} days of silence.`,
     sentiment: "neutral",
-    raw_event_id: lastPositive.raw_event_id,
+    raw_event_id: "",
     occurred_at: new Date().toISOString(),
   });
+
+  logger.info("Nurture executed — lead pushed to SmartLead", {
+    email: nurtureItem.contact_email,
+    campaignId: smartleadCampaignId,
+  });
+}
+
+function getSourceLabel(source: string): string {
+  switch (source) {
+    case "smartlead": return "cold email reply";
+    case "heyreach": return "LinkedIn message";
+    case "zoom_phone": return "phone call";
+    case "zoom_meeting": return "meeting";
+    case "gmail": return "email";
+    default: return "interaction";
+  }
 }
 
 function buildNurtureReason(
   lastPositive: { summary: string; source: string; occurred_at: string },
   daysSilent: number
 ): string {
-  const sourceLabel =
-    lastPositive.source === "smartlead"
-      ? "cold email reply"
-      : lastPositive.source === "heyreach"
-        ? "LinkedIn message"
-        : lastPositive.source === "zoom_phone"
-          ? "phone call"
-          : lastPositive.source === "zoom_meeting"
-            ? "meeting"
-            : "interaction";
+  const sourceLabel = getSourceLabel(lastPositive.source);
 
   return `WHY NURTURE:
-This prospect engaged via ${sourceLabel} on ${new Date(lastPositive.occurred_at).toLocaleDateString()} and then went silent.
+This prospect engaged via ${sourceLabel} on ${new Date(lastPositive.occurred_at).toLocaleDateString()} and then went silent for ${daysSilent} days.
 
-LAST POSITIVE INTERACTION (${daysSilent} days ago):
+LAST POSITIVE INTERACTION:
 ${lastPositive.summary}
 
 SOURCE: ${lastPositive.source}
 DATE: ${new Date(lastPositive.occurred_at).toLocaleString()}
 
 CONTEXT FOR RE-ENGAGEMENT:
-They originally showed interest through a ${sourceLabel}. Reference what they responded to and provide additional value to re-engage.`;
+They originally showed interest through a ${sourceLabel}. Your SmartLead nurture sequence should reference what they responded to and provide additional value.`;
 }

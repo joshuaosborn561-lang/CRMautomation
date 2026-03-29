@@ -169,6 +169,108 @@ export async function getLastPositiveInteraction(
   return (data?.[0] as InteractionLog) || null;
 }
 
+// --- Nurture Sequence Queue ---
+
+export interface NurtureQueueItem {
+  id: string;
+  contact_email: string;
+  contact_first_name?: string;
+  contact_last_name?: string;
+  contact_company?: string;
+  deal_id: string;
+  smartlead_campaign_id?: number;
+  nurture_reason: string;
+  last_positive_summary: string;
+  last_positive_source: string;
+  last_positive_at: string;
+  days_silent: number;
+  status: "pending" | "approved" | "rejected" | "pushed";
+  created_at: string;
+  reviewed_at?: string;
+  pushed_at?: string;
+}
+
+export async function addToNurtureQueue(item: Omit<NurtureQueueItem, "id" | "status" | "created_at">): Promise<string> {
+  const supabase = getSupabase();
+
+  // Don't add duplicates
+  const { data: existing } = await supabase
+    .from("nurture_queue")
+    .select("id")
+    .eq("contact_email", item.contact_email)
+    .in("status", ["pending", "approved"])
+    .limit(1);
+
+  if (existing && existing.length > 0) {
+    logger.info("Contact already in nurture queue", { email: item.contact_email });
+    return existing[0].id;
+  }
+
+  const { data, error } = await supabase
+    .from("nurture_queue")
+    .insert({
+      ...item,
+      status: "pending",
+      created_at: new Date().toISOString(),
+    })
+    .select("id")
+    .single();
+
+  if (error) throw error;
+  logger.info("Added to nurture queue", { id: data.id, email: item.contact_email });
+  return data.id;
+}
+
+export async function getPendingNurtures(): Promise<NurtureQueueItem[]> {
+  const supabase = getSupabase();
+  const { data, error } = await supabase
+    .from("nurture_queue")
+    .select("*")
+    .eq("status", "pending")
+    .order("created_at", { ascending: true });
+
+  if (error) throw error;
+  return (data || []) as NurtureQueueItem[];
+}
+
+export async function approveNurture(nurtureId: string): Promise<NurtureQueueItem> {
+  const supabase = getSupabase();
+  const { data, error } = await supabase
+    .from("nurture_queue")
+    .update({
+      status: "approved",
+      reviewed_at: new Date().toISOString(),
+    })
+    .eq("id", nurtureId)
+    .select("*")
+    .single();
+
+  if (error) throw error;
+  return data as NurtureQueueItem;
+}
+
+export async function rejectNurture(nurtureId: string): Promise<void> {
+  const supabase = getSupabase();
+  await supabase
+    .from("nurture_queue")
+    .update({
+      status: "rejected",
+      reviewed_at: new Date().toISOString(),
+    })
+    .eq("id", nurtureId);
+}
+
+export async function markNurturePushed(nurtureId: string): Promise<void> {
+  const supabase = getSupabase();
+  await supabase
+    .from("nurture_queue")
+    .update({
+      status: "pushed",
+      pushed_at: new Date().toISOString(),
+    })
+    .eq("id", nurtureId);
+}
+
 // --- Nurture Tracking ---
 
 export async function getDealsForNurtureCheck(): Promise<

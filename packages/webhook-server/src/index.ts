@@ -11,6 +11,7 @@ import { gmailRouter } from "./webhooks/gmail";
 
 // API routes
 import { reviewRouter } from "./routes/review";
+import { nurtureRouter } from "./routes/nurture";
 import { queryRouter } from "./routes/query";
 
 // Background jobs
@@ -36,6 +37,7 @@ app.use("/webhooks/gmail", gmailRouter);
 
 // API endpoints
 app.use("/api/review", reviewRouter);
+app.use("/api/nurture", nurtureRouter);
 app.use("/api/query", queryRouter);
 
 // Status endpoint — overview of system state

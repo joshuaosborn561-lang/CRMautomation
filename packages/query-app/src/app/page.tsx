@@ -17,13 +17,27 @@ interface ReviewItem {
   task?: { title: string; description: string };
 }
 
+interface NurtureItem {
+  id: string;
+  contact_email: string;
+  deal_id: string;
+  days_silent: number;
+  last_positive_summary: string;
+  last_positive_source: string;
+  last_positive_at: string;
+  nurture_reason: string;
+  created_at: string;
+}
+
 export default function Home() {
   const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState("");
   const [loading, setLoading] = useState(false);
-  const [tab, setTab] = useState<"query" | "review">("query");
+  const [tab, setTab] = useState<"query" | "review" | "nurture">("query");
   const [reviews, setReviews] = useState<ReviewItem[]>([]);
   const [reviewLoading, setReviewLoading] = useState(false);
+  const [nurtures, setNurtures] = useState<NurtureItem[]>([]);
+  const [nurtureLoading, setNurtureLoading] = useState(false);
   const messagesEndRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -32,6 +46,7 @@ export default function Home() {
 
   useEffect(() => {
     if (tab === "review") loadReviews();
+    if (tab === "nurture") loadNurtures();
   }, [tab]);
 
   async function loadReviews() {
@@ -44,6 +59,18 @@ export default function Home() {
       setReviews([]);
     }
     setReviewLoading(false);
+  }
+
+  async function loadNurtures() {
+    setNurtureLoading(true);
+    try {
+      const res = await fetch("/api/nurture");
+      const data = await res.json();
+      setNurtures(data.prospects || []);
+    } catch {
+      setNurtures([]);
+    }
+    setNurtureLoading(false);
   }
 
   async function handleSubmit(e: React.FormEvent) {
@@ -84,11 +111,34 @@ export default function Home() {
     }
   }
 
+  async function handleNurtureAction(id: string, action: "approve" | "reject") {
+    try {
+      await fetch(`/api/nurture/${id}/${action}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+      });
+      setNurtures((prev) => prev.filter((n) => n.id !== id));
+    } catch {
+      // ignore
+    }
+  }
+
+  const sourceLabel = (source: string) => {
+    switch (source) {
+      case "smartlead": return "Cold Email";
+      case "heyreach": return "LinkedIn";
+      case "zoom_phone": return "Phone Call";
+      case "zoom_meeting": return "Meeting";
+      case "gmail": return "Email";
+      default: return source;
+    }
+  };
+
   return (
     <div style={{ maxWidth: 800, margin: "0 auto", padding: "2rem 1rem" }}>
       <h1 style={{ fontSize: "1.5rem", marginBottom: "0.5rem" }}>CRM Autopilot</h1>
       <p style={{ color: "#888", marginBottom: "1.5rem", fontSize: "0.9rem" }}>
-        Ask questions about your pipeline or review pending CRM updates
+        Ask questions about your pipeline, review CRM updates, or approve nurture sequences
       </p>
 
       {/* Tabs */}
@@ -118,6 +168,19 @@ export default function Home() {
           }}
         >
           Review Queue {reviews.length > 0 && `(${reviews.length})`}
+        </button>
+        <button
+          onClick={() => setTab("nurture")}
+          style={{
+            padding: "0.5rem 1rem",
+            background: tab === "nurture" ? "#333" : "transparent",
+            color: tab === "nurture" ? "#fff" : "#888",
+            border: "1px solid #333",
+            borderRadius: 6,
+            cursor: "pointer",
+          }}
+        >
+          Nurture Queue {nurtures.length > 0 && `(${nurtures.length})`}
         </button>
       </div>
 
@@ -344,6 +407,132 @@ export default function Home() {
           {!reviewLoading && reviews.length === 0 && (
             <p style={{ color: "#555", textAlign: "center", marginTop: "3rem" }}>
               No pending reviews. All caught up!
+            </p>
+          )}
+        </div>
+      )}
+
+      {/* Nurture Tab */}
+      {tab === "nurture" && (
+        <div>
+          <div
+            style={{
+              display: "flex",
+              justifyContent: "space-between",
+              alignItems: "center",
+              marginBottom: "1rem",
+            }}
+          >
+            <span style={{ color: "#888" }}>
+              {nurtures.length} prospect{nurtures.length !== 1 ? "s" : ""} ready for nurture
+            </span>
+            <button
+              onClick={loadNurtures}
+              style={{
+                padding: "0.25rem 0.75rem",
+                background: "#222",
+                color: "#888",
+                border: "1px solid #333",
+                borderRadius: 6,
+                cursor: "pointer",
+                fontSize: "0.8rem",
+              }}
+            >
+              Refresh
+            </button>
+          </div>
+
+          {nurtureLoading && <p style={{ color: "#888" }}>Loading...</p>}
+
+          {nurtures.map((item) => (
+            <div
+              key={item.id}
+              style={{
+                marginBottom: "1rem",
+                padding: "1rem",
+                border: "1px solid #222",
+                borderRadius: 8,
+                background: "#111",
+              }}
+            >
+              <div
+                style={{
+                  display: "flex",
+                  justifyContent: "space-between",
+                  marginBottom: "0.5rem",
+                }}
+              >
+                <span
+                  style={{
+                    fontSize: "0.75rem",
+                    color: "#f59e0b",
+                    fontWeight: 600,
+                  }}
+                >
+                  {item.days_silent} DAYS SILENT
+                </span>
+                <span style={{ fontSize: "0.75rem", color: "#888" }}>
+                  via {sourceLabel(item.last_positive_source)}
+                </span>
+              </div>
+
+              <h3 style={{ margin: "0 0 0.25rem", fontSize: "1rem" }}>
+                {item.contact_email}
+              </h3>
+
+              <p
+                style={{
+                  margin: "0.5rem 0",
+                  fontSize: "0.85rem",
+                  color: "#ccc",
+                  lineHeight: 1.4,
+                }}
+              >
+                <strong style={{ color: "#aaa" }}>Last positive interaction:</strong>{" "}
+                {item.last_positive_summary}
+              </p>
+
+              <p style={{ margin: "0 0 0.75rem", fontSize: "0.8rem", color: "#888" }}>
+                Last engaged: {new Date(item.last_positive_at).toLocaleDateString()}
+              </p>
+
+              <div style={{ display: "flex", gap: "0.5rem" }}>
+                <button
+                  onClick={() => handleNurtureAction(item.id, "approve")}
+                  style={{
+                    padding: "0.4rem 1rem",
+                    background: "#f59e0b",
+                    color: "#000",
+                    border: "none",
+                    borderRadius: 6,
+                    cursor: "pointer",
+                    fontSize: "0.85rem",
+                    fontWeight: 600,
+                  }}
+                >
+                  Push to SmartLead Nurture
+                </button>
+                <button
+                  onClick={() => handleNurtureAction(item.id, "reject")}
+                  style={{
+                    padding: "0.4rem 1rem",
+                    background: "transparent",
+                    color: "#888",
+                    border: "1px solid #333",
+                    borderRadius: 6,
+                    cursor: "pointer",
+                    fontSize: "0.85rem",
+                  }}
+                >
+                  Skip
+                </button>
+              </div>
+            </div>
+          ))}
+
+          {!nurtureLoading && nurtures.length === 0 && (
+            <p style={{ color: "#555", textAlign: "center", marginTop: "3rem" }}>
+              No prospects pending nurture. All caught up!
             </p>
           )}
         </div>
