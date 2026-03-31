@@ -176,6 +176,7 @@ function buildZoomPhoneContext(payload: Record<string, unknown>): string {
   const obj = p?.object as Record<string, unknown> | undefined;
   const callDetails = payload.call_details as Record<string, unknown> | undefined;
   const transcript = payload.transcript as string | undefined;
+  const apolloContact = payload.apollo_contact as Record<string, unknown> | undefined;
 
   let context = `Zoom Phone Call Event:
 - Caller: ${callDetails?.caller_number || obj?.caller_number || "unknown"} (${callDetails?.caller_name || obj?.caller_name || "unknown"})
@@ -184,6 +185,24 @@ function buildZoomPhoneContext(payload: Record<string, unknown>): string {
 - Duration: ${callDetails?.duration || obj?.duration || "unknown"} seconds
 - Date/Time: ${callDetails?.date_time || obj?.date_time || "unknown"}
 - Call Result: ${callDetails?.result || "unknown"}`;
+
+  if (apolloContact) {
+    context += `
+
+LEAD IDENTIFIED VIA APOLLO (matched by phone number):
+- Name: ${apolloContact.first_name || ""} ${apolloContact.last_name || ""} (${apolloContact.name || ""})
+- Email: ${apolloContact.email || "unknown"}
+- Company: ${apolloContact.company || "unknown"}
+- Title: ${apolloContact.title || "unknown"}
+- LinkedIn: ${apolloContact.linkedin_url || "unknown"}
+- Phone: ${apolloContact.phone || "unknown"}
+
+IMPORTANT: Use this Apollo contact data for the contact fields in your response. The email from Apollo is the primary identifier for this lead.`;
+  } else {
+    context += `
+
+NOTE: No Apollo match found for this phone number. The caller/callee info from Zoom is all we have. If you cannot determine an email address, use the phone number as the identifier and set email to "unknown".`;
+  }
 
   if (transcript) {
     context += `

@@ -37,6 +37,9 @@ const envSchema = z.object({
   GOOGLE_REFRESH_TOKEN: z.string().min(1),
   GMAIL_USER_EMAIL: z.string().email().optional(),
   GOOGLE_PUBSUB_TOPIC: z.string().optional(),
+
+  // Apollo.io (lead enrichment)
+  APOLLO_API_KEY: z.string().optional(),
 });
 
 export type Config = z.infer<typeof envSchema>;
