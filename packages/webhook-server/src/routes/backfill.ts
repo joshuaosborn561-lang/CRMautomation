@@ -1,10 +1,67 @@
 import { Router, Request, Response } from "express";
+import Anthropic from "@anthropic-ai/sdk";
 import { storeWebhookEvent } from "../services/event-store";
 import * as gmailService from "../services/gmail";
 import * as zoomService from "../services/zoom";
+import { getConfig } from "../config";
 import { logger } from "../utils/logger";
+import { getSupabase } from "../utils/supabase";
 
 export const backfillRouter = Router();
+
+// DELETE /api/backfill/clear - Purge all backfill events from queues
+backfillRouter.delete("/clear", async (_req: Request, res: Response) => {
+  try {
+    const supabase = getSupabase();
+
+    // Delete review queue items whose event came from backfill
+    const { data: backfillEvents } = await supabase
+      .from("webhook_events")
+      .select("id")
+      .like("event_type", "%_backfill");
+
+    const backfillEventIds = (backfillEvents || []).map((e: { id: string }) => e.id);
+
+    let reviewsDeleted = 0;
+    let eventsDeleted = 0;
+    let interactionsDeleted = 0;
+
+    if (backfillEventIds.length > 0) {
+      // Delete review queue items linked to backfill events
+      const { count: rc } = await supabase
+        .from("review_queue")
+        .delete({ count: "exact" })
+        .in("event_id", backfillEventIds);
+      reviewsDeleted = rc || 0;
+
+      // Delete interaction log entries from backfill events
+      const { count: ic } = await supabase
+        .from("interaction_log")
+        .delete({ count: "exact" })
+        .in("event_id", backfillEventIds);
+      interactionsDeleted = ic || 0;
+
+      // Delete the backfill events themselves
+      const { count: ec } = await supabase
+        .from("webhook_events")
+        .delete({ count: "exact" })
+        .like("event_type", "%_backfill");
+      eventsDeleted = ec || 0;
+    }
+
+    logger.info("Backfill cleared", { reviewsDeleted, eventsDeleted, interactionsDeleted });
+
+    res.json({
+      status: "cleared",
+      reviews_deleted: reviewsDeleted,
+      events_deleted: eventsDeleted,
+      interactions_deleted: interactionsDeleted,
+    });
+  } catch (err) {
+    logger.error("Failed to clear backfill", { error: String(err) });
+    res.status(500).json({ error: String(err) });
+  }
+});
 
 // POST /api/backfill/gmail - Pull recent Gmail emails and feed them into the pipeline
 // Body: { days?: number, max_results?: number, query?: string }
@@ -28,44 +85,77 @@ backfillRouter.post("/gmail", async (req: Request, res: Response) => {
     let skipped = 0;
     const errors: string[] = [];
 
+    // Batch emails and use Claude to pre-filter for sales relevance
+    const emailBatch: Array<{ msgRef: { id: string; threadId: string }; message: any }> = [];
+
     for (const msgRef of messages) {
       try {
         const message = await gmailService.getMessage(msgRef.id);
 
-        // Skip emails from yourself (we want inbound from prospects)
-        const fromLower = message.from.toLowerCase();
-        if (
-          fromLower.includes("joshuaosborn561") ||
-          fromLower.includes("joshua@jmosolutions") ||
-          fromLower.includes("noreply") ||
-          fromLower.includes("no-reply") ||
-          fromLower.includes("notifications") ||
-          fromLower.includes("mailer-daemon")
-        ) {
+        // Skip emails from yourself / automated senders
+        if (isAutomatedSender(message.from.toLowerCase())) {
           skipped++;
           continue;
         }
 
-        await storeWebhookEvent("gmail", "email_received_backfill", {
-          message_id: message.id,
-          thread_id: message.threadId,
-          from: message.from,
-          to: message.to,
-          subject: message.subject,
-          date: message.date,
-          body: message.body.substring(0, 5000),
-          snippet: message.snippet,
-          backfill: true,
-        });
+        emailBatch.push({ msgRef, message });
 
-        processed++;
-
-        // Rate limit — don't hammer the APIs
-        if (processed % 10 === 0) {
-          await new Promise((r) => setTimeout(r, 1000));
+        // Rate limit Gmail reads
+        if (emailBatch.length % 10 === 0) {
+          await new Promise((r) => setTimeout(r, 500));
         }
       } catch (err) {
         errors.push(`${msgRef.id}: ${String(err)}`);
+      }
+    }
+
+    logger.info("Gmail backfill: fetched emails, now filtering with AI", {
+      total: messages.length,
+      afterSkip: emailBatch.length,
+      skipped,
+    });
+
+    // Use Claude to classify emails in batches of 10
+    const BATCH_SIZE = 10;
+    for (let i = 0; i < emailBatch.length; i += BATCH_SIZE) {
+      const batch = emailBatch.slice(i, i + BATCH_SIZE);
+
+      try {
+        const salesRelevant = await classifyEmailBatch(batch.map((b) => ({
+          id: b.msgRef.id,
+          from: b.message.from,
+          to: b.message.to,
+          subject: b.message.subject,
+          snippet: b.message.snippet || b.message.body?.substring(0, 300) || "",
+        })));
+
+        for (const item of batch) {
+          if (salesRelevant.has(item.msgRef.id)) {
+            await storeWebhookEvent("gmail", "email_received_backfill", {
+              message_id: item.message.id,
+              thread_id: item.message.threadId,
+              from: item.message.from,
+              to: item.message.to,
+              subject: item.message.subject,
+              date: item.message.date,
+              body: item.message.body?.substring(0, 5000) || "",
+              snippet: item.message.snippet,
+              backfill: true,
+            });
+            processed++;
+          } else {
+            skipped++;
+          }
+        }
+      } catch (err) {
+        // If AI classification fails, skip the whole batch rather than flooding queue
+        logger.warn("AI classification failed for batch, skipping", { error: String(err) });
+        skipped += batch.length;
+      }
+
+      // Rate limit between batches
+      if (i + BATCH_SIZE < emailBatch.length) {
+        await new Promise((r) => setTimeout(r, 1000));
       }
     }
 
@@ -308,39 +398,58 @@ async function runGmailBackfill(days: number, maxResults: number) {
   let processed = 0;
   let skipped = 0;
 
+  // Fetch all messages and apply sender filter
+  const emailBatch: Array<{ msgRef: { id: string; threadId: string }; message: any }> = [];
   for (const msgRef of messages) {
     try {
       const message = await gmailService.getMessage(msgRef.id);
       const fromLower = message.from.toLowerCase();
-      if (
-        fromLower.includes("joshuaosborn561") ||
-        fromLower.includes("joshua@jmosolutions") ||
-        fromLower.includes("noreply") ||
-        fromLower.includes("no-reply") ||
-        fromLower.includes("notifications") ||
-        fromLower.includes("mailer-daemon")
-      ) {
+      if (isAutomatedSender(fromLower)) {
         skipped++;
         continue;
       }
-
-      await storeWebhookEvent("gmail", "email_received_backfill", {
-        message_id: message.id,
-        thread_id: message.threadId,
-        from: message.from,
-        to: message.to,
-        subject: message.subject,
-        date: message.date,
-        body: message.body.substring(0, 5000),
-        snippet: message.snippet,
-        backfill: true,
-      });
-      processed++;
-
-      if (processed % 10 === 0) await new Promise((r) => setTimeout(r, 1000));
+      emailBatch.push({ msgRef, message });
+      if (emailBatch.length % 10 === 0) await new Promise((r) => setTimeout(r, 500));
     } catch {
-      // skip individual errors
+      // skip
     }
+  }
+
+  // AI classify in batches
+  const BATCH_SIZE = 10;
+  for (let i = 0; i < emailBatch.length; i += BATCH_SIZE) {
+    const batch = emailBatch.slice(i, i + BATCH_SIZE);
+    try {
+      const salesRelevant = await classifyEmailBatch(batch.map((b) => ({
+        id: b.msgRef.id,
+        from: b.message.from,
+        to: b.message.to,
+        subject: b.message.subject,
+        snippet: b.message.snippet || b.message.body?.substring(0, 300) || "",
+      })));
+
+      for (const item of batch) {
+        if (salesRelevant.has(item.msgRef.id)) {
+          await storeWebhookEvent("gmail", "email_received_backfill", {
+            message_id: item.message.id,
+            thread_id: item.message.threadId,
+            from: item.message.from,
+            to: item.message.to,
+            subject: item.message.subject,
+            date: item.message.date,
+            body: item.message.body?.substring(0, 5000) || "",
+            snippet: item.message.snippet,
+            backfill: true,
+          });
+          processed++;
+        } else {
+          skipped++;
+        }
+      }
+    } catch {
+      skipped += batch.length;
+    }
+    if (i + BATCH_SIZE < emailBatch.length) await new Promise((r) => setTimeout(r, 1000));
   }
 
   return { total_found: messages.length, processed, skipped };
@@ -384,4 +493,79 @@ async function runZoomBackfill(days: number) {
   }
 
   return { total_found: meetings.length, processed };
+}
+
+// --- Sender skip list ---
+
+function isAutomatedSender(fromLower: string): boolean {
+  const skipPatterns = [
+    "joshuaosborn561", "joshua@jmosolutions",
+    "noreply", "no-reply", "donotreply", "do-not-reply",
+    "notifications", "mailer-daemon", "newsletter", "digest",
+    "calendar-notification", "support@", "billing@", "info@",
+    "team@", "hello@", "admin@", "ops@", "feedback@",
+    "@linkedin.com", "@google.com", "@zoom.us", "@slack",
+    "@stripe.com", "@github.com", "@notion.so", "@railway.app",
+    "@vercel.com", "@supabase", "@calendly.com", "@hubspot",
+    "@mailchimp", "@sendgrid", "@intercom", "@zendesk",
+    "@atlassian", "@jira", "@confluence", "@asana",
+    "@trello.com", "@figma.com", "@loom.com", "@dropbox.com",
+    "@amazonses.com", "@aws.amazon.com", "@shopify.com",
+  ];
+  return skipPatterns.some((p) => fromLower.includes(p));
+}
+
+// --- Claude AI email classifier ---
+
+async function classifyEmailBatch(
+  emails: Array<{ id: string; from: string; to: string; subject: string; snippet: string }>
+): Promise<Set<string>> {
+  const config = getConfig();
+  const client = new Anthropic({ apiKey: config.ANTHROPIC_API_KEY });
+
+  const emailList = emails
+    .map(
+      (e, i) =>
+        `[${i + 1}] ID: ${e.id}\n  From: ${e.from}\n  To: ${e.to}\n  Subject: ${e.subject}\n  Preview: ${e.snippet.substring(0, 200)}`
+    )
+    .join("\n\n");
+
+  const response = await client.messages.create({
+    model: "claude-sonnet-4-6",
+    max_tokens: 500,
+    messages: [
+      {
+        role: "user",
+        content: `You are filtering emails for a B2B outbound sales agency founder's CRM. Only keep emails that are SALES-RELEVANT — meaning they are from or about a real prospect, lead, or client discussing business, meetings, proposals, interest, or deals.
+
+REJECT emails that are:
+- SaaS product notifications, billing, receipts
+- Internal team/tool notifications
+- Marketing newsletters or promotional content
+- Automated alerts, CI/CD, deployment notices
+- Personal/social emails unrelated to sales
+- Vendor/service provider communications (unless they are a prospect)
+- Calendar invites from tools (not from a real person scheduling a sales meeting)
+
+Here are the emails. Return ONLY the IDs of sales-relevant emails as a JSON array. If none are relevant, return [].
+
+${emailList}
+
+Respond with ONLY a JSON array of ID strings, nothing else. Example: ["abc123", "def456"]`,
+      },
+    ],
+  });
+
+  const text = response.content[0].type === "text" ? response.content[0].text : "[]";
+
+  try {
+    // Extract JSON array from response
+    const match = text.match(/\[.*\]/s);
+    if (!match) return new Set();
+    const ids: string[] = JSON.parse(match[0]);
+    return new Set(ids);
+  } catch {
+    logger.warn("Failed to parse AI classification response", { text });
+    return new Set();
+  }
 }
