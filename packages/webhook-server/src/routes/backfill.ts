@@ -10,17 +10,30 @@ import { getSupabase } from "../utils/supabase";
 export const backfillRouter = Router();
 
 // DELETE /api/backfill/clear - Purge all backfill events from queues
+// Also clears old events that used "email_received" (before _backfill tagging was added)
+// Supports ?pending_only=true to only clear pending review queue items
 backfillRouter.delete("/clear", async (_req: Request, res: Response) => {
   try {
     const supabase = getSupabase();
+    const pendingOnly = _req.query.pending_only === "true";
 
-    // Delete review queue items whose event came from backfill
-    const { data: backfillEvents } = await supabase
+    // Find backfill events by: event_type contains "_backfill" OR payload has backfill:true
+    const { data: taggedEvents } = await supabase
       .from("webhook_events")
       .select("id")
       .like("event_type", "%_backfill");
 
-    const backfillEventIds = (backfillEvents || []).map((e: { id: string }) => e.id);
+    // Also find events where payload contains backfill flag (old-style events)
+    const { data: flaggedEvents } = await supabase
+      .from("webhook_events")
+      .select("id")
+      .contains("payload", { backfill: true });
+
+    // Merge and deduplicate
+    const allIds = new Set<string>();
+    for (const e of taggedEvents || []) allIds.add(e.id);
+    for (const e of flaggedEvents || []) allIds.add(e.id);
+    const backfillEventIds = Array.from(allIds);
 
     let reviewsDeleted = 0;
     let eventsDeleted = 0;
@@ -28,31 +41,48 @@ backfillRouter.delete("/clear", async (_req: Request, res: Response) => {
 
     if (backfillEventIds.length > 0) {
       // Delete review queue items linked to backfill events
-      const { count: rc } = await supabase
+      // Supabase .in() has a limit, so batch in chunks of 200
+      for (let i = 0; i < backfillEventIds.length; i += 200) {
+        const chunk = backfillEventIds.slice(i, i + 200);
+
+        let reviewQuery = supabase
+          .from("review_queue")
+          .delete({ count: "exact" })
+          .in("event_id", chunk);
+        if (pendingOnly) reviewQuery = reviewQuery.eq("status", "pending");
+        const { count: rc } = await reviewQuery;
+        reviewsDeleted += rc || 0;
+
+        const { count: ic } = await supabase
+          .from("interaction_log")
+          .delete({ count: "exact" })
+          .in("event_id", chunk);
+        interactionsDeleted += ic || 0;
+
+        const { count: ec } = await supabase
+          .from("webhook_events")
+          .delete({ count: "exact" })
+          .in("id", chunk);
+        eventsDeleted += ec || 0;
+      }
+    }
+
+    // Fallback: also clear any pending review queue items from gmail source
+    // that don't have a matching backfill event (covers edge cases)
+    if (!pendingOnly) {
+      const { count: extraReviews } = await supabase
         .from("review_queue")
         .delete({ count: "exact" })
-        .in("event_id", backfillEventIds);
-      reviewsDeleted = rc || 0;
-
-      // Delete interaction log entries from backfill events
-      const { count: ic } = await supabase
-        .from("interaction_log")
-        .delete({ count: "exact" })
-        .in("event_id", backfillEventIds);
-      interactionsDeleted = ic || 0;
-
-      // Delete the backfill events themselves
-      const { count: ec } = await supabase
-        .from("webhook_events")
-        .delete({ count: "exact" })
-        .like("event_type", "%_backfill");
-      eventsDeleted = ec || 0;
+        .eq("source", "gmail")
+        .eq("status", "pending");
+      reviewsDeleted += extraReviews || 0;
     }
 
     logger.info("Backfill cleared", { reviewsDeleted, eventsDeleted, interactionsDeleted });
 
     res.json({
       status: "cleared",
+      backfill_events_found: backfillEventIds.length,
       reviews_deleted: reviewsDeleted,
       events_deleted: eventsDeleted,
       interactions_deleted: interactionsDeleted,
