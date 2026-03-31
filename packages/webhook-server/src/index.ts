@@ -13,6 +13,7 @@ import { gmailRouter } from "./webhooks/gmail";
 import { reviewRouter } from "./routes/review";
 import { nurtureRouter } from "./routes/nurture";
 import { queryRouter } from "./routes/query";
+import { backfillRouter } from "./routes/backfill";
 
 // Background jobs
 import { processEventQueue } from "./processors/event-pipeline";
@@ -39,6 +40,7 @@ app.use("/webhooks/gmail", gmailRouter);
 app.use("/api/review", reviewRouter);
 app.use("/api/nurture", nurtureRouter);
 app.use("/api/query", queryRouter);
+app.use("/api/backfill", backfillRouter);
 
 // Status endpoint — overview of system state
 app.get("/api/status", async (_req, res) => {

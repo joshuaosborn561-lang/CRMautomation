@@ -136,8 +136,8 @@ export default function Home() {
 
   return (
     <div style={{ maxWidth: 800, margin: "0 auto", padding: "2rem 1rem" }}>
-      <h1 style={{ fontSize: "1.5rem", marginBottom: "0.5rem" }}>CRM Autopilot</h1>
-      <p style={{ color: "#888", marginBottom: "1.5rem", fontSize: "0.9rem" }}>
+      <h1 style={{ fontSize: "1.5rem", marginBottom: "0.5rem", color: "#1a1a1a" }}>CRM Autopilot</h1>
+      <p style={{ color: "#666", marginBottom: "1.5rem", fontSize: "0.9rem" }}>
         Ask questions about your pipeline, review CRM updates, or approve nurture sequences
       </p>
 
@@ -147,9 +147,9 @@ export default function Home() {
           onClick={() => setTab("query")}
           style={{
             padding: "0.5rem 1rem",
-            background: tab === "query" ? "#333" : "transparent",
-            color: tab === "query" ? "#fff" : "#888",
-            border: "1px solid #333",
+            background: tab === "query" ? "#2563eb" : "#f5f5f5",
+            color: tab === "query" ? "#fff" : "#555",
+            border: "1px solid #ddd",
             borderRadius: 6,
             cursor: "pointer",
           }}
@@ -160,9 +160,9 @@ export default function Home() {
           onClick={() => setTab("review")}
           style={{
             padding: "0.5rem 1rem",
-            background: tab === "review" ? "#333" : "transparent",
-            color: tab === "review" ? "#fff" : "#888",
-            border: "1px solid #333",
+            background: tab === "review" ? "#2563eb" : "#f5f5f5",
+            color: tab === "review" ? "#fff" : "#555",
+            border: "1px solid #ddd",
             borderRadius: 6,
             cursor: "pointer",
           }}
@@ -173,9 +173,9 @@ export default function Home() {
           onClick={() => setTab("nurture")}
           style={{
             padding: "0.5rem 1rem",
-            background: tab === "nurture" ? "#333" : "transparent",
-            color: tab === "nurture" ? "#fff" : "#888",
-            border: "1px solid #333",
+            background: tab === "nurture" ? "#2563eb" : "#f5f5f5",
+            color: tab === "nurture" ? "#fff" : "#555",
+            border: "1px solid #ddd",
             borderRadius: 6,
             cursor: "pointer",
           }}
@@ -194,13 +194,13 @@ export default function Home() {
               overflowY: "auto",
               marginBottom: "1rem",
               padding: "1rem",
-              border: "1px solid #222",
+              border: "1px solid #e0e0e0",
               borderRadius: 8,
-              background: "#111",
+              background: "#fafafa",
             }}
           >
             {messages.length === 0 && (
-              <div style={{ color: "#555", textAlign: "center", marginTop: "8rem" }}>
+              <div style={{ color: "#999", textAlign: "center", marginTop: "8rem" }}>
                 <p>Ask me anything about your pipeline.</p>
                 <p style={{ fontSize: "0.85rem" }}>
                   Try: &quot;What deals haven&apos;t had activity in 2 weeks?&quot;
@@ -221,8 +221,9 @@ export default function Home() {
                     maxWidth: "80%",
                     padding: "0.75rem 1rem",
                     borderRadius: 12,
-                    background: msg.role === "user" ? "#2563eb" : "#1e1e1e",
-                    color: "#ededed",
+                    background: msg.role === "user" ? "#2563eb" : "#ffffff",
+                    color: msg.role === "user" ? "#ffffff" : "#1a1a1a",
+                    border: msg.role === "assistant" ? "1px solid #e0e0e0" : "none",
                     whiteSpace: "pre-wrap",
                     textAlign: "left",
                     fontSize: "0.9rem",
@@ -234,7 +235,7 @@ export default function Home() {
               </div>
             ))}
             {loading && (
-              <div style={{ color: "#888", fontStyle: "italic" }}>Thinking...</div>
+              <div style={{ color: "#999", fontStyle: "italic" }}>Thinking...</div>
             )}
             <div ref={messagesEndRef} />
           </div>
@@ -248,10 +249,10 @@ export default function Home() {
               style={{
                 flex: 1,
                 padding: "0.75rem 1rem",
-                border: "1px solid #333",
+                border: "1px solid #ddd",
                 borderRadius: 8,
-                background: "#111",
-                color: "#ededed",
+                background: "#fff",
+                color: "#1a1a1a",
                 fontSize: "0.9rem",
                 outline: "none",
               }}
@@ -286,16 +287,16 @@ export default function Home() {
               marginBottom: "1rem",
             }}
           >
-            <span style={{ color: "#888" }}>
+            <span style={{ color: "#666" }}>
               {reviews.length} pending review{reviews.length !== 1 ? "s" : ""}
             </span>
             <button
               onClick={loadReviews}
               style={{
                 padding: "0.25rem 0.75rem",
-                background: "#222",
-                color: "#888",
-                border: "1px solid #333",
+                background: "#f5f5f5",
+                color: "#666",
+                border: "1px solid #ddd",
                 borderRadius: 6,
                 cursor: "pointer",
                 fontSize: "0.8rem",
@@ -305,7 +306,7 @@ export default function Home() {
             </button>
           </div>
 
-          {reviewLoading && <p style={{ color: "#888" }}>Loading...</p>}
+          {reviewLoading && <p style={{ color: "#666" }}>Loading...</p>}
 
           {reviews.map((review) => (
             <div
@@ -313,9 +314,9 @@ export default function Home() {
               style={{
                 marginBottom: "1rem",
                 padding: "1rem",
-                border: "1px solid #222",
+                border: "1px solid #e0e0e0",
                 borderRadius: 8,
-                background: "#111",
+                background: "#fafafa",
               }}
             >
               <div
@@ -330,6 +331,7 @@ export default function Home() {
                     fontSize: "0.75rem",
                     color: "#888",
                     textTransform: "uppercase",
+                    fontWeight: 600,
                   }}
                 >
                   {review.source}
@@ -339,17 +341,17 @@ export default function Home() {
                 </span>
               </div>
 
-              <h3 style={{ margin: "0 0 0.25rem", fontSize: "1rem" }}>
+              <h3 style={{ margin: "0 0 0.25rem", fontSize: "1rem", color: "#1a1a1a" }}>
                 {review.deal.title}
               </h3>
-              <p style={{ margin: "0 0 0.5rem", fontSize: "0.85rem", color: "#aaa" }}>
+              <p style={{ margin: "0 0 0.5rem", fontSize: "0.85rem", color: "#555" }}>
                 {review.contact.email} &middot; Stage: {review.deal.stage}
               </p>
               <p
                 style={{
                   margin: "0 0 0.5rem",
                   fontSize: "0.85rem",
-                  color: "#ccc",
+                  color: "#333",
                   lineHeight: 1.4,
                 }}
               >
@@ -364,7 +366,8 @@ export default function Home() {
                   style={{
                     margin: "0 0 0.75rem",
                     fontSize: "0.8rem",
-                    color: "#f59e0b",
+                    color: "#b45309",
+                    fontWeight: 500,
                   }}
                 >
                   Task: {review.task.title}
@@ -405,7 +408,7 @@ export default function Home() {
           ))}
 
           {!reviewLoading && reviews.length === 0 && (
-            <p style={{ color: "#555", textAlign: "center", marginTop: "3rem" }}>
+            <p style={{ color: "#999", textAlign: "center", marginTop: "3rem" }}>
               No pending reviews. All caught up!
             </p>
           )}
@@ -423,16 +426,16 @@ export default function Home() {
               marginBottom: "1rem",
             }}
           >
-            <span style={{ color: "#888" }}>
+            <span style={{ color: "#666" }}>
               {nurtures.length} prospect{nurtures.length !== 1 ? "s" : ""} ready for nurture
             </span>
             <button
               onClick={loadNurtures}
               style={{
                 padding: "0.25rem 0.75rem",
-                background: "#222",
-                color: "#888",
-                border: "1px solid #333",
+                background: "#f5f5f5",
+                color: "#666",
+                border: "1px solid #ddd",
                 borderRadius: 6,
                 cursor: "pointer",
                 fontSize: "0.8rem",
@@ -442,7 +445,7 @@ export default function Home() {
             </button>
           </div>
 
-          {nurtureLoading && <p style={{ color: "#888" }}>Loading...</p>}
+          {nurtureLoading && <p style={{ color: "#666" }}>Loading...</p>}
 
           {nurtures.map((item) => (
             <div
@@ -450,9 +453,9 @@ export default function Home() {
               style={{
                 marginBottom: "1rem",
                 padding: "1rem",
-                border: "1px solid #222",
+                border: "1px solid #fbbf24",
                 borderRadius: 8,
-                background: "#111",
+                background: "#fffbeb",
               }}
             >
               <div
@@ -465,7 +468,7 @@ export default function Home() {
                 <span
                   style={{
                     fontSize: "0.75rem",
-                    color: "#f59e0b",
+                    color: "#b45309",
                     fontWeight: 600,
                   }}
                 >
@@ -476,7 +479,7 @@ export default function Home() {
                 </span>
               </div>
 
-              <h3 style={{ margin: "0 0 0.25rem", fontSize: "1rem" }}>
+              <h3 style={{ margin: "0 0 0.25rem", fontSize: "1rem", color: "#1a1a1a" }}>
                 {item.contact_email}
               </h3>
 
@@ -484,11 +487,11 @@ export default function Home() {
                 style={{
                   margin: "0.5rem 0",
                   fontSize: "0.85rem",
-                  color: "#ccc",
+                  color: "#333",
                   lineHeight: 1.4,
                 }}
               >
-                <strong style={{ color: "#aaa" }}>Last positive interaction:</strong>{" "}
+                <strong style={{ color: "#555" }}>Last positive interaction:</strong>{" "}
                 {item.last_positive_summary}
               </p>
 
@@ -502,7 +505,7 @@ export default function Home() {
                   style={{
                     padding: "0.4rem 1rem",
                     background: "#f59e0b",
-                    color: "#000",
+                    color: "#fff",
                     border: "none",
                     borderRadius: 6,
                     cursor: "pointer",
@@ -516,9 +519,9 @@ export default function Home() {
                   onClick={() => handleNurtureAction(item.id, "reject")}
                   style={{
                     padding: "0.4rem 1rem",
-                    background: "transparent",
-                    color: "#888",
-                    border: "1px solid #333",
+                    background: "#f5f5f5",
+                    color: "#666",
+                    border: "1px solid #ddd",
                     borderRadius: 6,
                     cursor: "pointer",
                     fontSize: "0.85rem",
@@ -531,7 +534,7 @@ export default function Home() {
           ))}
 
           {!nurtureLoading && nurtures.length === 0 && (
-            <p style={{ color: "#555", textAlign: "center", marginTop: "3rem" }}>
+            <p style={{ color: "#999", textAlign: "center", marginTop: "3rem" }}>
               No prospects pending nurture. All caught up!
             </p>
           )}
