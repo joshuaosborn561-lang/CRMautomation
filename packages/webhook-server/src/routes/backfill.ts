@@ -274,22 +274,171 @@ backfillRouter.post("/zoom", async (req: Request, res: Response) => {
   }
 });
 
-// POST /api/backfill/all - Run both Gmail and Zoom backfill
+// POST /api/backfill/smartlead - Pull replied leads from SmartLead campaigns
+backfillRouter.post("/smartlead", async (req: Request, res: Response) => {
+  try {
+    const { listCampaigns, getCampaignLeadsWithReplies } = await import("../services/smartlead");
+
+    logger.info("Starting SmartLead backfill");
+
+    // Get all campaigns
+    const campaigns = await listCampaigns();
+    let processed = 0;
+    const errors: string[] = [];
+
+    for (const campaign of campaigns) {
+      try {
+        const leads = await getCampaignLeadsWithReplies(campaign.id);
+
+        for (const lead of leads) {
+          await storeWebhookEvent("smartlead", "reply_backfill", {
+            email: lead.email,
+            lead_email: lead.email,
+            name: `${lead.first_name || ""} ${lead.last_name || ""}`.trim(),
+            lead_name: `${lead.first_name || ""} ${lead.last_name || ""}`.trim(),
+            company: lead.company_name,
+            company_name: lead.company_name,
+            campaign_name: campaign.name,
+            campaign_id: campaign.id,
+            reply: lead.reply || "",
+            message: lead.reply || "",
+            category: lead.reply_category || lead.status,
+            reply_category: lead.reply_category || lead.status,
+            replied_at: lead.replied_at,
+            backfill: true,
+          });
+          processed++;
+        }
+
+        // Rate limit between campaigns
+        await new Promise((r) => setTimeout(r, 1000));
+      } catch (err) {
+        errors.push(`Campaign ${campaign.name}: ${String(err)}`);
+      }
+    }
+
+    res.json({
+      status: "done",
+      campaigns_scanned: campaigns.length,
+      leads_with_replies: processed,
+      errors: errors.length,
+      error_details: errors.slice(0, 10),
+    });
+  } catch (err) {
+    logger.error("SmartLead backfill failed", { error: String(err) });
+    res.status(500).json({ error: String(err) });
+  }
+});
+
+// POST /api/backfill/heyreach - Pull LinkedIn engagement from HeyReach campaigns
+backfillRouter.post("/heyreach", async (req: Request, res: Response) => {
+  try {
+    const config = getConfig();
+    logger.info("Starting HeyReach backfill");
+
+    // HeyReach API — get campaigns and their leads
+    const campaignsResp = await fetch("https://api.heyreach.io/api/v1/campaigns", {
+      headers: {
+        "X-API-KEY": config.HEYREACH_API_KEY,
+        "Content-Type": "application/json",
+      },
+    });
+
+    if (!campaignsResp.ok) {
+      throw new Error(`HeyReach API error: ${campaignsResp.status}`);
+    }
+
+    const campaignsData = (await campaignsResp.json()) as Array<{
+      id: string;
+      name: string;
+    }>;
+
+    let processed = 0;
+    const errors: string[] = [];
+
+    for (const campaign of campaignsData || []) {
+      try {
+        // Get leads from this campaign
+        const leadsResp = await fetch(
+          `https://api.heyreach.io/api/v1/campaigns/${campaign.id}/leads?status=REPLIED`,
+          {
+            headers: {
+              "X-API-KEY": config.HEYREACH_API_KEY,
+              "Content-Type": "application/json",
+            },
+          }
+        );
+
+        if (!leadsResp.ok) continue;
+
+        const leads = (await leadsResp.json()) as Array<{
+          id: string;
+          firstName?: string;
+          lastName?: string;
+          email?: string;
+          companyName?: string;
+          linkedinUrl?: string;
+          status: string;
+          lastMessage?: string;
+        }>;
+
+        for (const lead of leads || []) {
+          await storeWebhookEvent("heyreach", "reply_received_backfill", {
+            contact_name: `${lead.firstName || ""} ${lead.lastName || ""}`.trim(),
+            name: `${lead.firstName || ""} ${lead.lastName || ""}`.trim(),
+            email: lead.email || "",
+            company: lead.companyName || "",
+            linkedin_url: lead.linkedinUrl || "",
+            profile_url: lead.linkedinUrl || "",
+            event_type: "reply_received",
+            action: "reply_received",
+            message: lead.lastMessage || "",
+            text: lead.lastMessage || "",
+            campaign_name: campaign.name,
+            backfill: true,
+          });
+          processed++;
+        }
+
+        await new Promise((r) => setTimeout(r, 500));
+      } catch (err) {
+        errors.push(`Campaign ${campaign.name}: ${String(err)}`);
+      }
+    }
+
+    res.json({
+      status: "done",
+      campaigns_scanned: (campaignsData || []).length,
+      leads_with_engagement: processed,
+      errors: errors.length,
+      error_details: errors.slice(0, 10),
+    });
+  } catch (err) {
+    logger.error("HeyReach backfill failed", { error: String(err) });
+    res.status(500).json({ error: String(err) });
+  }
+});
+
+// POST /api/backfill/all - Run all source backfills
 backfillRouter.post("/all", async (req: Request, res: Response) => {
   try {
     const days = req.body.days || 30;
 
-    logger.info("Starting full backfill", { days });
+    logger.info("Starting full backfill (all sources)", { days });
 
-    // Run both sequentially to avoid rate limits
+    // Run sequentially to avoid rate limits
     const gmailResult = await runGmailBackfill(days, 100);
     const zoomResult = await runZoomBackfill(days);
+    const smartleadResult = await runSmartLeadBackfill();
+    const heyreachResult = await runHeyReachBackfill();
 
     res.json({
       status: "done",
       gmail: gmailResult,
       zoom: zoomResult,
-      note: "All events are now in the queue. They will be processed by the AI pipeline every 30 seconds and appear in the Review Queue.",
+      smartlead: smartleadResult,
+      heyreach: heyreachResult,
+      note: "All events are now in the queue. The AI pipeline processes events every 30 seconds.",
     });
   } catch (err) {
     logger.error("Full backfill failed", { error: String(err) });
@@ -523,6 +672,112 @@ async function runZoomBackfill(days: number) {
   }
 
   return { total_found: meetings.length, processed };
+}
+
+async function runSmartLeadBackfill() {
+  const { listCampaigns, getCampaignLeadsWithReplies } = await import("../services/smartlead");
+
+  const campaigns = await listCampaigns();
+  let processed = 0;
+
+  for (const campaign of campaigns) {
+    try {
+      const leads = await getCampaignLeadsWithReplies(campaign.id);
+      for (const lead of leads) {
+        await storeWebhookEvent("smartlead", "reply_backfill", {
+          email: lead.email,
+          lead_email: lead.email,
+          name: `${lead.first_name || ""} ${lead.last_name || ""}`.trim(),
+          lead_name: `${lead.first_name || ""} ${lead.last_name || ""}`.trim(),
+          company: lead.company_name,
+          company_name: lead.company_name,
+          campaign_name: campaign.name,
+          campaign_id: campaign.id,
+          reply: lead.reply || "",
+          message: lead.reply || "",
+          category: lead.reply_category || lead.status,
+          reply_category: lead.reply_category || lead.status,
+          replied_at: lead.replied_at,
+          backfill: true,
+        });
+        processed++;
+      }
+      await new Promise((r) => setTimeout(r, 1000));
+    } catch {
+      // skip
+    }
+  }
+
+  return { campaigns_scanned: campaigns.length, leads_with_replies: processed };
+}
+
+async function runHeyReachBackfill() {
+  const config = getConfig();
+  let processed = 0;
+
+  try {
+    const campaignsResp = await fetch("https://api.heyreach.io/api/v1/campaigns", {
+      headers: {
+        "X-API-KEY": config.HEYREACH_API_KEY,
+        "Content-Type": "application/json",
+      },
+    });
+
+    if (!campaignsResp.ok) {
+      return { campaigns_scanned: 0, leads_with_engagement: 0, error: `API error: ${campaignsResp.status}` };
+    }
+
+    const campaigns = (await campaignsResp.json()) as Array<{ id: string; name: string }>;
+
+    for (const campaign of campaigns || []) {
+      try {
+        const leadsResp = await fetch(
+          `https://api.heyreach.io/api/v1/campaigns/${campaign.id}/leads?status=REPLIED`,
+          {
+            headers: {
+              "X-API-KEY": config.HEYREACH_API_KEY,
+              "Content-Type": "application/json",
+            },
+          }
+        );
+        if (!leadsResp.ok) continue;
+
+        const leads = (await leadsResp.json()) as Array<{
+          firstName?: string;
+          lastName?: string;
+          email?: string;
+          companyName?: string;
+          linkedinUrl?: string;
+          lastMessage?: string;
+        }>;
+
+        for (const lead of leads || []) {
+          await storeWebhookEvent("heyreach", "reply_received_backfill", {
+            contact_name: `${lead.firstName || ""} ${lead.lastName || ""}`.trim(),
+            name: `${lead.firstName || ""} ${lead.lastName || ""}`.trim(),
+            email: lead.email || "",
+            company: lead.companyName || "",
+            linkedin_url: lead.linkedinUrl || "",
+            profile_url: lead.linkedinUrl || "",
+            event_type: "reply_received",
+            action: "reply_received",
+            message: lead.lastMessage || "",
+            text: lead.lastMessage || "",
+            campaign_name: campaign.name,
+            backfill: true,
+          });
+          processed++;
+        }
+        await new Promise((r) => setTimeout(r, 500));
+      } catch {
+        // skip
+      }
+    }
+
+    return { campaigns_scanned: (campaigns || []).length, leads_with_engagement: processed };
+  } catch {
+    return { campaigns_scanned: 0, leads_with_engagement: 0 };
+  }
 }
 
 // --- Sender skip list ---

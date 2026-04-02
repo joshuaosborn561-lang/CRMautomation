@@ -11,6 +11,7 @@ import {
   updateDealStage,
   createNote,
 } from "../services/attio";
+import { sendNurtureApprovalEmail } from "../services/notifications";
 
 const SILENCE_THRESHOLD_DAYS = 2;
 
@@ -126,7 +127,7 @@ async function checkContactForNurture(
   });
 
   // Queue for approval — don't auto-push
-  await addToNurtureQueue({
+  const nurtureId = await addToNurtureQueue({
     contact_email: email,
     contact_first_name: undefined,
     contact_last_name: undefined,
@@ -138,6 +139,19 @@ async function checkContactForNurture(
     last_positive_at: lastPositive.occurred_at,
     days_silent: daysSilent,
   });
+
+  // Email you for approval instead of relying on the web UI
+  try {
+    await sendNurtureApprovalEmail({
+      id: nurtureId,
+      contact_email: email,
+      nurture_reason: nurtureReason,
+      days_silent: daysSilent,
+      last_positive_summary: lastPositive.summary,
+    });
+  } catch (err) {
+    logger.warn("Failed to send nurture email notification", { error: String(err) });
+  }
 }
 
 // Called when you approve a nurture — pushes to SmartLead and updates Attio

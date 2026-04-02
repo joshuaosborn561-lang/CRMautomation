@@ -35,6 +35,58 @@ nurtureRouter.get("/", async (_req: Request, res: Response) => {
   }
 });
 
+// GET /api/nurture/:id/approve - Approve via email link click
+nurtureRouter.get("/:id/approve", async (req: Request, res: Response) => {
+  try {
+    const config = getConfig();
+    const campaignId = config.SMARTLEAD_NURTURE_CAMPAIGN_ID
+      ? parseInt(config.SMARTLEAD_NURTURE_CAMPAIGN_ID, 10)
+      : null;
+
+    if (!campaignId) {
+      return res.send("<h2>Error: No SmartLead nurture campaign ID configured.</h2>");
+    }
+
+    const nurtureItem = await approveNurture(String(req.params.id));
+    await executeNurture(nurtureItem, campaignId);
+    await markNurturePushed(String(req.params.id));
+
+    logger.info("Nurture approved via email link", {
+      nurtureId: req.params.id,
+      email: nurtureItem.contact_email,
+    });
+
+    res.send(`
+      <div style="font-family: -apple-system, sans-serif; max-width: 500px; margin: 80px auto; text-align: center;">
+        <h2 style="color: #22c55e;">Approved!</h2>
+        <p><strong>${nurtureItem.contact_email}</strong> has been pushed to your SmartLead nurture campaign.</p>
+        <p>Deal stage updated to Nurture in Attio.</p>
+      </div>
+    `);
+  } catch (err) {
+    logger.error("Failed to approve nurture via link", { error: String(err) });
+    res.send(`<h2 style="color: red;">Error: ${String(err)}</h2>`);
+  }
+});
+
+// GET /api/nurture/:id/reject - Reject via email link click
+nurtureRouter.get("/:id/reject", async (req: Request, res: Response) => {
+  try {
+    await rejectNurture(String(req.params.id));
+    logger.info("Nurture rejected via email link", { nurtureId: req.params.id });
+
+    res.send(`
+      <div style="font-family: -apple-system, sans-serif; max-width: 500px; margin: 80px auto; text-align: center;">
+        <h2 style="color: #ef4444;">Rejected</h2>
+        <p>This prospect will not be added to the nurture sequence.</p>
+      </div>
+    `);
+  } catch (err) {
+    logger.error("Failed to reject nurture via link", { error: String(err) });
+    res.send(`<h2 style="color: red;">Error: ${String(err)}</h2>`);
+  }
+});
+
 // POST /api/nurture/:id/approve - Approve and push to SmartLead nurture sequence
 // Body: { campaign_id: number } (optional — falls back to SMARTLEAD_NURTURE_CAMPAIGN_ID env var)
 nurtureRouter.post("/:id/approve", async (req: Request, res: Response) => {

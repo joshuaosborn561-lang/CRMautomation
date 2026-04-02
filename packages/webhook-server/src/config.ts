@@ -7,7 +7,7 @@ const envSchema = z.object({
     .default("development"),
   REVIEW_MODE: z
     .string()
-    .default("true")
+    .default("false")
     .transform((v) => v === "true"),
 
   SUPABASE_URL: z.string().url(),
@@ -40,6 +40,10 @@ const envSchema = z.object({
 
   // Apollo.io (lead enrichment)
   APOLLO_API_KEY: z.string().optional(),
+
+  // Notifications
+  NOTIFICATION_EMAIL: z.string().optional(),
+  SERVER_URL: z.string().optional(),
 });
 
 export type Config = z.infer<typeof envSchema>;
