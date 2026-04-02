@@ -15,6 +15,7 @@ import {
   createNote,
   createTask,
 } from "../services/attio";
+import { enrichContact } from "../services/leadmagic";
 import type { AIProcessingResult, WebhookEvent } from "@crm-autopilot/shared";
 
 // Process all unprocessed events in the queue
@@ -75,6 +76,40 @@ export async function applyToAttio(result: AIProcessingResult): Promise<void> {
       eventId: result.event_id,
     });
     return;
+  }
+
+  // 0. Enrich contact with LeadMagic before pushing to Attio
+  try {
+    const enriched = await enrichContact({
+      email: contact.email,
+      first_name: contact.first_name,
+      last_name: contact.last_name,
+      company: contact.company,
+      linkedin_url: contact.linkedin_url,
+      phone: contact.phone,
+    });
+
+    if (enriched.enriched) {
+      contact.first_name = contact.first_name || enriched.first_name;
+      contact.last_name = contact.last_name || enriched.last_name;
+      contact.company = contact.company || enriched.company;
+      contact.linkedin_url = contact.linkedin_url || enriched.linkedin_url;
+      contact.phone = contact.phone || enriched.phone;
+      // Email stays as-is (AI already extracted it)
+
+      logger.info("Contact enriched via LeadMagic before Attio push", {
+        email: contact.email,
+        company: contact.company,
+        enrichedFields: {
+          name: !!enriched.first_name,
+          company: !!enriched.company,
+          linkedin: !!enriched.linkedin_url,
+          industry: !!enriched.industry,
+        },
+      });
+    }
+  } catch (err) {
+    logger.warn("LeadMagic enrichment failed, proceeding without", { error: String(err) });
   }
 
   // 1. Find or create the contact in Attio

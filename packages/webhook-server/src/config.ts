@@ -38,8 +38,8 @@ const envSchema = z.object({
   GMAIL_USER_EMAIL: z.string().optional(),
   GOOGLE_PUBSUB_TOPIC: z.string().optional(),
 
-  // Apollo.io (lead enrichment)
-  APOLLO_API_KEY: z.string().optional(),
+  // LeadMagic (lead enrichment)
+  LEADMAGIC_API_KEY: z.string().optional(),
 
   // Notifications
   NOTIFICATION_EMAIL: z.string().optional(),

@@ -2,7 +2,7 @@ import { Router, Request, Response } from "express";
 import { storeWebhookEvent } from "../services/event-store";
 import { verifyZoomWebhook, handleZoomChallenge } from "../services/zoom";
 import * as zoomService from "../services/zoom";
-import { findContactByPhone } from "../services/apollo";
+import { enrichContact } from "../services/leadmagic";
 import { getSupabase } from "../utils/supabase";
 import { logger } from "../utils/logger";
 
@@ -145,26 +145,34 @@ zoomRouter.post("/", async (req: Request, res: Response) => {
         if (transcript) enrichedPayload.transcript = transcript;
         if (callDetails) enrichedPayload.call_details = callDetails;
 
-        // --- APOLLO LOOKUP: Match phone number to lead ---
+        // --- LEADMAGIC ENRICHMENT: Match phone number to lead ---
         const externalNumber = getExternalPhoneNumber(callDetails, payload);
-        if (externalNumber) {
-          const apolloContact = await findContactByPhone(externalNumber);
-          if (apolloContact) {
-            enrichedPayload.apollo_contact = {
-              email: apolloContact.email,
-              first_name: apolloContact.first_name,
-              last_name: apolloContact.last_name,
-              name: apolloContact.name,
-              company: apolloContact.organization_name,
-              title: apolloContact.title,
-              linkedin_url: apolloContact.linkedin_url,
+        const callerName = (callDetails?.caller_name || callDetails?.callee_name || "") as string;
+        if (externalNumber || callerName) {
+          // Use whatever we have from Zoom to enrich via LeadMagic
+          const enriched = await enrichContact({
+            phone: externalNumber || undefined,
+            first_name: callerName.split(" ")[0] || undefined,
+            last_name: callerName.split(" ").slice(1).join(" ") || undefined,
+          });
+          if (enriched.enriched) {
+            enrichedPayload.enriched_contact = {
+              email: enriched.email,
+              first_name: enriched.first_name,
+              last_name: enriched.last_name,
+              company: enriched.company,
+              title: enriched.title,
+              linkedin_url: enriched.linkedin_url,
               phone: externalNumber,
+              industry: enriched.industry,
+              company_size: enriched.company_size,
             };
-            logger.info("Enriched Zoom phone call with Apollo data", {
+            logger.info("Enriched Zoom phone call with LeadMagic data", {
               callId,
               phone: externalNumber,
-              name: apolloContact.name,
-              email: apolloContact.email,
+              name: `${enriched.first_name} ${enriched.last_name}`,
+              email: enriched.email,
+              company: enriched.company,
             });
           }
         }
