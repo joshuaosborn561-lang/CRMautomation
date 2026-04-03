@@ -225,10 +225,17 @@ backfillRouter.post("/zoom", async (req: Request, res: Response) => {
 
     for (const meeting of meetings) {
       try {
-        // Try to get the transcript
+        // Try to get the transcript — don't let failure block the meeting from being stored
         let transcript: string | null = null;
         if (meeting.id) {
-          transcript = await zoomService.getMeetingTranscript(String(meeting.id));
+          try {
+            transcript = await zoomService.getMeetingTranscript(String(meeting.id));
+          } catch (transcriptErr) {
+            logger.warn("Could not fetch transcript, storing meeting without it", {
+              meetingId: meeting.id,
+              error: transcriptErr instanceof Error ? transcriptErr.message : JSON.stringify(transcriptErr),
+            });
+          }
         }
 
         await storeWebhookEvent("zoom_meeting", "meeting.ended_backfill", {
@@ -254,7 +261,8 @@ backfillRouter.post("/zoom", async (req: Request, res: Response) => {
           await new Promise((r) => setTimeout(r, 2000));
         }
       } catch (err) {
-        errors.push(`${meeting.topic || meeting.id}: ${String(err)}`);
+        const errMsg = err instanceof Error ? err.message : JSON.stringify(err);
+        errors.push(`${meeting.topic || meeting.id}: ${errMsg}`);
       }
     }
 
@@ -659,7 +667,11 @@ async function runZoomBackfill(days: number) {
     try {
       let transcript: string | null = null;
       if (meeting.id) {
-        transcript = await zoomService.getMeetingTranscript(String(meeting.id));
+        try {
+          transcript = await zoomService.getMeetingTranscript(String(meeting.id));
+        } catch {
+          // Transcript fetch failed — store meeting without it
+        }
       }
 
       await storeWebhookEvent("zoom_meeting", "meeting.ended_backfill", {

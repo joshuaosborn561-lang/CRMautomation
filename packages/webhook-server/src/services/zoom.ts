@@ -103,11 +103,28 @@ export async function getMeetingRecordings(meetingId: string): Promise<{
     status: string;
   }>;
 }> {
-  return (await zoomFetch(`/meetings/${meetingId}/recordings`)) as ReturnType<
-    typeof getMeetingRecordings
-  > extends Promise<infer T>
-    ? T
-    : never;
+  // Zoom UUIDs with / or = need double URL encoding
+  const encodedId = meetingId.includes("/") || meetingId.includes("=")
+    ? encodeURIComponent(encodeURIComponent(meetingId))
+    : meetingId;
+
+  try {
+    return (await zoomFetch(`/meetings/${encodedId}/recordings`)) as {
+      recording_files: Array<{
+        id: string;
+        file_type: string;
+        download_url: string;
+        recording_type: string;
+        status: string;
+      }>;
+    };
+  } catch (err) {
+    // 404 = no recordings for this meeting — not an error
+    if (err instanceof Error && err.message.includes("404")) {
+      return { recording_files: [] };
+    }
+    throw err;
+  }
 }
 
 export async function getMeetingTranscript(meetingId: string): Promise<string | null> {
