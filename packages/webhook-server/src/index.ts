@@ -390,11 +390,28 @@ setupGmailWatch().catch((err) =>
 // --- Background Jobs ---
 
 // Process event queue every 30 seconds
+// Tracks consecutive AI failures to back off when rate-limited
+let consecutiveAiFailures = 0;
 cron.schedule("*/30 * * * * *", async () => {
+  // Back off if AI is rate-limited (exponential: 1 skip, 2 skips, 4 skips... up to 60 = ~30 min)
+  if (consecutiveAiFailures > 0) {
+    const skipCycles = Math.min(Math.pow(2, consecutiveAiFailures - 1), 60);
+    consecutiveAiFailures++;
+    if (consecutiveAiFailures % skipCycles !== 0) {
+      return; // skip this cycle
+    }
+  }
   try {
     await processEventQueue();
+    consecutiveAiFailures = 0; // reset on success
   } catch (err) {
-    logger.error("Event queue processing failed", { error: String(err) });
+    const errMsg = String(err);
+    if (errMsg.includes("429") || errMsg.includes("quota") || errMsg.includes("rate")) {
+      consecutiveAiFailures++;
+      logger.warn("AI rate limited, backing off", { failures: consecutiveAiFailures });
+    } else {
+      logger.error("Event queue processing failed", { error: errMsg });
+    }
   }
 });
 
