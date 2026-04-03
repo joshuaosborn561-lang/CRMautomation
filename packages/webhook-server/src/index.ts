@@ -19,6 +19,7 @@ import { backfillRouter } from "./routes/backfill";
 import { processEventQueue } from "./processors/event-pipeline";
 import { runNurtureCheck } from "./jobs/nurture-engine";
 import { setupGmailWatch } from "./services/gmail";
+import { runStartupBackfill } from "./jobs/startup-backfill";
 
 const app = express();
 
@@ -179,6 +180,16 @@ app.listen(port, () => {
 setupGmailWatch().catch((err) =>
   logger.warn("Gmail watch setup failed (will retry via cron)", { error: String(err) })
 );
+
+// --- One-time startup backfill ---
+// Pulls leads from all sources, processes them through AI, and pushes to Attio.
+// Only runs if there are 0 interaction_log entries (first boot) or RUN_STARTUP_BACKFILL=true.
+// Runs in background so it doesn't block the server from starting.
+setTimeout(() => {
+  runStartupBackfill().catch((err) =>
+    logger.error("Startup backfill failed", { error: String(err) })
+  );
+}, 5000); // 5 second delay to let server fully initialize
 
 // --- Background Jobs ---
 
