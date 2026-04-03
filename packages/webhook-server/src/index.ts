@@ -102,6 +102,78 @@ app.get("/api/status", async (_req, res) => {
   }
 });
 
+// Diagnostic endpoint — test every external API connection
+app.get("/api/diag", async (_req, res) => {
+  const config = getConfig();
+  const results: Record<string, unknown> = {};
+
+  // Supabase
+  try {
+    const { getSupabase } = await import("./utils/supabase");
+    const supabase = getSupabase();
+    const { count, error } = await supabase
+      .from("webhook_events")
+      .select("*", { count: "exact", head: true });
+    results.supabase = error ? { status: "FAIL", error: error.message } : { status: "OK", event_count: count };
+  } catch (err) {
+    results.supabase = { status: "FAIL", error: String(err) };
+  }
+
+  // Attio
+  try {
+    const resp = await fetch("https://api.attio.com/v2/self", {
+      headers: { Authorization: `Bearer ${config.ATTIO_API_KEY}` },
+    });
+    const body = await resp.text();
+    results.attio = resp.ok
+      ? { status: "OK", response: JSON.parse(body) }
+      : { status: "FAIL", http: resp.status, body };
+  } catch (err) {
+    results.attio = { status: "FAIL", error: String(err) };
+  }
+
+  // Attio pipeline
+  try {
+    if (config.ATTIO_PIPELINE_ID) {
+      const resp = await fetch(`https://api.attio.com/v2/lists/${config.ATTIO_PIPELINE_ID}`, {
+        headers: { Authorization: `Bearer ${config.ATTIO_API_KEY}` },
+      });
+      const body = await resp.text();
+      results.attio_pipeline = resp.ok
+        ? { status: "OK", pipeline: JSON.parse(body) }
+        : { status: "FAIL", http: resp.status, body };
+    } else {
+      results.attio_pipeline = { status: "FAIL", error: "ATTIO_PIPELINE_ID not set" };
+    }
+  } catch (err) {
+    results.attio_pipeline = { status: "FAIL", error: String(err) };
+  }
+
+  // Anthropic
+  try {
+    const keyPrefix = config.ANTHROPIC_API_KEY.substring(0, 10) + "...";
+    results.anthropic = { status: "OK", key_prefix: keyPrefix };
+  } catch (err) {
+    results.anthropic = { status: "FAIL", error: String(err) };
+  }
+
+  // Config summary
+  results.config = {
+    review_mode: config.REVIEW_MODE,
+    has_attio_key: !!config.ATTIO_API_KEY && config.ATTIO_API_KEY.length > 10,
+    has_attio_pipeline: !!config.ATTIO_PIPELINE_ID && config.ATTIO_PIPELINE_ID.length > 5,
+    has_anthropic_key: !!config.ANTHROPIC_API_KEY && config.ANTHROPIC_API_KEY.length > 10,
+    has_smartlead_key: !!config.SMARTLEAD_API_KEY && config.SMARTLEAD_API_KEY.length > 5,
+    has_heyreach_key: !!config.HEYREACH_API_KEY && config.HEYREACH_API_KEY.length > 5,
+    has_zoom_creds: !!config.ZOOM_CLIENT_ID && !!config.ZOOM_CLIENT_SECRET,
+    has_google_creds: !!config.GOOGLE_CLIENT_ID && !!config.GOOGLE_REFRESH_TOKEN,
+    has_leadmagic_key: !!config.LEADMAGIC_API_KEY,
+    run_startup_backfill: process.env.RUN_STARTUP_BACKFILL,
+  };
+
+  res.json(results);
+});
+
 // Reprocess events — reset processed events so the cron picks them up again
 app.post("/api/reprocess", async (req, res) => {
   try {

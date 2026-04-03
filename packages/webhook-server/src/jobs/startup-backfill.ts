@@ -22,9 +22,16 @@ export async function runStartupBackfill(): Promise<void> {
   // Check if we should run
   const forceRun = process.env.RUN_STARTUP_BACKFILL === "true";
 
-  const { count: interactionCount } = await supabase
+  const { count: interactionCount, error: countError } = await supabase
     .from("interaction_log")
     .select("*", { count: "exact", head: true });
+
+  if (countError) {
+    logger.error("STARTUP BACKFILL: Cannot query interaction_log — Supabase may be misconfigured", {
+      error: countError.message,
+    });
+    return;
+  }
 
   if (!forceRun && (interactionCount || 0) > 0) {
     logger.info("Startup backfill: skipping — interactions already exist", {
@@ -34,6 +41,51 @@ export async function runStartupBackfill(): Promise<void> {
   }
 
   logger.info("=== STARTUP BACKFILL: Beginning one-time data pull ===");
+
+  // Pre-flight: test critical API connections
+  logger.info("Pre-flight checks...");
+  const checks: Record<string, string> = {};
+
+  // Test Supabase
+  try {
+    const { error: sbErr } = await supabase.from("webhook_events").select("id").limit(1);
+    checks.supabase = sbErr ? `FAIL: ${sbErr.message}` : "OK";
+  } catch (err) {
+    checks.supabase = `FAIL: ${String(err)}`;
+  }
+
+  // Test Attio
+  try {
+    const resp = await fetch("https://api.attio.com/v2/self", {
+      headers: { Authorization: `Bearer ${config.ATTIO_API_KEY}` },
+    });
+    checks.attio = resp.ok ? "OK" : `FAIL: ${resp.status} ${await resp.text()}`;
+  } catch (err) {
+    checks.attio = `FAIL: ${String(err)}`;
+  }
+
+  // Test Anthropic
+  try {
+    const client = new Anthropic({ apiKey: config.ANTHROPIC_API_KEY });
+    await client.messages.create({
+      model: "claude-haiku-4-5-20251001",
+      max_tokens: 10,
+      messages: [{ role: "user", content: "say ok" }],
+    });
+    checks.anthropic = "OK";
+  } catch (err) {
+    checks.anthropic = `FAIL: ${String(err)}`;
+  }
+
+  logger.info("Pre-flight results", checks);
+
+  // Abort if critical services are down
+  if (checks.supabase !== "OK" || checks.attio !== "OK" || checks.anthropic !== "OK") {
+    logger.error("STARTUP BACKFILL ABORTED — critical services not reachable", checks);
+    return;
+  }
+
+  logger.info("All pre-flight checks passed ✓");
 
   // Step 1: Clear all old events (they're from failed credential attempts)
   logger.info("Step 1: Clearing old events...");
