@@ -46,7 +46,7 @@ export async function runStartupBackfill(): Promise<void> {
   try {
     logger.info("Step 2a: Pulling SmartLead leads...");
     results.smartlead = await pullSmartLead();
-    logger.info("SmartLead backfill done", results.smartlead);
+    logger.info("SmartLead backfill done", results.smartlead as Record<string, unknown>);
   } catch (err) {
     logger.error("SmartLead backfill failed", { error: String(err) });
     results.smartlead = { error: String(err) };
@@ -56,7 +56,7 @@ export async function runStartupBackfill(): Promise<void> {
   try {
     logger.info("Step 2b: Pulling HeyReach leads...");
     results.heyreach = await pullHeyReach(config);
-    logger.info("HeyReach backfill done", results.heyreach);
+    logger.info("HeyReach backfill done", results.heyreach as Record<string, unknown>);
   } catch (err) {
     logger.error("HeyReach backfill failed", { error: String(err) });
     results.heyreach = { error: String(err) };
@@ -66,7 +66,7 @@ export async function runStartupBackfill(): Promise<void> {
   try {
     logger.info("Step 2c: Pulling Zoom meetings...");
     results.zoom = await pullZoom(config);
-    logger.info("Zoom backfill done", results.zoom);
+    logger.info("Zoom backfill done", results.zoom as Record<string, unknown>);
   } catch (err) {
     logger.error("Zoom backfill failed", { error: String(err) });
     results.zoom = { error: String(err) };
@@ -76,7 +76,7 @@ export async function runStartupBackfill(): Promise<void> {
   try {
     logger.info("Step 2d: Pulling Gmail emails...");
     results.gmail = await pullGmail(config);
-    logger.info("Gmail backfill done", results.gmail);
+    logger.info("Gmail backfill done", results.gmail as Record<string, unknown>);
   } catch (err) {
     logger.error("Gmail backfill failed", { error: String(err) });
     results.gmail = { error: String(err) };

@@ -118,22 +118,8 @@ app.post("/api/reprocess", async (req, res) => {
       query = query.eq("source", source);
     }
 
-    const { count, error } = await query.select("*", { count: "exact", head: true });
-
+    const { error } = await query;
     if (error) throw error;
-
-    // Actually do the update
-    let updateQuery = supabase
-      .from("webhook_events")
-      .update({ processed: false, processed_at: null })
-      .eq("processed", true);
-
-    if (source) {
-      updateQuery = updateQuery.eq("source", source);
-    }
-
-    const { error: updateError } = await updateQuery;
-    if (updateError) throw updateError;
 
     res.json({
       message: `Reset events to unprocessed. The cron job will re-process them within 30 seconds.`,
