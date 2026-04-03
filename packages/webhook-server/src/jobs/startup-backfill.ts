@@ -67,7 +67,7 @@ export async function runStartupBackfill(): Promise<void> {
   // Test Gemini
   try {
     const gemini = new GoogleGenerativeAI(config.GEMINI_API_KEY);
-    const testModel = gemini.getGenerativeModel({ model: "gemini-2.0-flash" });
+    const testModel = gemini.getGenerativeModel({ model: "gemini-2.5-flash" });
     await testModel.generateContent("say ok");
     checks.gemini = "OK";
   } catch (err) {
@@ -485,7 +485,7 @@ async function pullGmail(config: ReturnType<typeof getConfig>): Promise<{ found:
 
   // AI classify in batches of 10 using Gemini Flash
   const gemini = new GoogleGenerativeAI(config.GEMINI_API_KEY);
-  const classifierModel = gemini.getGenerativeModel({ model: "gemini-2.0-flash" });
+  const classifierModel = gemini.getGenerativeModel({ model: "gemini-2.5-flash" });
   let processed = 0;
   const BATCH_SIZE = 10;
 

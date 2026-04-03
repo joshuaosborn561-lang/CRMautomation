@@ -50,7 +50,7 @@ Respond with valid JSON matching the AIProcessingResult schema. Output ONLY the 
 
 export async function processEvent(event: WebhookEvent): Promise<AIProcessingResult> {
   const client = getGeminiClient();
-  const model = client.getGenerativeModel({ model: "gemini-2.0-flash" });
+  const model = client.getGenerativeModel({ model: "gemini-2.5-flash" });
 
   const userPrompt = buildPrompt(event);
 
@@ -283,7 +283,7 @@ export async function processQuery(
   pipelineData: string
 ): Promise<string> {
   const client = getGeminiClient();
-  const model = client.getGenerativeModel({ model: "gemini-2.0-flash" });
+  const model = client.getGenerativeModel({ model: "gemini-2.5-flash" });
 
   const result = await model.generateContent({
     contents: [

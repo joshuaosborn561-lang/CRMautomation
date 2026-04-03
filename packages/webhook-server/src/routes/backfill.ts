@@ -870,7 +870,7 @@ async function classifyEmailBatch(
 ): Promise<Set<string>> {
   const config = getConfig();
   const client = new GoogleGenerativeAI(config.GEMINI_API_KEY);
-  const model = client.getGenerativeModel({ model: "gemini-2.0-flash" });
+  const model = client.getGenerativeModel({ model: "gemini-2.5-flash" });
 
   const emailList = emails
     .map(
