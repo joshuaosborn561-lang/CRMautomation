@@ -60,19 +60,34 @@ export async function processEvent(event: WebhookEvent): Promise<AIProcessingRes
     generationConfig: {
       maxOutputTokens: 1024,
       temperature: 0.1,
+      responseMimeType: "application/json",
     },
   });
 
   const text = result.response.text();
+  logger.info("Raw Gemini response", { text: text.substring(0, 500) });
 
-  // Extract JSON from response (handle markdown code blocks)
-  const jsonMatch = text.match(/```json\s*([\s\S]*?)\s*```/) || text.match(/\{[\s\S]*\}/);
-  if (!jsonMatch) {
+  // Extract JSON from response — try multiple patterns
+  let jsonStr: string | null = null;
+
+  // Try markdown code block first
+  const codeBlockMatch = text.match(/```(?:json)?\s*([\s\S]*?)\s*```/);
+  if (codeBlockMatch) {
+    jsonStr = codeBlockMatch[1];
+  }
+
+  // Try raw JSON object
+  if (!jsonStr) {
+    const objectMatch = text.match(/\{[\s\S]*\}/);
+    if (objectMatch) {
+      jsonStr = objectMatch[0];
+    }
+  }
+
+  if (!jsonStr) {
     logger.error("Failed to parse AI response as JSON", { text });
     throw new Error("AI response was not valid JSON");
   }
-
-  const jsonStr = jsonMatch[1] || jsonMatch[0];
   const parsed = JSON.parse(jsonStr) as AIProcessingResult;
   parsed.event_id = event.id;
 

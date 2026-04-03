@@ -175,7 +175,7 @@ app.get("/api/diag", async (_req, res) => {
 });
 
 // Clear events by source and reset others for reprocessing
-app.post("/api/fix", async (_req, res) => {
+app.all("/api/fix", async (_req, res) => {
   try {
     const { getSupabase } = await import("./utils/supabase");
     const supabase = getSupabase();
