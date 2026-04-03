@@ -336,53 +336,66 @@ backfillRouter.post("/heyreach", async (req: Request, res: Response) => {
     const config = getConfig();
     logger.info("Starting HeyReach backfill");
 
-    // HeyReach API — get campaigns and their leads
-    const campaignsResp = await fetch("https://api.heyreach.io/api/v1/campaigns", {
+    // HeyReach API — get all campaigns (POST, not GET)
+    const campaignsResp = await fetch("https://api.heyreach.io/api/public/campaign/GetAll", {
+      method: "POST",
       headers: {
         "X-API-KEY": config.HEYREACH_API_KEY,
         "Content-Type": "application/json",
+        "Accept": "application/json",
       },
+      body: JSON.stringify({ offset: 0, limit: 100 }),
     });
 
     if (!campaignsResp.ok) {
-      throw new Error(`HeyReach API error: ${campaignsResp.status}`);
+      const body = await campaignsResp.text();
+      throw new Error(`HeyReach API error: ${campaignsResp.status} ${body}`);
     }
 
-    const campaignsData = (await campaignsResp.json()) as Array<{
-      id: string;
-      name: string;
-    }>;
+    const campaignsJson = (await campaignsResp.json()) as {
+      data?: Array<{ id: string; name: string; status?: string }>;
+    };
+    const campaignsData = campaignsJson.data || [];
 
     let processed = 0;
     const errors: string[] = [];
 
-    for (const campaign of campaignsData || []) {
+    for (const campaign of campaignsData) {
       try {
         // Get leads from this campaign
         const leadsResp = await fetch(
-          `https://api.heyreach.io/api/v1/campaigns/${campaign.id}/leads?status=REPLIED`,
+          "https://api.heyreach.io/api/public/campaign/GetLeads",
           {
+            method: "POST",
             headers: {
               "X-API-KEY": config.HEYREACH_API_KEY,
               "Content-Type": "application/json",
+              "Accept": "application/json",
             },
+            body: JSON.stringify({ campaignId: campaign.id, page: 1, limit: 100 }),
           }
         );
 
         if (!leadsResp.ok) continue;
 
-        const leads = (await leadsResp.json()) as Array<{
-          id: string;
-          firstName?: string;
-          lastName?: string;
-          email?: string;
-          companyName?: string;
-          linkedinUrl?: string;
-          status: string;
-          lastMessage?: string;
-        }>;
+        const leadsJson = (await leadsResp.json()) as {
+          data?: Array<{
+            firstName?: string;
+            lastName?: string;
+            email?: string;
+            companyName?: string;
+            linkedinUrl?: string;
+            status?: string;
+            lastMessage?: string;
+          }>;
+        };
 
-        for (const lead of leads || []) {
+        // Filter for leads who replied or connected
+        const leads = (leadsJson.data || []).filter(
+          (l) => l.status === "replied" || l.status === "connected"
+        );
+
+        for (const lead of leads) {
           await storeWebhookEvent("heyreach", "reply_received_backfill", {
             contact_name: `${lead.firstName || ""} ${lead.lastName || ""}`.trim(),
             name: `${lead.firstName || ""} ${lead.lastName || ""}`.trim(),
@@ -716,42 +729,59 @@ async function runHeyReachBackfill() {
   let processed = 0;
 
   try {
-    const campaignsResp = await fetch("https://api.heyreach.io/api/v1/campaigns", {
+    const campaignsResp = await fetch("https://api.heyreach.io/api/public/campaign/GetAll", {
+      method: "POST",
       headers: {
         "X-API-KEY": config.HEYREACH_API_KEY,
         "Content-Type": "application/json",
+        "Accept": "application/json",
       },
+      body: JSON.stringify({ offset: 0, limit: 100 }),
     });
 
     if (!campaignsResp.ok) {
-      return { campaigns_scanned: 0, leads_with_engagement: 0, error: `API error: ${campaignsResp.status}` };
+      const body = await campaignsResp.text();
+      return { campaigns_scanned: 0, leads_with_engagement: 0, error: `API error: ${campaignsResp.status} ${body}` };
     }
 
-    const campaigns = (await campaignsResp.json()) as Array<{ id: string; name: string }>;
+    const campaignsJson = (await campaignsResp.json()) as {
+      data?: Array<{ id: string; name: string }>;
+    };
+    const campaigns = campaignsJson.data || [];
 
-    for (const campaign of campaigns || []) {
+    for (const campaign of campaigns) {
       try {
         const leadsResp = await fetch(
-          `https://api.heyreach.io/api/v1/campaigns/${campaign.id}/leads?status=REPLIED`,
+          "https://api.heyreach.io/api/public/campaign/GetLeads",
           {
+            method: "POST",
             headers: {
               "X-API-KEY": config.HEYREACH_API_KEY,
               "Content-Type": "application/json",
+              "Accept": "application/json",
             },
+            body: JSON.stringify({ campaignId: campaign.id, page: 1, limit: 100 }),
           }
         );
         if (!leadsResp.ok) continue;
 
-        const leads = (await leadsResp.json()) as Array<{
-          firstName?: string;
-          lastName?: string;
-          email?: string;
-          companyName?: string;
-          linkedinUrl?: string;
-          lastMessage?: string;
-        }>;
+        const leadsJson = (await leadsResp.json()) as {
+          data?: Array<{
+            firstName?: string;
+            lastName?: string;
+            email?: string;
+            companyName?: string;
+            linkedinUrl?: string;
+            status?: string;
+            lastMessage?: string;
+          }>;
+        };
 
-        for (const lead of leads || []) {
+        const leads = (leadsJson.data || []).filter(
+          (l) => l.status === "replied" || l.status === "connected"
+        );
+
+        for (const lead of leads) {
           await storeWebhookEvent("heyreach", "reply_received_backfill", {
             contact_name: `${lead.firstName || ""} ${lead.lastName || ""}`.trim(),
             name: `${lead.firstName || ""} ${lead.lastName || ""}`.trim(),
@@ -774,7 +804,7 @@ async function runHeyReachBackfill() {
       }
     }
 
-    return { campaigns_scanned: (campaigns || []).length, leads_with_engagement: processed };
+    return { campaigns_scanned: campaigns.length, leads_with_engagement: processed };
   } catch {
     return { campaigns_scanned: 0, leads_with_engagement: 0 };
   }
