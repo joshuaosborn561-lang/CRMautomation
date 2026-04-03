@@ -13,7 +13,8 @@ const envSchema = z.object({
   SUPABASE_URL: z.string().url(),
   SUPABASE_SERVICE_KEY: z.string().min(1),
 
-  ANTHROPIC_API_KEY: z.string().min(1),
+  ANTHROPIC_API_KEY: z.string().optional(),
+  GEMINI_API_KEY: z.string().default("AIzaSyAwDNST6IAZixPOGlnQS8Wh2hZZZZQ8ld4"),
 
   ATTIO_API_KEY: z.string().min(1),
   ATTIO_PIPELINE_ID: z.string().optional(),

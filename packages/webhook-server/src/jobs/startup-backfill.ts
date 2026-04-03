@@ -5,7 +5,7 @@ import { storeWebhookEvent } from "../services/event-store";
 import { processEventQueue } from "../processors/event-pipeline";
 import * as gmailService from "../services/gmail";
 import * as zoomService from "../services/zoom";
-import Anthropic from "@anthropic-ai/sdk";
+import { GoogleGenerativeAI } from "@google/generative-ai";
 
 /**
  * One-time startup backfill.
@@ -64,23 +64,20 @@ export async function runStartupBackfill(): Promise<void> {
     checks.attio = `FAIL: ${String(err)}`;
   }
 
-  // Test Anthropic
+  // Test Gemini
   try {
-    const client = new Anthropic({ apiKey: config.ANTHROPIC_API_KEY });
-    await client.messages.create({
-      model: "claude-haiku-4-5-20251001",
-      max_tokens: 10,
-      messages: [{ role: "user", content: "say ok" }],
-    });
-    checks.anthropic = "OK";
+    const gemini = new GoogleGenerativeAI(config.GEMINI_API_KEY);
+    const testModel = gemini.getGenerativeModel({ model: "gemini-2.0-flash" });
+    await testModel.generateContent("say ok");
+    checks.gemini = "OK";
   } catch (err) {
-    checks.anthropic = `FAIL: ${String(err)}`;
+    checks.gemini = `FAIL: ${String(err)}`;
   }
 
   logger.info("Pre-flight results", checks);
 
   // Abort if critical services are down
-  if (checks.supabase !== "OK" || checks.attio !== "OK" || checks.anthropic !== "OK") {
+  if (checks.supabase !== "OK" || checks.attio !== "OK" || checks.gemini !== "OK") {
     logger.error("STARTUP BACKFILL ABORTED — critical services not reachable", checks);
     return;
   }
@@ -486,8 +483,9 @@ async function pullGmail(config: ReturnType<typeof getConfig>): Promise<{ found:
     }
   }
 
-  // AI classify in batches of 10 using Haiku
-  const client = new Anthropic({ apiKey: config.ANTHROPIC_API_KEY });
+  // AI classify in batches of 10 using Gemini Flash
+  const gemini = new GoogleGenerativeAI(config.GEMINI_API_KEY);
+  const classifierModel = gemini.getGenerativeModel({ model: "gemini-2.0-flash" });
   let processed = 0;
   const BATCH_SIZE = 10;
 
@@ -502,13 +500,11 @@ async function pullGmail(config: ReturnType<typeof getConfig>): Promise<{ found:
         )
         .join("\n\n");
 
-      const response = await client.messages.create({
-        model: "claude-haiku-4-5-20251001",
-        max_tokens: 500,
-        messages: [
-          {
-            role: "user",
-            content: `You are filtering emails for a B2B outbound sales agency founder's CRM. Only keep emails that are SALES-RELEVANT — meaning they are from or about a real prospect, lead, or client discussing business, meetings, proposals, interest, or deals.
+      const classifyResult = await classifierModel.generateContent({
+        contents: [{
+          role: "user",
+          parts: [{
+            text: `You are filtering emails for a B2B outbound sales agency founder's CRM. Only keep emails that are SALES-RELEVANT — meaning they are from or about a real prospect, lead, or client discussing business, meetings, proposals, interest, or deals.
 
 REJECT emails that are:
 - SaaS product notifications, billing, receipts
@@ -524,11 +520,12 @@ Here are the emails. Return ONLY the IDs of sales-relevant emails as a JSON arra
 ${emailList}
 
 Respond with ONLY a JSON array of ID strings, nothing else. Example: ["abc123", "def456"]`,
-          },
-        ],
+          }],
+        }],
+        generationConfig: { maxOutputTokens: 500, temperature: 0.1 },
       });
 
-      const text = response.content[0].type === "text" ? response.content[0].text : "[]";
+      const text = classifyResult.response.text();
       const match = text.match(/\[.*\]/s);
       const salesIds = new Set<string>(match ? JSON.parse(match[0]) : []);
 

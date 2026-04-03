@@ -1,4 +1,4 @@
-import Anthropic from "@anthropic-ai/sdk";
+import { GoogleGenerativeAI } from "@google/generative-ai";
 import { getConfig } from "../config";
 import { logger } from "../utils/logger";
 import type {
@@ -7,12 +7,12 @@ import type {
   WebhookEvent,
 } from "@crm-autopilot/shared";
 
-let _client: Anthropic | null = null;
+let _client: GoogleGenerativeAI | null = null;
 
-function getAnthropicClient(): Anthropic {
+function getGeminiClient(): GoogleGenerativeAI {
   if (!_client) {
     const config = getConfig();
-    _client = new Anthropic({ apiKey: config.ANTHROPIC_API_KEY });
+    _client = new GoogleGenerativeAI(config.GEMINI_API_KEY);
   }
   return _client;
 }
@@ -46,31 +46,24 @@ Rules:
 - Suggest concrete next actions when creating tasks
 - Determine sentiment: positive (interested, engaged), neutral (noncommittal), negative (objection, not interested)
 
-Respond with valid JSON matching the AIProcessingResult schema.`;
+Respond with valid JSON matching the AIProcessingResult schema. Output ONLY the JSON object, no markdown or extra text.`;
 
 export async function processEvent(event: WebhookEvent): Promise<AIProcessingResult> {
-  const client = getAnthropicClient();
+  const client = getGeminiClient();
+  const model = client.getGenerativeModel({ model: "gemini-2.0-flash" });
 
   const userPrompt = buildPrompt(event);
 
-  const model = "claude-haiku-4-5-20251001";
-
-  const response = await client.messages.create({
-    model,
-    max_tokens: 1024,
-    system: SYSTEM_PROMPT,
-    messages: [
-      {
-        role: "user",
-        content: userPrompt,
-      },
-    ],
+  const result = await model.generateContent({
+    contents: [{ role: "user", parts: [{ text: userPrompt }] }],
+    systemInstruction: { role: "model", parts: [{ text: SYSTEM_PROMPT }] },
+    generationConfig: {
+      maxOutputTokens: 1024,
+      temperature: 0.1,
+    },
   });
 
-  const text = response.content
-    .filter((block): block is Anthropic.TextBlock => block.type === "text")
-    .map((block) => block.text)
-    .join("");
+  const text = result.response.text();
 
   // Extract JSON from response (handle markdown code blocks)
   const jsonMatch = text.match(/```json\s*([\s\S]*?)\s*```/) || text.match(/\{[\s\S]*\}/);
@@ -80,17 +73,17 @@ export async function processEvent(event: WebhookEvent): Promise<AIProcessingRes
   }
 
   const jsonStr = jsonMatch[1] || jsonMatch[0];
-  const result = JSON.parse(jsonStr) as AIProcessingResult;
-  result.event_id = event.id;
+  const parsed = JSON.parse(jsonStr) as AIProcessingResult;
+  parsed.event_id = event.id;
 
   logger.info("AI processed event", {
     eventId: event.id,
     source: event.source,
-    stage: result.deal.stage,
-    sentiment: result.note.sentiment,
+    stage: parsed.deal.stage,
+    sentiment: parsed.note.sentiment,
   });
 
-  return result;
+  return parsed;
 }
 
 function buildPrompt(event: WebhookEvent): string {
@@ -184,7 +177,7 @@ function buildZoomPhoneContext(payload: Record<string, unknown>): string {
   const obj = p?.object as Record<string, unknown> | undefined;
   const callDetails = payload.call_details as Record<string, unknown> | undefined;
   const transcript = payload.transcript as string | undefined;
-  const apolloContact = (payload.enriched_contact || payload.apollo_contact) as Record<string, unknown> | undefined;
+  const enrichedContact = (payload.enriched_contact || payload.apollo_contact) as Record<string, unknown> | undefined;
 
   let context = `Zoom Phone Call Event:
 - Caller: ${callDetails?.caller_number || obj?.caller_number || "unknown"} (${callDetails?.caller_name || obj?.caller_name || "unknown"})
@@ -194,16 +187,16 @@ function buildZoomPhoneContext(payload: Record<string, unknown>): string {
 - Date/Time: ${callDetails?.date_time || obj?.date_time || "unknown"}
 - Call Result: ${callDetails?.result || "unknown"}`;
 
-  if (apolloContact) {
+  if (enrichedContact) {
     context += `
 
 LEAD IDENTIFIED VIA LEADMAGIC (enriched contact data):
-- Name: ${apolloContact.first_name || ""} ${apolloContact.last_name || ""} (${apolloContact.name || ""})
-- Email: ${apolloContact.email || "unknown"}
-- Company: ${apolloContact.company || "unknown"}
-- Title: ${apolloContact.title || "unknown"}
-- LinkedIn: ${apolloContact.linkedin_url || "unknown"}
-- Phone: ${apolloContact.phone || "unknown"}
+- Name: ${enrichedContact.first_name || ""} ${enrichedContact.last_name || ""} (${enrichedContact.name || ""})
+- Email: ${enrichedContact.email || "unknown"}
+- Company: ${enrichedContact.company || "unknown"}
+- Title: ${enrichedContact.title || "unknown"}
+- LinkedIn: ${enrichedContact.linkedin_url || "unknown"}
+- Phone: ${enrichedContact.phone || "unknown"}
 
 IMPORTANT: Use this enriched contact data for the contact fields in your response. The email is the primary identifier for this lead.`;
   } else {
@@ -289,26 +282,30 @@ export async function processQuery(
   query: string,
   pipelineData: string
 ): Promise<string> {
-  const client = getAnthropicClient();
+  const client = getGeminiClient();
+  const model = client.getGenerativeModel({ model: "gemini-2.0-flash" });
 
-  const response = await client.messages.create({
-    model: "claude-haiku-4-5-20251001",
-    max_tokens: 2048,
-    system: `You are a conversational sales pipeline assistant for a B2B outbound agency founder.
+  const result = await model.generateContent({
+    contents: [
+      {
+        role: "user",
+        parts: [{ text: `Here is the current pipeline data:\n\n${pipelineData}\n\nUser question: ${query}` }],
+      },
+    ],
+    systemInstruction: {
+      role: "model",
+      parts: [{
+        text: `You are a conversational sales pipeline assistant for a B2B outbound agency founder.
 Answer questions about their pipeline, deals, and activity in a natural, conversational tone.
 Don't dump raw data — interpret it and give actionable insights.
 Be concise but thorough. Use specific numbers, names, and dates when available.
 If you don't have enough data to answer, say so clearly.`,
-    messages: [
-      {
-        role: "user",
-        content: `Here is the current pipeline data:\n\n${pipelineData}\n\nUser question: ${query}`,
-      },
-    ],
+      }],
+    },
+    generationConfig: {
+      maxOutputTokens: 2048,
+    },
   });
 
-  return response.content
-    .filter((block): block is Anthropic.TextBlock => block.type === "text")
-    .map((block) => block.text)
-    .join("");
+  return result.response.text();
 }

@@ -1,5 +1,5 @@
 import { Router, Request, Response } from "express";
-import Anthropic from "@anthropic-ai/sdk";
+import { GoogleGenerativeAI } from "@google/generative-ai";
 import { storeWebhookEvent } from "../services/event-store";
 import * as gmailService from "../services/gmail";
 import * as zoomService from "../services/zoom";
@@ -863,13 +863,14 @@ function isAutomatedSender(fromLower: string): boolean {
   return skipPatterns.some((p) => fromLower.includes(p));
 }
 
-// --- Claude AI email classifier ---
+// --- Gemini AI email classifier ---
 
 async function classifyEmailBatch(
   emails: Array<{ id: string; from: string; to: string; subject: string; snippet: string }>
 ): Promise<Set<string>> {
   const config = getConfig();
-  const client = new Anthropic({ apiKey: config.ANTHROPIC_API_KEY });
+  const client = new GoogleGenerativeAI(config.GEMINI_API_KEY);
+  const model = client.getGenerativeModel({ model: "gemini-2.0-flash" });
 
   const emailList = emails
     .map(
@@ -878,13 +879,11 @@ async function classifyEmailBatch(
     )
     .join("\n\n");
 
-  const response = await client.messages.create({
-    model: "claude-haiku-4-5-20251001",
-    max_tokens: 500,
-    messages: [
-      {
-        role: "user",
-        content: `You are filtering emails for a B2B outbound sales agency founder's CRM. Only keep emails that are SALES-RELEVANT — meaning they are from or about a real prospect, lead, or client discussing business, meetings, proposals, interest, or deals.
+  const result = await model.generateContent({
+    contents: [{
+      role: "user",
+      parts: [{
+        text: `You are filtering emails for a B2B outbound sales agency founder's CRM. Only keep emails that are SALES-RELEVANT — meaning they are from or about a real prospect, lead, or client discussing business, meetings, proposals, interest, or deals.
 
 REJECT emails that are:
 - SaaS product notifications, billing, receipts
@@ -900,14 +899,14 @@ Here are the emails. Return ONLY the IDs of sales-relevant emails as a JSON arra
 ${emailList}
 
 Respond with ONLY a JSON array of ID strings, nothing else. Example: ["abc123", "def456"]`,
-      },
-    ],
+      }],
+    }],
+    generationConfig: { maxOutputTokens: 500, temperature: 0.1 },
   });
 
-  const text = response.content[0].type === "text" ? response.content[0].text : "[]";
+  const text = result.response.text();
 
   try {
-    // Extract JSON array from response
     const match = text.match(/\[.*\]/s);
     if (!match) return new Set();
     const ids: string[] = JSON.parse(match[0]);
