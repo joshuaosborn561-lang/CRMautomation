@@ -313,6 +313,75 @@ app.get("/api/debug/test-one", async (_req, res) => {
   }
 });
 
+// One-time setup: create custom Attio pipeline attributes if they don't exist
+app.get("/api/setup-attio-fields", async (_req, res) => {
+  try {
+    const config = getConfig();
+    const pipelineId = config.ATTIO_PIPELINE_ID;
+    const results: Record<string, unknown> = {};
+
+    const fieldsToCreate = [
+      {
+        title: "Deal Name",
+        api_slug: "deal_name",
+        type: "text",
+        description: "Name of the deal (e.g. Company - Service)",
+      },
+      {
+        title: "Deal Value",
+        api_slug: "deal_value",
+        type: "currency",
+        description: "Monthly deal value in USD",
+      },
+      {
+        title: "Term Length",
+        api_slug: "term_length",
+        type: "number",
+        description: "Contract term in months",
+      },
+    ];
+
+    for (const field of fieldsToCreate) {
+      try {
+        const resp = await fetch(
+          `https://api.attio.com/v2/lists/${pipelineId}/attributes`,
+          {
+            method: "POST",
+            headers: {
+              Authorization: `Bearer ${config.ATTIO_API_KEY}`,
+              "Content-Type": "application/json",
+            },
+            body: JSON.stringify({
+              data: {
+                title: field.title,
+                api_slug: field.api_slug,
+                type: field.type,
+                description: field.description,
+                is_multiselect: false,
+              },
+            }),
+          }
+        );
+
+        const body = await resp.text();
+        if (resp.ok) {
+          results[field.api_slug] = { status: "CREATED", response: JSON.parse(body) };
+        } else if (resp.status === 409) {
+          results[field.api_slug] = { status: "ALREADY_EXISTS" };
+        } else {
+          results[field.api_slug] = { status: "FAIL", http: resp.status, body };
+        }
+      } catch (err) {
+        results[field.api_slug] = { status: "FAIL", error: String(err) };
+      }
+    }
+
+    res.json({ message: "Attio field setup complete", fields: results });
+  } catch (err) {
+    res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+  }
+});
+
 // Reprocess events — reset processed events so the cron picks them up again
 app.post("/api/reprocess", async (req, res) => {
   try {
