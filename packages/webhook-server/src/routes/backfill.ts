@@ -98,14 +98,15 @@ backfillRouter.delete("/clear", async (_req: Request, res: Response) => {
 backfillRouter.post("/gmail", async (req: Request, res: Response) => {
   try {
     const days = req.body.days || 30;
-    const maxResults = req.body.max_results || 100;
+    const maxResults = req.body.max_results || 500;
     const customQuery = req.body.query || "";
 
     const afterDate = new Date(Date.now() - days * 24 * 60 * 60 * 1000);
     const afterEpoch = Math.floor(afterDate.getTime() / 1000);
 
     // Search for emails — exclude newsletters, notifications, etc.
-    const query = customQuery || `after:${afterEpoch} -category:promotions -category:social -category:updates -category:forums`;
+    // Use "in:inbox" to only get inbox emails (skip sent, trash, spam)
+    const query = customQuery || `in:inbox after:${afterEpoch} -category:promotions -category:social -category:updates -category:forums`;
 
     logger.info("Starting Gmail backfill", { days, maxResults, query });
 
@@ -448,7 +449,7 @@ backfillRouter.post("/all", async (req: Request, res: Response) => {
     logger.info("Starting full backfill (all sources)", { days });
 
     // Run sequentially to avoid rate limits
-    const gmailResult = await runGmailBackfill(days, 100);
+    const gmailResult = await runGmailBackfill(days, 500);
     const zoomResult = await runZoomBackfill(days);
     const smartleadResult = await runSmartLeadBackfill();
     const heyreachResult = await runHeyReachBackfill();
@@ -487,8 +488,15 @@ async function listGmailMessages(
     }),
   });
 
+  if (!tokenResponse.ok) {
+    const errBody = await tokenResponse.text();
+    throw new Error(`Gmail OAuth token error: ${tokenResponse.status} ${errBody}`);
+  }
+
   const tokenData = (await tokenResponse.json()) as { access_token: string };
   const userId = config.GMAIL_USER_EMAIL || "me";
+
+  logger.info("Gmail backfill: listing messages", { userId, query });
 
   const allMessages: Array<{ id: string; threadId: string }> = [];
   let pageToken: string | undefined;
@@ -507,7 +515,11 @@ async function listGmailMessages(
       }
     );
 
-    if (!response.ok) break;
+    if (!response.ok) {
+      const errBody = await response.text();
+      logger.error("Gmail list messages failed", { status: response.status, body: errBody });
+      throw new Error(`Gmail API error: ${response.status} ${errBody}`);
+    }
 
     const data = (await response.json()) as {
       messages?: Array<{ id: string; threadId: string }>;
@@ -592,7 +604,7 @@ async function listZoomRecordings(
 async function runGmailBackfill(days: number, maxResults: number) {
   const afterDate = new Date(Date.now() - days * 24 * 60 * 60 * 1000);
   const afterEpoch = Math.floor(afterDate.getTime() / 1000);
-  const query = `after:${afterEpoch} -category:promotions -category:social -category:updates -category:forums`;
+  const query = `in:inbox after:${afterEpoch} -category:promotions -category:social -category:updates -category:forums`;
 
   const messages = await listGmailMessages(query, maxResults);
   let processed = 0;
