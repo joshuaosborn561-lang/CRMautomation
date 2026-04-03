@@ -8,6 +8,7 @@ import {
   logInteraction,
 } from "../services/event-store";
 import {
+  findContact,
   findOrCreateContact,
   findDealByContact,
   createDeal,
@@ -16,7 +17,17 @@ import {
   createTask,
 } from "../services/attio";
 import { enrichContact } from "../services/leadmagic";
-import type { AIProcessingResult, WebhookEvent } from "@crm-autopilot/shared";
+import type { AIProcessingResult, WebhookEvent, EventSource } from "@crm-autopilot/shared";
+
+// Sources that CREATE new contacts (outbound-first channels)
+const LEAD_SOURCES: EventSource[] = ["smartlead", "heyreach", "zoom_phone"];
+
+// Sources that only ENRICH existing contacts (don't create new ones)
+const ENRICHMENT_ONLY_SOURCES: EventSource[] = ["gmail"];
+
+// Zoom meetings: enrich existing contacts by default, but CREATE new contact
+// if the transcript clearly shows it's a real sales meeting
+const CONDITIONAL_LEAD_SOURCES: EventSource[] = ["zoom_meeting"];
 
 // Process all unprocessed events in the queue
 export async function processEventQueue(): Promise<void> {
@@ -31,7 +42,7 @@ export async function processEventQueue(): Promise<void> {
     } catch (err) {
       logger.error("Failed to process event", {
         eventId: event.id,
-        error: String(err),
+        error: err instanceof Error ? err.message : String(err),
       });
     }
   }
@@ -60,7 +71,7 @@ async function processSingleEvent(event: WebhookEvent): Promise<void> {
     await addToReviewQueue(event.id, event.source, result);
     logger.info("Event queued for review", { eventId: event.id });
   } else {
-    await applyToAttio(result);
+    await applyToAttio(result, event.source);
   }
 
   // Mark the raw event as processed
@@ -68,7 +79,10 @@ async function processSingleEvent(event: WebhookEvent): Promise<void> {
 }
 
 // Apply an AI processing result to Attio CRM
-export async function applyToAttio(result: AIProcessingResult): Promise<void> {
+export async function applyToAttio(
+  result: AIProcessingResult,
+  source?: EventSource
+): Promise<void> {
   const contact = result.contact;
 
   if (!contact.email) {
@@ -78,7 +92,102 @@ export async function applyToAttio(result: AIProcessingResult): Promise<void> {
     return;
   }
 
-  // 0. Enrich contact with LeadMagic before pushing to Attio
+  // --- SOURCE-BASED LOGIC ---
+  // Lead sources (SmartLead, HeyReach, Zoom Phone): CREATE new contacts
+  // Gmail: ONLY update existing contacts (pure enrichment)
+  // Zoom Meeting: enrich existing contacts, OR create new if transcript shows real sales meeting
+  const isEnrichmentOnly = source && ENRICHMENT_ONLY_SOURCES.includes(source);
+  const isConditionalLead = source && CONDITIONAL_LEAD_SOURCES.includes(source);
+
+  if (isEnrichmentOnly || isConditionalLead) {
+    // Check if contact already exists in Attio
+    const existingContact = await findContact(contact.email);
+
+    if (!existingContact) {
+      // For Zoom meetings: create new contact if AI determined it's a real sales meeting
+      // (positive sentiment = engaged prospect, or stage beyond initial reply = real deal activity)
+      const isSalesMeeting =
+        isConditionalLead &&
+        (result.note.sentiment === "positive" ||
+          ["discovery_completed", "proposal_sent", "negotiating", "closed_won"].includes(
+            result.deal.stage
+          ));
+
+      if (isSalesMeeting) {
+        logger.info("Zoom meeting identified as sales meeting — creating new contact", {
+          email: contact.email,
+          sentiment: result.note.sentiment,
+          stage: result.deal.stage,
+        });
+        // Fall through to the lead source path below to create contact + deal
+      } else {
+        logger.info("Skipping enrichment-only event — contact not in CRM", {
+          email: contact.email,
+          source,
+          eventId: result.event_id,
+        });
+        return;
+      }
+    } else {
+      // Contact exists — enrich and update their deal
+      const contactId = existingContact.id;
+
+      // Enrich with LeadMagic
+      try {
+        const enriched = await enrichContact({
+          email: contact.email,
+          first_name: contact.first_name,
+          last_name: contact.last_name,
+          company: contact.company,
+          linkedin_url: contact.linkedin_url,
+          phone: contact.phone,
+        });
+        if (enriched.enriched) {
+          contact.first_name = contact.first_name || enriched.first_name;
+          contact.last_name = contact.last_name || enriched.last_name;
+          contact.company = contact.company || enriched.company;
+          contact.linkedin_url = contact.linkedin_url || enriched.linkedin_url;
+          contact.phone = contact.phone || enriched.phone;
+        }
+      } catch (err) {
+        logger.warn("LeadMagic enrichment failed", { error: String(err) });
+      }
+
+      // Find existing deal and update it
+      const existingDeal = await findDealByContact(contactId);
+      if (existingDeal) {
+        await updateDealStage(existingDeal.id, result.deal.stage);
+        await createNote({
+          parent_object: "deals",
+          parent_id: existingDeal.id,
+          title: `[${result.note.sentiment.toUpperCase()}] ${result.deal.stage_reason}`,
+          content: buildNoteContent(result),
+        });
+        if (result.task) {
+          await createTask({
+            title: result.task.title,
+            description: result.task.description,
+            linked_deal_id: existingDeal.id,
+            due_date: result.task.due_date,
+          });
+        }
+        logger.info("Enriched existing contact from " + source, {
+          email: contact.email,
+          dealId: existingDeal.id,
+        });
+      } else {
+        logger.info("Contact exists but no deal — skipping enrichment", {
+          email: contact.email,
+          source,
+        });
+      }
+      return;
+    }
+  }
+
+  // --- LEAD SOURCE: Create new contacts and deals ---
+
+  // Enrich contact with LeadMagic before pushing to Attio
   try {
     const enriched = await enrichContact({
       email: contact.email,
@@ -95,17 +204,10 @@ export async function applyToAttio(result: AIProcessingResult): Promise<void> {
       contact.company = contact.company || enriched.company;
       contact.linkedin_url = contact.linkedin_url || enriched.linkedin_url;
       contact.phone = contact.phone || enriched.phone;
-      // Email stays as-is (AI already extracted it)
 
-      logger.info("Contact enriched via LeadMagic before Attio push", {
+      logger.info("Contact enriched via LeadMagic", {
         email: contact.email,
         company: contact.company,
-        enrichedFields: {
-          name: !!enriched.first_name,
-          company: !!enriched.company,
-          linkedin: !!enriched.linkedin_url,
-          industry: !!enriched.industry,
-        },
       });
     }
   } catch (err) {
@@ -128,7 +230,6 @@ export async function applyToAttio(result: AIProcessingResult): Promise<void> {
   let dealId: string;
   if (existingDeal) {
     dealId = existingDeal.id;
-    // Update stage if it's progressing forward (or moving to closed/nurture)
     await updateDealStage(dealId, result.deal.stage);
   } else {
     dealId = await createDeal({
