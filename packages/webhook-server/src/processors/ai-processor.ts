@@ -53,9 +53,7 @@ export async function processEvent(event: WebhookEvent): Promise<AIProcessingRes
 
   const userPrompt = buildPrompt(event);
 
-  // Use Haiku for most events (cheap), Sonnet only for events with transcripts
-  const hasTranscript = !!(event.payload?.transcript);
-  const model = hasTranscript ? "claude-sonnet-4-6" : "claude-haiku-4-5-20251001";
+  const model = "claude-haiku-4-5-20251001";
 
   const response = await client.messages.create({
     model,
