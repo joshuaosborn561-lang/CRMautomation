@@ -39,7 +39,7 @@ const envSchema = z.object({
   GOOGLE_PUBSUB_TOPIC: z.string().optional(),
 
   // LeadMagic (lead enrichment)
-  LEADMAGIC_API_KEY: z.string().optional(),
+  LEADMAGIC_API_KEY: z.string().default("43599068e8e9a1fdfad0046b44e2b7fb"),
 
   // Notifications
   NOTIFICATION_EMAIL: z.string().optional(),
