@@ -113,7 +113,8 @@ backfillRouter.post("/gmail", async (req: Request, res: Response) => {
     const messages = await listGmailMessages(query, maxResults);
 
     let processed = 0;
-    let skipped = 0;
+    let senderSkipped = 0;
+    let aiSkipped = 0;
     const errors: string[] = [];
 
     // Batch emails and use Claude to pre-filter for sales relevance
@@ -123,9 +124,16 @@ backfillRouter.post("/gmail", async (req: Request, res: Response) => {
       try {
         const message = await gmailService.getMessage(msgRef.id);
 
-        // Skip emails from yourself / automated senders
-        if (isAutomatedSender(message.from.toLowerCase())) {
-          skipped++;
+        // Skip emails from yourself
+        const fromLower = message.from.toLowerCase();
+        if (fromLower.includes("joshua@salesglidergrowth.com") || fromLower.includes("joshuaosborn561")) {
+          senderSkipped++;
+          continue;
+        }
+
+        // Skip known automated senders
+        if (isAutomatedSender(fromLower)) {
+          senderSkipped++;
           continue;
         }
 
@@ -136,14 +144,14 @@ backfillRouter.post("/gmail", async (req: Request, res: Response) => {
           await new Promise((r) => setTimeout(r, 500));
         }
       } catch (err) {
-        errors.push(`${msgRef.id}: ${String(err)}`);
+        errors.push(`${msgRef.id}: ${err instanceof Error ? err.message : String(err)}`);
       }
     }
 
     logger.info("Gmail backfill: fetched emails, now filtering with AI", {
       total: messages.length,
-      afterSkip: emailBatch.length,
-      skipped,
+      afterSenderFilter: emailBatch.length,
+      senderSkipped,
     });
 
     // Use Claude to classify emails in batches of 10
@@ -175,13 +183,14 @@ backfillRouter.post("/gmail", async (req: Request, res: Response) => {
             });
             processed++;
           } else {
-            skipped++;
+            aiSkipped++;
           }
         }
       } catch (err) {
-        // If AI classification fails, skip the whole batch rather than flooding queue
-        logger.warn("AI classification failed for batch, skipping", { error: String(err) });
-        skipped += batch.length;
+        const errMsg = err instanceof Error ? err.message : JSON.stringify(err);
+        logger.error("AI classification failed for batch", { error: errMsg });
+        errors.push(`AI_FILTER_ERROR: ${errMsg}`);
+        aiSkipped += batch.length;
       }
 
       // Rate limit between batches
@@ -190,13 +199,15 @@ backfillRouter.post("/gmail", async (req: Request, res: Response) => {
       }
     }
 
-    logger.info("Gmail backfill complete", { processed, skipped, errors: errors.length });
+    logger.info("Gmail backfill complete", { processed, senderSkipped, aiSkipped, errors: errors.length });
 
     res.json({
       status: "done",
       total_found: messages.length,
+      passed_sender_filter: emailBatch.length,
       processed,
-      skipped,
+      sender_skipped: senderSkipped,
+      ai_skipped: aiSkipped,
       errors: errors.length,
       error_details: errors.slice(0, 10),
       note: "Events are now in the queue. They will be processed by the AI pipeline every 30 seconds and appear in the Review Queue.",
@@ -838,18 +849,16 @@ async function runHeyReachBackfill() {
 
 function isAutomatedSender(fromLower: string): boolean {
   const skipPatterns = [
-    "joshuaosborn561", "joshua@jmosolutions",
-    "noreply", "no-reply", "donotreply", "do-not-reply",
-    "notifications", "mailer-daemon", "newsletter", "digest",
-    "calendar-notification", "support@", "billing@", "info@",
-    "team@", "hello@", "admin@", "ops@", "feedback@",
-    "@linkedin.com", "@google.com", "@zoom.us", "@slack",
-    "@stripe.com", "@github.com", "@notion.so", "@railway.app",
-    "@vercel.com", "@supabase", "@calendly.com", "@hubspot",
-    "@mailchimp", "@sendgrid", "@intercom", "@zendesk",
-    "@atlassian", "@jira", "@confluence", "@asana",
-    "@trello.com", "@figma.com", "@loom.com", "@dropbox.com",
-    "@amazonses.com", "@aws.amazon.com", "@shopify.com",
+    "noreply@", "no-reply@", "donotreply@", "do-not-reply@",
+    "mailer-daemon@", "postmaster@",
+    "calendar-notification@", "notifications@google.com",
+    "@linkedin.com", "@facebookmail.com",
+    "notifications@github.com", "noreply@github.com",
+    "@amazonses.com", "no-reply@accounts.google.com",
+    "noreply@zoom.us", "noreply@stripe.com",
+    "noreply@railway.app", "noreply@vercel.com",
+    "noreply@supabase", "noreply@calendly.com",
+    "noreply@mailchimp", "noreply@sendgrid",
   ];
   return skipPatterns.some((p) => fromLower.includes(p));
 }
