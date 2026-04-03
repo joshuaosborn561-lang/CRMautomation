@@ -68,6 +68,8 @@ export interface AIProcessingResult {
     title: string;
     stage: DealStage;
     stage_reason: string;
+    value?: number;
+    term_months?: number;
   };
   note: {
     summary: string;

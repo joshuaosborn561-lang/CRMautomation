@@ -153,27 +153,42 @@ export async function findDealByContact(contactId: string): Promise<{ id: string
   return null;
 }
 
-export async function createDeal(deal: AttioDeal): Promise<string> {
+export async function createDeal(deal: AttioDeal & { value?: number; term_months?: number }): Promise<string> {
   const config = getConfig();
   const pipelineId = config.ATTIO_PIPELINE_ID;
   if (!pipelineId) throw new Error("ATTIO_PIPELINE_ID not configured");
 
   const stageName = STAGE_MAP[deal.stage];
 
+  const entryValues: Record<string, unknown> = {
+    name: [{ value: deal.name }],
+  };
+
+  if (deal.value) {
+    entryValues.deal_value = [{ value: deal.value, currency_code: "USD" }];
+  }
+  if (deal.term_months) {
+    entryValues.term_length = [{ value: deal.term_months }];
+  }
+
   const result = (await attioFetch(`/lists/${pipelineId}/entries`, {
     method: "POST",
     body: JSON.stringify({
       data: {
         parent_record_id: deal.contact_id,
-        entry_values: {
-          name: [{ value: deal.name }],
-        },
+        entry_values: entryValues,
         current_status_title: stageName,
       },
     }),
   })) as { data: { entry_id: string } };
 
-  logger.info("Created Attio deal", { name: deal.name, stage: stageName, id: result.data.entry_id });
+  logger.info("Created Attio deal", {
+    name: deal.name,
+    stage: stageName,
+    value: deal.value,
+    term_months: deal.term_months,
+    id: result.data.entry_id,
+  });
   return result.data.entry_id;
 }
 

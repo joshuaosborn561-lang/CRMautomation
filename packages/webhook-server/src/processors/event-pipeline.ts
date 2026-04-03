@@ -237,6 +237,8 @@ export async function applyToAttio(
       stage: result.deal.stage,
       contact_id: contactId,
       company: contact.company,
+      value: result.deal.value,
+      term_months: result.deal.term_months,
     });
   }
 
@@ -271,6 +273,12 @@ function buildNoteContent(result: AIProcessingResult): string {
 
   if (result.note.pricing_discussed) {
     content += "\n\n💰 Pricing was discussed in this interaction.";
+    if (result.deal.value) {
+      content += ` Deal value: $${result.deal.value.toLocaleString()}/mo`;
+      if (result.deal.term_months) {
+        content += ` × ${result.deal.term_months} months ($${(result.deal.value * result.deal.term_months).toLocaleString()} total)`;
+      }
+    }
   }
 
   if (result.note.next_steps) {

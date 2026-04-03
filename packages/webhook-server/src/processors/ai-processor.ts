@@ -38,6 +38,10 @@ Deal stages (in order of progression):
 Rules:
 - Only advance the deal stage, never move it backwards (unless to closed_lost or nurture)
 - If pricing/budget was discussed, mark pricing_discussed as true
+- IMPORTANT: Extract the deal value (monthly price) and term length (in months) when mentioned.
+  The founder almost always states the price and term length during calls. Look for dollar amounts,
+  monthly/annual pricing, and contract duration (e.g. "3 months at $2,500/month" → value: 2500, term_months: 3).
+  If only a total is mentioned (e.g. "$15,000 for 6 months"), calculate the monthly rate (value: 2500, term_months: 6).
 - Be specific in your summaries - include key details from the conversation
 - Suggest concrete next actions when creating tasks
 - Determine sentiment: positive (interested, engaged), neutral (noncommittal), negative (objection, not interested)
@@ -135,7 +139,9 @@ Respond with a JSON object matching this schema:
   "deal": {
     "title": "string - name for this deal, typically 'Company Name - Service'",
     "stage": "one of the deal stages",
-    "stage_reason": "string - why this stage was chosen"
+    "stage_reason": "string - why this stage was chosen",
+    "value": "number (optional) - monthly price in USD if mentioned (e.g. 2500 for $2,500/mo)",
+    "term_months": "number (optional) - contract term length in months if mentioned"
   },
   "note": {
     "summary": "string - human-readable summary of the interaction",
