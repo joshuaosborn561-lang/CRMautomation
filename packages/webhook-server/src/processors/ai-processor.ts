@@ -53,8 +53,12 @@ export async function processEvent(event: WebhookEvent): Promise<AIProcessingRes
 
   const userPrompt = buildPrompt(event);
 
+  // Use Haiku for most events (cheap), Sonnet only for events with transcripts
+  const hasTranscript = !!(event.payload?.transcript);
+  const model = hasTranscript ? "claude-sonnet-4-6" : "claude-haiku-4-5-20251001";
+
   const response = await client.messages.create({
-    model: "claude-sonnet-4-6",
+    model,
     max_tokens: 1024,
     system: SYSTEM_PROMPT,
     messages: [
@@ -290,7 +294,7 @@ export async function processQuery(
   const client = getAnthropicClient();
 
   const response = await client.messages.create({
-    model: "claude-sonnet-4-6",
+    model: "claude-haiku-4-5-20251001",
     max_tokens: 2048,
     system: `You are a conversational sales pipeline assistant for a B2B outbound agency founder.
 Answer questions about their pipeline, deals, and activity in a natural, conversational tone.
