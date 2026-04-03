@@ -212,6 +212,13 @@ app.all("/api/fix", async (_req, res) => {
       .eq("contact_email", "unknown");
     results.unknown_interactions_cleared = clearErr ? `Error: ${clearErr.message}` : "OK";
 
+    // 3b. Delete events with empty payloads or "unknown" event types (broken events)
+    const { error: emptyErr } = await supabase
+      .from("webhook_events")
+      .delete()
+      .eq("event_type", "unknown");
+    results.empty_events_deleted = emptyErr ? `Error: ${emptyErr.message}` : "OK";
+
     // 4. Show what's left
     const { count: remaining } = await supabase
       .from("webhook_events")
@@ -222,7 +229,7 @@ app.all("/api/fix", async (_req, res) => {
     const config = getConfig();
     try {
       const pipelineResp = await fetch(
-        `https://api.attio.com/v2/lists/${config.ATTIO_PIPELINE_ID}/statuses`,
+        `https://api.attio.com/v2/lists/${config.ATTIO_PIPELINE_ID}/attributes`,
         { headers: { Authorization: `Bearer ${config.ATTIO_API_KEY}` } }
       );
       if (pipelineResp.ok) {
@@ -256,21 +263,24 @@ app.get("/api/debug/test-one", async (_req, res) => {
     const { getSupabase } = await import("./utils/supabase");
     const supabase = getSupabase();
 
-    // Get one unprocessed non-gmail event
+    // Get one unprocessed non-gmail event that has actual payload data
     const { data: events } = await supabase
       .from("webhook_events")
       .select("*")
       .eq("processed", false)
       .neq("source", "gmail")
+      .neq("payload", "{}")
+      .neq("event_type", "unknown")
       .order("received_at", { ascending: true })
-      .limit(1);
+      .limit(5);
 
     if (!events || events.length === 0) {
       res.json({ message: "No unprocessed non-gmail events to test" });
       return;
     }
 
-    const event = events[0];
+    // Pick first event with actual content
+    const event = events.find((e: any) => e.payload && Object.keys(e.payload).length > 0) || events[0];
     const result: Record<string, unknown> = {
       event_id: event.id,
       source: event.source,
