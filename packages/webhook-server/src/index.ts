@@ -174,6 +174,135 @@ app.get("/api/diag", async (_req, res) => {
   res.json(results);
 });
 
+// Clear events by source and reset others for reprocessing
+app.post("/api/fix", async (_req, res) => {
+  try {
+    const { getSupabase } = await import("./utils/supabase");
+    const supabase = getSupabase();
+    const results: Record<string, unknown> = {};
+
+    // 1. Delete all gmail events and their linked data
+    const { data: gmailEvents } = await supabase
+      .from("webhook_events")
+      .select("id")
+      .eq("source", "gmail");
+    const gmailIds = (gmailEvents || []).map((e: { id: string }) => e.id);
+
+    if (gmailIds.length > 0) {
+      for (let i = 0; i < gmailIds.length; i += 200) {
+        const chunk = gmailIds.slice(i, i + 200);
+        await supabase.from("review_queue").delete().in("event_id", chunk);
+        await supabase.from("interaction_log").delete().in("raw_event_id", chunk);
+      }
+      await supabase.from("webhook_events").delete().eq("source", "gmail");
+    }
+    results.gmail_deleted = gmailIds.length;
+
+    // 2. Reset all non-gmail processed events to unprocessed (so they re-run with correct config)
+    const { error: resetErr } = await supabase
+      .from("webhook_events")
+      .update({ processed: false, processed_at: null })
+      .eq("processed", true);
+    results.events_reset = resetErr ? `Error: ${resetErr.message}` : "OK";
+
+    // 3. Clear interaction_log entries with "unknown" email (failed enrichment)
+    const { error: clearErr } = await supabase
+      .from("interaction_log")
+      .delete()
+      .eq("contact_email", "unknown");
+    results.unknown_interactions_cleared = clearErr ? `Error: ${clearErr.message}` : "OK";
+
+    // 4. Show what's left
+    const { count: remaining } = await supabase
+      .from("webhook_events")
+      .select("*", { count: "exact", head: true });
+    results.remaining_events = remaining;
+
+    // 5. Show Attio pipeline stages for debugging
+    const config = getConfig();
+    try {
+      const pipelineResp = await fetch(
+        `https://api.attio.com/v2/lists/${config.ATTIO_PIPELINE_ID}/statuses`,
+        { headers: { Authorization: `Bearer ${config.ATTIO_API_KEY}` } }
+      );
+      if (pipelineResp.ok) {
+        const pipelineData = await pipelineResp.json();
+        results.attio_pipeline_stages = pipelineData;
+      } else {
+        results.attio_pipeline_stages = `Error: ${pipelineResp.status} ${await pipelineResp.text()}`;
+      }
+    } catch (err) {
+      results.attio_pipeline_stages = `Error: ${String(err)}`;
+    }
+
+    // 6. Check LeadMagic key
+    results.leadmagic_key_set = !!config.LEADMAGIC_API_KEY && config.LEADMAGIC_API_KEY.length > 5;
+    results.leadmagic_action_needed = !results.leadmagic_key_set
+      ? "SET LEADMAGIC_API_KEY in Railway env vars to: 43599068e8e9a1fdfad0046b44e2b7fb"
+      : "Key is set";
+
+    res.json({
+      message: "Gmail events cleared, remaining events reset for reprocessing",
+      ...results,
+    });
+  } catch (err) {
+    res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+  }
+});
+
+// Test processing a single event end-to-end (dry run with full error details)
+app.get("/api/debug/test-one", async (_req, res) => {
+  try {
+    const { getSupabase } = await import("./utils/supabase");
+    const supabase = getSupabase();
+
+    // Get one unprocessed non-gmail event
+    const { data: events } = await supabase
+      .from("webhook_events")
+      .select("*")
+      .eq("processed", false)
+      .neq("source", "gmail")
+      .order("received_at", { ascending: true })
+      .limit(1);
+
+    if (!events || events.length === 0) {
+      res.json({ message: "No unprocessed non-gmail events to test" });
+      return;
+    }
+
+    const event = events[0];
+    const result: Record<string, unknown> = {
+      event_id: event.id,
+      source: event.source,
+      event_type: event.event_type,
+      payload_keys: Object.keys(event.payload || {}),
+    };
+
+    // Try AI processing
+    try {
+      const { processEvent } = await import("./processors/ai-processor");
+      const aiResult = await processEvent(event);
+      result.ai_result = aiResult;
+
+      // Try applying to Attio
+      try {
+        const { applyToAttio } = await import("./processors/event-pipeline");
+        await applyToAttio(aiResult, event.source);
+        result.attio_result = "SUCCESS — check Attio!";
+      } catch (attioErr) {
+        result.attio_error = attioErr instanceof Error ? attioErr.message : String(attioErr);
+        result.attio_stack = attioErr instanceof Error ? attioErr.stack : undefined;
+      }
+    } catch (aiErr) {
+      result.ai_error = aiErr instanceof Error ? aiErr.message : String(aiErr);
+    }
+
+    res.json(result);
+  } catch (err) {
+    res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+  }
+});
+
 // Reprocess events — reset processed events so the cron picks them up again
 app.post("/api/reprocess", async (req, res) => {
   try {
