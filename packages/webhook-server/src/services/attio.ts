@@ -171,16 +171,35 @@ export async function createDeal(deal: AttioDeal & { value?: number; term_months
     entryValues.term_length = [{ value: deal.term_months }];
   }
 
-  const result = (await attioFetch(`/lists/${pipelineId}/entries`, {
-    method: "POST",
-    body: JSON.stringify({
-      data: {
-        parent_record_id: deal.contact_id,
-        entry_values: Object.keys(entryValues).length > 0 ? entryValues : undefined,
-        current_status_title: stageName,
-      },
-    }),
-  })) as { data: { entry_id: string } };
+  // Try with stage first, fall back to no stage if it fails
+  let result: { data: { entry_id: string } };
+  try {
+    result = (await attioFetch(`/lists/${pipelineId}/entries`, {
+      method: "POST",
+      body: JSON.stringify({
+        data: {
+          parent_record_id: deal.contact_id,
+          entry_values: Object.keys(entryValues).length > 0 ? entryValues : undefined,
+          current_status_title: stageName,
+        },
+      }),
+    })) as { data: { entry_id: string } };
+  } catch (err) {
+    // Stage name might not exist — retry without it
+    logger.warn("Deal creation failed with stage, retrying without", {
+      stage: stageName,
+      error: String(err),
+    });
+    result = (await attioFetch(`/lists/${pipelineId}/entries`, {
+      method: "POST",
+      body: JSON.stringify({
+        data: {
+          parent_record_id: deal.contact_id,
+          entry_values: Object.keys(entryValues).length > 0 ? entryValues : undefined,
+        },
+      }),
+    })) as { data: { entry_id: string } };
+  }
 
   logger.info("Created Attio deal", {
     name: deal.name,
@@ -199,16 +218,23 @@ export async function updateDealStage(dealId: string, stage: DealStage): Promise
 
   const stageName = STAGE_MAP[stage];
 
-  await attioFetch(`/lists/${pipelineId}/entries/${dealId}`, {
-    method: "PATCH",
-    body: JSON.stringify({
-      data: {
-        current_status_title: stageName,
-      },
-    }),
-  });
-
-  logger.info("Updated Attio deal stage", { dealId, stage: stageName });
+  try {
+    await attioFetch(`/lists/${pipelineId}/entries/${dealId}`, {
+      method: "PATCH",
+      body: JSON.stringify({
+        data: {
+          current_status_title: stageName,
+        },
+      }),
+    });
+    logger.info("Updated Attio deal stage", { dealId, stage: stageName });
+  } catch (err) {
+    logger.warn("Failed to update deal stage (stage may not exist in Attio)", {
+      dealId,
+      stage: stageName,
+      error: String(err),
+    });
+  }
 }
 
 // --- Notes ---
