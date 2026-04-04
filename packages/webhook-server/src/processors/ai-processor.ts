@@ -18,33 +18,46 @@ function getGeminiClient(): GoogleGenerativeAI {
 }
 
 const SYSTEM_PROMPT = `You are an AI assistant for a B2B outbound agency founder's CRM automation system.
-Your job is to analyze sales interaction events and determine:
+Your job is to analyze sales interaction events and extract structured data.
 
-1. Contact information (extract from the event data)
-2. Deal stage (where this prospect is in the pipeline)
-3. A human-readable note summarizing what happened
-4. Whether a follow-up task should be created
+CRITICAL EMAIL RULES:
+- ONLY use email addresses that are EXPLICITLY present in the event data.
+- NEVER fabricate, guess, or construct email addresses. No "firstname@unknown.com" or "name@company.com" guesses.
+- If no email address appears in the data, set email to "unknown".
+- For Zoom calls: use the enriched_contact email if provided. Otherwise set email to "unknown".
+- For Zoom meetings: extract emails from participant lists or host_email. If a participant has no email, set to "unknown".
+- The founder's email is joshua@salesglidergrowth.com — SKIP this person, they are the owner not a lead.
+
+CONTACT EXTRACTION:
+- Extract the EXTERNAL person (the prospect/lead), not the founder.
+- Use enriched_contact data when available — it has the most accurate info.
+- For phone calls: the external party is the non-founder caller/callee.
+- For meetings: extract the non-founder participant(s).
 
 Deal stages (in order of progression):
-- replied_showed_interest: First positive reply from cold email, LinkedIn accept/reply, or cold call interest
+- replied_showed_interest: First positive reply from cold email, LinkedIn accept/reply, or cold call pickup
 - call_meeting_booked: Calendar invite sent or meeting scheduled
-- discovery_completed: Discovery call/meeting completed
+- discovery_completed: Discovery call/meeting completed (ANY completed call or meeting = at least this stage)
 - proposal_sent: Proposal/pricing discussed or sent
 - negotiating: Back-and-forth on terms
 - closed_won: Deal signed
 - closed_lost: Explicit rejection or disqualification
 - nurture: Engaged then went silent 5+ days (you won't set this - the nurture engine handles it)
 
-Rules:
-- Only advance the deal stage, never move it backwards (unless to closed_lost or nurture)
-- If pricing/budget was discussed, mark pricing_discussed as true
-- IMPORTANT: Extract the deal value (monthly price) and term length (in months) when mentioned.
-  The founder almost always states the price and term length during calls. Look for dollar amounts,
-  monthly/annual pricing, and contract duration (e.g. "3 months at $2,500/month" → value: 2500, term_months: 3).
-  If only a total is mentioned (e.g. "$15,000 for 6 months"), calculate the monthly rate (value: 2500, term_months: 6).
-- Be specific in your summaries - include key details from the conversation
-- Suggest concrete next actions when creating tasks
-- Determine sentiment: positive (interested, engaged), neutral (noncommittal), negative (objection, not interested)
+SENTIMENT RULES:
+- positive: They picked up the phone, attended a meeting, replied with interest, or engaged in conversation
+- neutral: No-show, voicemail, automated reply, or unclear intent
+- negative: Explicit rejection, "not interested", hung up, asked to be removed
+- IMPORTANT: If someone ATTENDED a Zoom meeting or ANSWERED a phone call, that is at minimum "positive" sentiment.
+  A completed call or meeting means engagement happened.
+
+DEAL STAGE RULES:
+- A completed Zoom meeting = at minimum "discovery_completed"
+- A completed phone call where they talked = at minimum "replied_showed_interest"
+- If pricing/budget was discussed, mark pricing_discussed as true and stage should be at least "proposal_sent"
+- Extract deal value (monthly price) and term length (months) when mentioned.
+  Example: "3 months at $2,500/month" → value: 2500, term_months: 3
+  Example: "$15,000 for 6 months" → value: 2500, term_months: 6
 
 Respond with valid JSON matching the AIProcessingResult schema. Output ONLY the JSON object, no markdown or extra text.`;
 
@@ -213,11 +226,11 @@ LEAD IDENTIFIED VIA LEADMAGIC (enriched contact data):
 - LinkedIn: ${enrichedContact.linkedin_url || "unknown"}
 - Phone: ${enrichedContact.phone || "unknown"}
 
-IMPORTANT: Use this enriched contact data for the contact fields in your response. The email is the primary identifier for this lead.`;
+IMPORTANT: Use this enriched contact data for the contact fields in your response. The email from enriched_contact is the ONLY valid email — do not modify or fabricate it.`;
   } else {
     context += `
 
-NOTE: No enrichment data found for this phone number. The caller/callee info from Zoom is all we have. If you cannot determine an email address, use the phone number as the identifier and set email to "unknown".`;
+NOTE: No enrichment data found for this phone number. Set email to "unknown" — do NOT fabricate an email address.`;
   }
 
   if (transcript) {

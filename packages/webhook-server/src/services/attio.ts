@@ -71,9 +71,11 @@ export async function findContact(email: string): Promise<{ id: string } | null>
 }
 
 export async function createContact(contact: AttioContact): Promise<string> {
-  const values: Record<string, unknown> = {
-    email_addresses: [{ email_address: contact.email }],
-  };
+  const values: Record<string, unknown> = {};
+  // Only add email if it's a real email
+  if (contact.email && contact.email !== "unknown" && contact.email.includes("@")) {
+    values.email_addresses = [{ email_address: contact.email }];
+  }
   if (contact.first_name) values.first_name = [{ first_name: contact.first_name }];
   if (contact.last_name) values.last_name = [{ last_name: contact.last_name }];
   if (contact.phone) values.phone_numbers = [{ phone_number: contact.phone }];
@@ -88,10 +90,13 @@ export async function createContact(contact: AttioContact): Promise<string> {
 }
 
 export async function findOrCreateContact(contact: AttioContact): Promise<string> {
-  const existing = await findContact(contact.email);
-  if (existing) {
-    logger.info("Found existing Attio contact", { email: contact.email, id: existing.id });
-    return existing.id;
+  // Try finding by email first
+  if (contact.email && contact.email !== "unknown") {
+    const existing = await findContact(contact.email);
+    if (existing) {
+      logger.info("Found existing Attio contact", { email: contact.email, id: existing.id });
+      return existing.id;
+    }
   }
   return createContact(contact);
 }

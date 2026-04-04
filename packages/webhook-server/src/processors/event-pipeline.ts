@@ -20,14 +20,10 @@ import { enrichContact } from "../services/leadmagic";
 import type { AIProcessingResult, WebhookEvent, EventSource } from "@crm-autopilot/shared";
 
 // Sources that CREATE new contacts (outbound-first channels)
-const LEAD_SOURCES: EventSource[] = ["smartlead", "heyreach", "zoom_phone"];
+const LEAD_SOURCES: EventSource[] = ["smartlead", "heyreach", "zoom_phone", "zoom_meeting"];
 
 // Sources that only ENRICH existing contacts (don't create new ones)
 const ENRICHMENT_ONLY_SOURCES: EventSource[] = ["gmail"];
-
-// Zoom meetings: enrich existing contacts by default, but CREATE new contact
-// if the transcript clearly shows it's a real sales meeting
-const CONDITIONAL_LEAD_SOURCES: EventSource[] = ["zoom_meeting"];
 
 // Process all unprocessed events in the queue
 export async function processEventQueue(): Promise<void> {
@@ -94,6 +90,20 @@ async function processSingleEvent(event: WebhookEvent): Promise<void> {
   await markEventProcessed(event.id);
 }
 
+// Check if an email is valid (not fabricated or placeholder)
+function isValidEmail(email: string): boolean {
+  if (!email || email === "unknown" || email === "none" || email === "n/a") return false;
+  // Reject fabricated emails with "unknown" in the domain
+  if (email.includes("unknown")) return false;
+  // Reject obviously fake patterns
+  if (email.includes("example.com") || email.includes("test.com")) return false;
+  // Must look like an email
+  if (!email.includes("@") || !email.includes(".")) return false;
+  // Skip the founder's own email
+  if (email.toLowerCase() === "joshua@salesglidergrowth.com") return false;
+  return true;
+}
+
 // Apply an AI processing result to Attio CRM
 export async function applyToAttio(
   result: AIProcessingResult,
@@ -101,104 +111,96 @@ export async function applyToAttio(
 ): Promise<void> {
   const contact = result.contact;
 
-  if (!contact.email) {
-    logger.warn("No email found in event, skipping Attio update", {
-      eventId: result.event_id,
-    });
-    return;
+  if (!isValidEmail(contact.email)) {
+    // For phone calls, try to use the phone number to find enrichment
+    if (contact.phone && source === "zoom_phone") {
+      logger.info("No valid email but have phone number, attempting phone-based contact creation", {
+        phone: contact.phone,
+        eventId: result.event_id,
+      });
+      // We'll still try to create — Attio can store phone-only contacts
+      // But we need at least a phone number
+    } else {
+      logger.warn("No valid email found in event, skipping Attio update", {
+        eventId: result.event_id,
+        email: contact.email,
+        source,
+      });
+      return;
+    }
   }
 
   // --- SOURCE-BASED LOGIC ---
-  // Lead sources (SmartLead, HeyReach, Zoom Phone): CREATE new contacts
+  // Lead sources (SmartLead, HeyReach, Zoom Phone, Zoom Meeting): CREATE new contacts
   // Gmail: ONLY update existing contacts (pure enrichment)
-  // Zoom Meeting: enrich existing contacts, OR create new if transcript shows real sales meeting
   const isEnrichmentOnly = source && ENRICHMENT_ONLY_SOURCES.includes(source);
-  const isConditionalLead = source && CONDITIONAL_LEAD_SOURCES.includes(source);
 
-  if (isEnrichmentOnly || isConditionalLead) {
+  if (isEnrichmentOnly) {
     // Check if contact already exists in Attio
-    const existingContact = await findContact(contact.email);
+    const existingContact = contact.email ? await findContact(contact.email) : null;
 
     if (!existingContact) {
-      // For Zoom meetings: create new contact if AI determined it's a real sales meeting
-      // (positive sentiment = engaged prospect, or stage beyond initial reply = real deal activity)
-      const isSalesMeeting =
-        isConditionalLead &&
-        (result.note.sentiment === "positive" ||
-          ["discovery_completed", "proposal_sent", "negotiating", "closed_won"].includes(
-            result.deal.stage
-          ));
-
-      if (isSalesMeeting) {
-        logger.info("Zoom meeting identified as sales meeting — creating new contact", {
-          email: contact.email,
-          sentiment: result.note.sentiment,
-          stage: result.deal.stage,
-        });
-        // Fall through to the lead source path below to create contact + deal
-      } else {
-        logger.info("Skipping enrichment-only event — contact not in CRM", {
-          email: contact.email,
-          source,
-          eventId: result.event_id,
-        });
-        return;
-      }
-    } else {
-      // Contact exists — enrich and update their deal
-      const contactId = existingContact.id;
-
-      // Enrich with LeadMagic
-      try {
-        const enriched = await enrichContact({
-          email: contact.email,
-          first_name: contact.first_name,
-          last_name: contact.last_name,
-          company: contact.company,
-          linkedin_url: contact.linkedin_url,
-          phone: contact.phone,
-        });
-        if (enriched.enriched) {
-          contact.first_name = contact.first_name || enriched.first_name;
-          contact.last_name = contact.last_name || enriched.last_name;
-          contact.company = contact.company || enriched.company;
-          contact.linkedin_url = contact.linkedin_url || enriched.linkedin_url;
-          contact.phone = contact.phone || enriched.phone;
-        }
-      } catch (err) {
-        logger.warn("LeadMagic enrichment failed", { error: String(err) });
-      }
-
-      // Find existing deal and update it
-      const existingDeal = await findDealByContact(contactId);
-      if (existingDeal) {
-        await updateDealStage(existingDeal.id, result.deal.stage);
-        await createNote({
-          parent_object: "deals",
-          parent_id: existingDeal.id,
-          title: `[${result.note.sentiment.toUpperCase()}] ${result.deal.stage_reason}`,
-          content: buildNoteContent(result),
-        });
-        if (result.task) {
-          await createTask({
-            title: result.task.title,
-            description: result.task.description,
-            linked_deal_id: existingDeal.id,
-            due_date: result.task.due_date,
-          });
-        }
-        logger.info("Enriched existing contact from " + source, {
-          email: contact.email,
-          dealId: existingDeal.id,
-        });
-      } else {
-        logger.info("Contact exists but no deal — skipping enrichment", {
-          email: contact.email,
-          source,
-        });
-      }
+      logger.info("Skipping enrichment-only event — contact not in CRM", {
+        email: contact.email,
+        source,
+        eventId: result.event_id,
+      });
       return;
     }
+
+    // Contact exists — enrich and update their deal
+    const contactId = existingContact.id;
+
+    // Enrich with LeadMagic
+    try {
+      const enriched = await enrichContact({
+        email: contact.email,
+        first_name: contact.first_name,
+        last_name: contact.last_name,
+        company: contact.company,
+        linkedin_url: contact.linkedin_url,
+        phone: contact.phone,
+      });
+      if (enriched.enriched) {
+        contact.first_name = contact.first_name || enriched.first_name;
+        contact.last_name = contact.last_name || enriched.last_name;
+        contact.company = contact.company || enriched.company;
+        contact.linkedin_url = contact.linkedin_url || enriched.linkedin_url;
+        contact.phone = contact.phone || enriched.phone;
+      }
+    } catch (err) {
+      logger.warn("LeadMagic enrichment failed", { error: String(err) });
+    }
+
+    // Find existing deal and update it
+    const existingDeal = await findDealByContact(contactId);
+    if (existingDeal) {
+      await updateDealStage(existingDeal.id, result.deal.stage);
+      await createNote({
+        parent_object: "deals",
+        parent_id: existingDeal.id,
+        title: `[${result.note.sentiment.toUpperCase()}] ${result.deal.stage_reason}`,
+        content: buildNoteContent(result),
+      });
+      if (result.task) {
+        await createTask({
+          title: result.task.title,
+          description: result.task.description,
+          linked_deal_id: existingDeal.id,
+          due_date: result.task.due_date,
+        });
+      }
+      logger.info("Enriched existing contact from " + source, {
+        email: contact.email,
+        dealId: existingDeal.id,
+      });
+    } else {
+      logger.info("Contact exists but no deal — skipping enrichment", {
+        email: contact.email,
+        source,
+      });
+    }
+    return;
   }
 
   // --- LEAD SOURCE: Create new contacts and deals ---
@@ -215,6 +217,10 @@ export async function applyToAttio(
     });
 
     if (enriched.enriched) {
+      // If we had no valid email and LeadMagic found one, use it
+      if ((!contact.email || contact.email === "unknown") && enriched.email) {
+        contact.email = enriched.email;
+      }
       contact.first_name = contact.first_name || enriched.first_name;
       contact.last_name = contact.last_name || enriched.last_name;
       contact.company = contact.company || enriched.company;
