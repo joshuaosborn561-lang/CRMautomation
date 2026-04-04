@@ -14,7 +14,7 @@ const envSchema = z.object({
   SUPABASE_SERVICE_KEY: z.string().min(1),
 
   ANTHROPIC_API_KEY: z.string().optional(),
-  GEMINI_API_KEY: z.string().default("AIzaSyAwDNST6IAZixPOGlnQS8Wh2hZZZZQ8ld4"),
+  GEMINI_API_KEY: z.string().min(1),
 
   ATTIO_API_KEY: z.string().min(1),
   ATTIO_PIPELINE_ID: z.string().optional(),
@@ -40,7 +40,7 @@ const envSchema = z.object({
   GOOGLE_PUBSUB_TOPIC: z.string().optional(),
 
   // LeadMagic (lead enrichment)
-  LEADMAGIC_API_KEY: z.string().default("43599068e8e9a1fdfad0046b44e2b7fb"),
+  LEADMAGIC_API_KEY: z.string().min(1),
 
   // Notifications
   NOTIFICATION_EMAIL: z.string().optional(),
