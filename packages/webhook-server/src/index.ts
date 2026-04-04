@@ -386,6 +386,78 @@ app.get("/api/setup-attio-fields", async (_req, res) => {
   }
 });
 
+// Setup Attio pipeline stages
+app.get("/api/setup-attio-stages", async (_req, res) => {
+  try {
+    const config = getConfig();
+    const pipelineId = config.ATTIO_PIPELINE_ID;
+    const results: Record<string, unknown> = {};
+
+    // First, get existing statuses
+    const listResp = await fetch(
+      `https://api.attio.com/v2/lists/${pipelineId}`,
+      { headers: { Authorization: `Bearer ${config.ATTIO_API_KEY}` } }
+    );
+    const listData = await listResp.json();
+    results.existing_list = listData;
+
+    // Try to get statuses
+    const statusResp = await fetch(
+      `https://api.attio.com/v2/lists/${pipelineId}/entries/query`,
+      {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${config.ATTIO_API_KEY}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ filter: {}, limit: 1 }),
+      }
+    );
+    const statusData = await statusResp.json();
+    results.sample_entry = statusData;
+
+    // Create each stage
+    const stages = [
+      "Replied / Showed Interest",
+      "Call or Meeting Booked",
+      "Discovery Completed",
+      "Proposal Sent",
+      "Negotiating",
+      "Closed Won",
+      "Closed Lost",
+      "Nurture",
+    ];
+
+    const stageResults: Record<string, unknown> = {};
+    for (const stage of stages) {
+      try {
+        const resp = await fetch(
+          `https://api.attio.com/v2/lists/${pipelineId}/statuses`,
+          {
+            method: "POST",
+            headers: {
+              Authorization: `Bearer ${config.ATTIO_API_KEY}`,
+              "Content-Type": "application/json",
+            },
+            body: JSON.stringify({ data: { title: stage } }),
+          }
+        );
+        const body = await resp.text();
+        stageResults[stage] = resp.ok
+          ? { status: "CREATED" }
+          : { status: resp.status, body };
+      } catch (err) {
+        stageResults[stage] = { error: String(err) };
+      }
+    }
+    results.stages = stageResults;
+
+    res.json(results);
+  } catch (err) {
+    res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+  }
+});
+
 // Reprocess events — reset processed events so the cron picks them up again
 app.post("/api/reprocess", async (req, res) => {
   try {
