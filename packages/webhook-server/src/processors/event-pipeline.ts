@@ -40,10 +40,26 @@ export async function processEventQueue(): Promise<void> {
     try {
       await processSingleEvent(event);
     } catch (err) {
-      logger.error("Failed to process event", {
-        eventId: event.id,
-        error: err instanceof Error ? err.message : String(err),
-      });
+      const errMsg = err instanceof Error ? err.message : String(err);
+      logger.error("Failed to process event", { eventId: event.id, error: errMsg });
+
+      // If AI fails (rate limit, bad response, etc), mark as processed with error
+      // so it doesn't retry forever and burn money
+      const retryCount = ((event.payload as any)?._retry_count || 0) + 1;
+      if (retryCount >= 3) {
+        logger.warn("Event failed 3 times, marking as processed to stop retries", {
+          eventId: event.id,
+          source: event.source,
+        });
+        await markEventProcessed(event.id);
+      } else {
+        // Increment retry count in payload
+        const { getSupabase } = await import("../utils/supabase");
+        await getSupabase()
+          .from("webhook_events")
+          .update({ payload: { ...event.payload, _retry_count: retryCount } })
+          .eq("id", event.id);
+      }
     }
   }
 }
