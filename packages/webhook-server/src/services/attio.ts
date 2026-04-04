@@ -160,12 +160,23 @@ export async function createDeal(deal: AttioDeal & { value?: number; term_months
 
   const stageName = STAGE_MAP[deal.stage];
 
-  // Pipeline only has a "stage" attribute — no name, deal_value, or term_length fields
+  const entryValues: Record<string, unknown> = {};
+  if (deal.name) {
+    entryValues.deal_name = [{ value: deal.name }];
+  }
+  if (deal.value) {
+    entryValues.deal_value = [{ currency_value: deal.value, currency_code: "USD" }];
+  }
+  if (deal.term_months) {
+    entryValues.term_length = [{ value: deal.term_months }];
+  }
+
   const result = (await attioFetch(`/lists/${pipelineId}/entries`, {
     method: "POST",
     body: JSON.stringify({
       data: {
         parent_record_id: deal.contact_id,
+        entry_values: Object.keys(entryValues).length > 0 ? entryValues : undefined,
         current_status_title: stageName,
       },
     }),

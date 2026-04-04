@@ -339,7 +339,7 @@ app.get("/api/setup-attio-fields", async (_req, res) => {
         is_required: false,
         is_unique: false,
         is_multiselect: false,
-        config: { currency: { default_currency_code: "USD", display_type: "number" } },
+        config: { currency: { default_currency_code: "USD", display_type: "symbol" } },
       },
       {
         title: "Term Length",
