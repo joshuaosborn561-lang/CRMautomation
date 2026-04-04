@@ -522,7 +522,7 @@ ${emailList}
 Respond with ONLY a JSON array of ID strings, nothing else. Example: ["abc123", "def456"]`,
           }],
         }],
-        generationConfig: { maxOutputTokens: 500, temperature: 0.1 },
+        generationConfig: { maxOutputTokens: 500, temperature: 0.1, thinkingConfig: { thinkingBudget: 0 } as any },
       });
 
       const text = classifyResult.response.text();

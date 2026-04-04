@@ -61,6 +61,8 @@ export async function processEvent(event: WebhookEvent): Promise<AIProcessingRes
       maxOutputTokens: 1024,
       temperature: 0.1,
       responseMimeType: "application/json",
+      // @ts-ignore - disable thinking tokens ($3.50/M → $0)
+      thinkingConfig: { thinkingBudget: 0 },
     },
   });
 
@@ -319,6 +321,8 @@ If you don't have enough data to answer, say so clearly.`,
     },
     generationConfig: {
       maxOutputTokens: 2048,
+      // @ts-ignore
+      thinkingConfig: { thinkingBudget: 0 },
     },
   });
 
