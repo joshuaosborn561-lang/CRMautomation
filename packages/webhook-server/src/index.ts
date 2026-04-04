@@ -326,18 +326,30 @@ app.get("/api/setup-attio-fields", async (_req, res) => {
         api_slug: "deal_name",
         type: "text",
         description: "Name of the deal (e.g. Company - Service)",
+        is_required: false,
+        is_unique: false,
+        is_multiselect: false,
+        config: {},
       },
       {
         title: "Deal Value",
         api_slug: "deal_value",
         type: "currency",
         description: "Monthly deal value in USD",
+        is_required: false,
+        is_unique: false,
+        is_multiselect: false,
+        config: { currency: { default_currency_code: "USD", display_type: "number" } },
       },
       {
         title: "Term Length",
         api_slug: "term_length",
         type: "number",
         description: "Contract term in months",
+        is_required: false,
+        is_unique: false,
+        is_multiselect: false,
+        config: {},
       },
     ];
 
@@ -351,15 +363,7 @@ app.get("/api/setup-attio-fields", async (_req, res) => {
               Authorization: `Bearer ${config.ATTIO_API_KEY}`,
               "Content-Type": "application/json",
             },
-            body: JSON.stringify({
-              data: {
-                title: field.title,
-                api_slug: field.api_slug,
-                type: field.type,
-                description: field.description,
-                is_multiselect: false,
-              },
-            }),
+            body: JSON.stringify({ data: field }),
           }
         );
 
