@@ -334,6 +334,49 @@ export async function findOrCreateCompany(name: string): Promise<string> {
   }
 }
 
+// --- Workspace Members ---
+
+let _workspaceMemberId: string | null = null;
+
+async function getWorkspaceMemberId(): Promise<string | null> {
+  if (_workspaceMemberId) return _workspaceMemberId;
+  try {
+    const result = (await attioFetch("/workspace_members", {
+      method: "GET",
+    })) as { data: Array<{ id: { workspace_member_id: string } }> };
+
+    if (result.data && result.data.length > 0) {
+      _workspaceMemberId = result.data[0].id.workspace_member_id;
+      logger.info("Got workspace member ID", { id: _workspaceMemberId });
+      return _workspaceMemberId;
+    }
+  } catch (err) {
+    logger.warn("Failed to get workspace member ID", { error: String(err) });
+  }
+  return null;
+}
+
+// --- Deal Stage Options ---
+
+let _dealStageOptions: Array<{ title: string; id: string }> | null = null;
+
+async function getDealStageOptions(): Promise<Array<{ title: string; id: string }>> {
+  if (_dealStageOptions) return _dealStageOptions;
+  try {
+    // Get the "stage" attribute on the deals object to find valid status options
+    const result = (await attioFetch("/objects/deals/attributes/stage", {
+      method: "GET",
+    })) as { data: { config?: { statuses?: Array<{ title: string; id: string }> } } };
+
+    _dealStageOptions = result.data?.config?.statuses || [];
+    logger.info("Got deal stage options", { options: _dealStageOptions.map(s => s.title) });
+    return _dealStageOptions;
+  } catch (err) {
+    logger.warn("Failed to get deal stage options", { error: String(err) });
+    return [];
+  }
+}
+
 // --- Deals ---
 
 export async function findDealByContact(contactId: string): Promise<{ id: string; stage: string } | null> {
@@ -406,15 +449,59 @@ export async function createDeal(deal: AttioDeal & { value?: number; term_months
 
   const stageName = STAGE_MAP[deal.stage];
 
-  // Step 1: Create a deal record in the Deals object
-  // The pipeline parent_object is "deals", so we need a deal record first
-  const dealValues: Record<string, unknown> = {};
-  if (deal.name) dealValues.name = deal.name;
+  // Deals object requires: name (text), stage (status), owner (actor-reference)
+  // Step 1: Get workspace member ID for owner field + deal stage options
+  const [ownerId, stageOptions] = await Promise.all([
+    getWorkspaceMemberId(),
+    getDealStageOptions(),
+  ]);
 
-  // Link deal to the person via associated_people (record-reference)
+  // Step 2: Create deal record with all required fields
+  const dealValues: Record<string, unknown> = {
+    name: deal.name || "Untitled Deal",
+  };
+
+  // stage is a required status field on the deals object
+  // Map our internal stage to Attio's stage options, or use first available
+  if (stageOptions.length > 0) {
+    const matchedStage = stageOptions.find(s =>
+      s.title.toLowerCase().includes(stageName.toLowerCase()) ||
+      stageName.toLowerCase().includes(s.title.toLowerCase())
+    );
+    // Use matched stage title, or fall back to first option
+    const stageTitle = matchedStage?.title || stageOptions[0].title;
+    dealValues.stage = [{ status: stageTitle }];
+    logger.info("Setting deal stage", { requested: stageName, matched: stageTitle });
+  }
+
+  // owner is actor-reference — use workspace member
+  if (ownerId) {
+    dealValues.owner = [{ referenced_actor_type: "workspace-member", referenced_actor_id: ownerId }];
+  }
+
+  // Link deal to the person
   if (deal.contact_id) {
     dealValues.associated_people = [{ target_object: "people", target_record_id: deal.contact_id }];
   }
+
+  // Link deal to company if available
+  if (deal.company) {
+    try {
+      const companyId = await findOrCreateCompany(deal.company);
+      dealValues.associated_company = [{ target_object: "companies", target_record_id: companyId }];
+    } catch { /* skip */ }
+  }
+
+  // Deal value (currency field)
+  if (deal.value) {
+    dealValues.value = [{ currency_value: deal.value, currency_code: "USD" }];
+  }
+
+  logger.info("Creating deal record with values", {
+    name: dealValues.name,
+    hasStage: !!dealValues.stage,
+    hasOwner: !!dealValues.owner,
+  });
 
   let dealRecordId: string;
   try {
@@ -425,16 +512,23 @@ export async function createDeal(deal: AttioDeal & { value?: number; term_months
     dealRecordId = dealRecord.data.id.record_id;
     logger.info("Created deal record", { name: deal.name, dealRecordId });
   } catch (err) {
-    // Maybe "deals" object doesn't have these fields — try minimal
-    logger.warn("Deal record creation failed, trying minimal", { error: String(err) });
+    // Fallback: try with just name + stage (maybe owner auto-fills or isn't truly required)
+    logger.warn("Deal creation failed, trying minimal required fields", { error: String(err) });
+    const minimalValues: Record<string, unknown> = {
+      name: dealValues.name,
+    };
+    if (dealValues.stage) minimalValues.stage = dealValues.stage;
+    if (dealValues.owner) minimalValues.owner = dealValues.owner;
+
     const dealRecord = (await attioFetch("/objects/deals/records", {
       method: "POST",
-      body: JSON.stringify({ data: { values: {} } }),
+      body: JSON.stringify({ data: { values: minimalValues } }),
     })) as { data: { id: { record_id: string } } };
     dealRecordId = dealRecord.data.id.record_id;
+    logger.info("Created deal record (minimal)", { name: deal.name, dealRecordId });
   }
 
-  // Step 2: Create a pipeline entry for this deal record
+  // Step 3: Create pipeline entry for this deal record
   let result: { data: { entry_id: string } };
   try {
     result = (await attioFetch(`/lists/${pipelineId}/entries`, {
@@ -449,7 +543,7 @@ export async function createDeal(deal: AttioDeal & { value?: number; term_months
       }),
     })) as { data: { entry_id: string } };
   } catch (err) {
-    logger.warn("Pipeline entry creation with stage failed, trying without", { error: String(err) });
+    logger.warn("Pipeline entry with stage failed, trying without", { error: String(err) });
     result = (await attioFetch(`/lists/${pipelineId}/entries`, {
       method: "POST",
       body: JSON.stringify({

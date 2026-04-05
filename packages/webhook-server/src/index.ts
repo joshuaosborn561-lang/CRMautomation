@@ -359,33 +359,62 @@ app.get("/api/debug/test-attio-write", async (_req, res) => {
         steps.push({ step: "pipeline_config", status: "ERROR", details: String(err) });
       }
 
-      // Try deal creation with the correct parent_object from pipeline config
-      // Step 4a: Create a deal record in the Deals object first
+      // Step 4a: Get workspace member ID for owner field
+      let testOwnerId: string | null = null;
+      try {
+        const wmResp = await fetch("https://api.attio.com/v2/workspace_members", {
+          headers: { Authorization: `Bearer ${config.ATTIO_API_KEY}` },
+        });
+        if (wmResp.ok) {
+          const wmData = await wmResp.json() as { data: Array<{ id: { workspace_member_id: string }; name?: string }> };
+          if (wmData.data?.length > 0) {
+            testOwnerId = wmData.data[0].id.workspace_member_id;
+            steps.push({ step: "get_workspace_member", status: "OK", details: { id: testOwnerId, count: wmData.data.length } });
+          }
+        } else {
+          steps.push({ step: "get_workspace_member", status: "FAIL", details: { http: wmResp.status } });
+        }
+      } catch (err) {
+        steps.push({ step: "get_workspace_member", status: "ERROR", details: String(err) });
+      }
+
+      // Step 4b: Get deal stage options
+      let testStageTitle: string | null = null;
+      try {
+        const stageResp = await fetch("https://api.attio.com/v2/objects/deals/attributes/stage", {
+          headers: { Authorization: `Bearer ${config.ATTIO_API_KEY}` },
+        });
+        if (stageResp.ok) {
+          const stageData = await stageResp.json() as { data: { config?: { statuses?: Array<{ title: string; id: string }> } } };
+          const statuses = stageData.data?.config?.statuses || [];
+          testStageTitle = statuses[0]?.title || null;
+          steps.push({ step: "get_deal_stages", status: "OK", details: { stages: statuses.map((s: any) => s.title), using: testStageTitle } });
+        } else {
+          const body = await stageResp.text();
+          steps.push({ step: "get_deal_stages", status: "FAIL", details: { http: stageResp.status, body: body.substring(0, 300) } });
+        }
+      } catch (err) {
+        steps.push({ step: "get_deal_stages", status: "ERROR", details: String(err) });
+      }
+
+      // Step 4c: Create a deal record with ALL required fields (name, stage, owner)
       let testDealRecordId: string | null = null;
       try {
+        const dealValues: Record<string, unknown> = { name: "Test Deal - CRM Debug" };
+        if (testStageTitle) dealValues.stage = [{ status: testStageTitle }];
+        if (testOwnerId) dealValues.owner = [{ referenced_actor_type: "workspace-member", referenced_actor_id: testOwnerId }];
+
         const dealResp = await fetch("https://api.attio.com/v2/objects/deals/records", {
           method: "POST", headers,
-          body: JSON.stringify({ data: { values: { name: "Test Deal" } } }),
+          body: JSON.stringify({ data: { values: dealValues } }),
         });
         const dealBody = await dealResp.text();
         if (dealResp.ok) {
           const dealData = JSON.parse(dealBody);
           testDealRecordId = dealData?.data?.id?.record_id;
-          steps.push({ step: "create_deal_record", status: "OK", details: { dealRecordId: testDealRecordId } });
+          steps.push({ step: "create_deal_record", status: "OK", details: { dealRecordId: testDealRecordId, sentValues: Object.keys(dealValues) } });
         } else {
-          // Try without name
-          const dealResp2 = await fetch("https://api.attio.com/v2/objects/deals/records", {
-            method: "POST", headers,
-            body: JSON.stringify({ data: { values: {} } }),
-          });
-          const dealBody2 = await dealResp2.text();
-          if (dealResp2.ok) {
-            const dealData2 = JSON.parse(dealBody2);
-            testDealRecordId = dealData2?.data?.id?.record_id;
-            steps.push({ step: "create_deal_record", status: "OK (minimal)", details: { dealRecordId: testDealRecordId, note: "name field failed" } });
-          } else {
-            steps.push({ step: "create_deal_record", status: "FAIL", details: { http: dealResp.status, body1: dealBody.substring(0, 300), body2: dealBody2.substring(0, 300) } });
-          }
+          steps.push({ step: "create_deal_record", status: "FAIL", details: { http: dealResp.status, body: dealBody.substring(0, 500), sentValues: dealValues } });
         }
       } catch (err) {
         steps.push({ step: "create_deal_record", status: "ERROR", details: String(err) });
