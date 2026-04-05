@@ -395,16 +395,42 @@ app.get("/api/debug/attio-check", async (_req, res) => {
   }
 });
 
-// Clean up unnamed/garbage contacts from Attio
+// Nuke ALL people and deals from Attio (clean slate)
 app.post("/api/cleanup-attio", async (_req, res) => {
   try {
     const config = getConfig();
-    let deleted = 0;
-    let kept = 0;
-    let page = 0;
-    const deletedIds: string[] = [];
+    let peopleDeleted = 0;
+    let dealsDeleted = 0;
 
-    // Query all people and delete unnamed ones
+    // 1. Delete all pipeline entries (deals) first
+    const pipelineId = config.ATTIO_PIPELINE_ID;
+    if (pipelineId) {
+      while (true) {
+        const dealsResp = await fetch(`https://api.attio.com/v2/lists/${pipelineId}/entries/query`, {
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${config.ATTIO_API_KEY}`,
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({ limit: 50 }),
+        });
+        if (!dealsResp.ok) break;
+        const dealsData = await dealsResp.json() as { data: Array<Record<string, unknown>> };
+        if (!dealsData.data || dealsData.data.length === 0) break;
+
+        for (const deal of dealsData.data) {
+          try {
+            await fetch(`https://api.attio.com/v2/lists/${pipelineId}/entries/${deal.entry_id}`, {
+              method: "DELETE",
+              headers: { Authorization: `Bearer ${config.ATTIO_API_KEY}` },
+            });
+            dealsDeleted++;
+          } catch { /* continue */ }
+        }
+      }
+    }
+
+    // 2. Delete all people
     while (true) {
       const resp = await fetch("https://api.attio.com/v2/objects/people/records/query", {
         method: "POST",
@@ -412,82 +438,27 @@ app.post("/api/cleanup-attio", async (_req, res) => {
           Authorization: `Bearer ${config.ATTIO_API_KEY}`,
           "Content-Type": "application/json",
         },
-        body: JSON.stringify({ limit: 50, offset: page * 50 }),
+        body: JSON.stringify({ limit: 50 }),
       });
-
-      if (!resp.ok) {
-        res.json({ error: `Query failed: ${resp.status} ${await resp.text()}`, deleted, kept });
-        return;
-      }
-
+      if (!resp.ok) break;
       const data = await resp.json() as { data: Array<Record<string, unknown>> };
       if (!data.data || data.data.length === 0) break;
 
       for (const person of data.data) {
         const id = (person.id as Record<string, string>)?.record_id;
-        const values = person.values as Record<string, unknown> | undefined;
-        const nameArr = values?.name as Array<Record<string, unknown>> | undefined;
-        const emailArr = values?.email_addresses as Array<Record<string, unknown>> | undefined;
-
-        // Check if contact has a name or email
-        const hasName = nameArr && nameArr.length > 0 &&
-          (nameArr[0]?.first_name || nameArr[0]?.last_name || nameArr[0]?.full_name);
-        const hasEmail = emailArr && emailArr.length > 0 && emailArr[0]?.email_address;
-
-        if (!hasName && !hasEmail) {
-          // Delete unnamed contact
-          try {
-            await fetch(`https://api.attio.com/v2/objects/people/records/${id}`, {
-              method: "DELETE",
-              headers: { Authorization: `Bearer ${config.ATTIO_API_KEY}` },
-            });
-            deleted++;
-            deletedIds.push(id);
-          } catch (err) {
-            // continue
-          }
-        } else {
-          kept++;
-        }
-      }
-
-      if (data.data.length < 50) break;
-      page++;
-    }
-
-    // Also delete all deals (pipeline entries) that have no parent contact
-    const pipelineId = config.ATTIO_PIPELINE_ID;
-    let dealsDeleted = 0;
-    if (pipelineId) {
-      const dealsResp = await fetch(`https://api.attio.com/v2/lists/${pipelineId}/entries/query`, {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${config.ATTIO_API_KEY}`,
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({ limit: 100 }),
-      });
-      if (dealsResp.ok) {
-        const dealsData = await dealsResp.json() as { data: Array<Record<string, unknown>> };
-        for (const deal of dealsData.data || []) {
-          const parentId = deal.parent_record_id as string;
-          if (deletedIds.includes(parentId)) {
-            try {
-              await fetch(`https://api.attio.com/v2/lists/${pipelineId}/entries/${deal.entry_id}`, {
-                method: "DELETE",
-                headers: { Authorization: `Bearer ${config.ATTIO_API_KEY}` },
-              });
-              dealsDeleted++;
-            } catch { /* continue */ }
-          }
-        }
+        try {
+          await fetch(`https://api.attio.com/v2/objects/people/records/${id}`, {
+            method: "DELETE",
+            headers: { Authorization: `Bearer ${config.ATTIO_API_KEY}` },
+          });
+          peopleDeleted++;
+        } catch { /* continue */ }
       }
     }
 
     res.json({
-      message: `Cleanup complete. ${deleted} unnamed contacts deleted, ${kept} kept, ${dealsDeleted} orphan deals deleted.`,
-      deleted,
-      kept,
+      message: `Attio wiped clean. ${peopleDeleted} people deleted, ${dealsDeleted} deals deleted. Ready for fresh reprocess.`,
+      peopleDeleted,
       dealsDeleted,
     });
   } catch (err) {

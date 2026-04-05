@@ -29,9 +29,16 @@ CRITICAL EMAIL RULES:
 - The founder's email is joshua@salesglidergrowth.com — SKIP this person, they are the owner not a lead.
 
 CONTACT EXTRACTION:
-- Extract the EXTERNAL person (the prospect/lead), not the founder.
+- Extract the EXTERNAL person (the prospect/lead), not anyone on the SalesGlider team.
 - Use enriched_contact data when available — it has the most accurate info.
-- For phone calls: the external party is the non-founder caller/callee.
+- For phone calls: the external party has extension_type "pstn". SKIP anyone with extension_type "user" — they are internal team members.
+- INTERNAL TEAM MEMBERS TO SKIP (these are NOT prospects):
+  * Joshua Osborn (founder) — joshua@salesglidergrowth.com
+  * Josiah Peterson (SDR)
+  * Noah Brown (SDR)
+  * Anyone with a @salesglidergrowth.com email
+  * Anyone with extension_type "user" in Zoom data
+- If the only people in an event are internal team members, set email to "skip_internal" so the pipeline knows to skip it.
 - For meetings: extract the non-founder participant(s).
 
 Deal stages (in order of progression):

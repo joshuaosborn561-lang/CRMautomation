@@ -95,15 +95,48 @@ export async function createContact(contact: AttioContact): Promise<string> {
   return result.data.id.record_id;
 }
 
+export async function findContactByName(firstName: string, lastName: string): Promise<{ id: string } | null> {
+  try {
+    const result = (await attioFetch("/objects/people/records/query", {
+      method: "POST",
+      body: JSON.stringify({
+        filter: {
+          name: { full_name: { contains: `${firstName} ${lastName}`.trim() } },
+        },
+      }),
+    })) as { data: Array<{ id: { record_id: string } }> };
+
+    if (result.data.length > 0) {
+      return { id: result.data[0].id.record_id };
+    }
+  } catch (err) {
+    logger.warn("Name-based contact search failed", { error: String(err) });
+  }
+  return null;
+}
+
 export async function findOrCreateContact(contact: AttioContact): Promise<string> {
   // Try finding by email first
   if (contact.email && contact.email !== "unknown") {
     const existing = await findContact(contact.email);
     if (existing) {
-      logger.info("Found existing Attio contact", { email: contact.email, id: existing.id });
+      logger.info("Found existing Attio contact by email", { email: contact.email, id: existing.id });
       return existing.id;
     }
   }
+
+  // Try finding by name (prevents duplicates for contacts without email)
+  if (contact.first_name && contact.last_name) {
+    const existing = await findContactByName(contact.first_name, contact.last_name);
+    if (existing) {
+      logger.info("Found existing Attio contact by name", {
+        name: `${contact.first_name} ${contact.last_name}`,
+        id: existing.id,
+      });
+      return existing.id;
+    }
+  }
+
   return createContact(contact);
 }
 
@@ -189,6 +222,7 @@ export async function createDeal(deal: AttioDeal & { value?: number; term_months
       method: "POST",
       body: JSON.stringify({
         data: {
+          parent_object: "people",
           parent_record_id: deal.contact_id,
           entry_values: Object.keys(entryValues).length > 0 ? entryValues : undefined,
           current_status_title: stageName,
@@ -205,6 +239,7 @@ export async function createDeal(deal: AttioDeal & { value?: number; term_months
       method: "POST",
       body: JSON.stringify({
         data: {
+          parent_object: "people",
           parent_record_id: deal.contact_id,
           entry_values: Object.keys(entryValues).length > 0 ? entryValues : undefined,
         },

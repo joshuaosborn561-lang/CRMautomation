@@ -93,14 +93,16 @@ async function processSingleEvent(event: WebhookEvent): Promise<void> {
 // Check if an email is valid (not fabricated or placeholder)
 function isValidEmail(email: string): boolean {
   if (!email || email === "unknown" || email === "none" || email === "n/a") return false;
+  // Skip internal team members
+  if (email === "skip_internal") return false;
   // Reject fabricated emails with "unknown" in the domain
   if (email.includes("unknown")) return false;
   // Reject obviously fake patterns
   if (email.includes("example.com") || email.includes("test.com")) return false;
   // Must look like an email
   if (!email.includes("@") || !email.includes(".")) return false;
-  // Skip the founder's own email
-  if (email.toLowerCase() === "joshua@salesglidergrowth.com") return false;
+  // Skip anyone from SalesGlider
+  if (email.toLowerCase().includes("salesglidergrowth.com")) return false;
   return true;
 }
 
