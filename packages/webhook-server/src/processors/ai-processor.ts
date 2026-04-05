@@ -271,10 +271,23 @@ function buildZoomMeetingContext(payload: Record<string, unknown>): string {
   let context = `Zoom Meeting Event:
 - Meeting Topic: ${obj?.topic || "unknown"}
 - Meeting ID: ${obj?.id || "unknown"}
-- Host: ${obj?.host_email || "unknown"}
+- Host: ${obj?.host_email || "unknown"} (this is the FOUNDER — do NOT use this as the contact email)
 - Duration: ${obj?.duration || "unknown"} minutes
 - Participants: ${JSON.stringify((obj as Record<string, unknown>)?.participants || [])}
-- Start Time: ${obj?.start_time || "unknown"}`;
+- Start Time: ${obj?.start_time || "unknown"}
+
+CONTACT EXTRACTION FOR MEETINGS:
+- The meeting topic usually contains the prospect's name (e.g. "SalesGlider Followup - Ramon Guitard and Joshua Osborn")
+- Extract the NON-FOUNDER name from the topic as first_name and last_name
+- Joshua Osborn is the founder — skip him
+- Set email to "unknown" if no participant email is available (do NOT fabricate)
+- This was a real sales meeting — set sentiment to "positive" and stage to at minimum "discovery_completed"`;
+
+  // Add Zoom AI Companion summary if available
+  const zoomAiSummary = payload.zoom_ai_summary as string | undefined;
+  if (zoomAiSummary) {
+    context += `\n\nZOOM AI COMPANION SUMMARY:\n${zoomAiSummary}`;
+  }
 
   if (shareUrl) {
     context += `\n- Recording Share URL: ${shareUrl}`;

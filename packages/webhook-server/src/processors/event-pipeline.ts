@@ -113,16 +113,20 @@ export async function applyToAttio(
   const contact = result.contact;
 
   if (!isValidEmail(contact.email)) {
-    // For phone calls, try to use the phone number to find enrichment
+    // For phone calls, allow phone-only contacts
     if (contact.phone && source === "zoom_phone") {
-      logger.info("No valid email but have phone number, attempting phone-based contact creation", {
+      logger.info("No valid email but have phone number, creating phone-based contact", {
         phone: contact.phone,
         eventId: result.event_id,
       });
-      // We'll still try to create — Attio can store phone-only contacts
-      // But we need at least a phone number
+    // For zoom meetings, allow name-only contacts (these are real sales meetings)
+    } else if (source === "zoom_meeting" && (contact.first_name || contact.last_name)) {
+      logger.info("No valid email but have name from meeting, creating name-based contact", {
+        name: `${contact.first_name} ${contact.last_name}`,
+        eventId: result.event_id,
+      });
     } else {
-      logger.warn("No valid email found in event, skipping Attio update", {
+      logger.warn("No valid email, phone, or name found — skipping Attio update", {
         eventId: result.event_id,
         email: contact.email,
         source,

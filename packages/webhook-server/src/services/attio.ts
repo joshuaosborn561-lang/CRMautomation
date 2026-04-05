@@ -78,7 +78,7 @@ export async function createContact(contact: AttioContact): Promise<string> {
   }
   if (contact.first_name) values.first_name = [{ first_name: contact.first_name }];
   if (contact.last_name) values.last_name = [{ last_name: contact.last_name }];
-  if (contact.phone) values.phone_numbers = [{ phone_number: contact.phone }];
+  if (contact.phone) values.phone_numbers = [{ original_phone_number: contact.phone }];
 
   const result = (await attioFetch("/objects/people/records", {
     method: "POST",
