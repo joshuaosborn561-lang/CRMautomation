@@ -1103,220 +1103,187 @@ app.post("/api/process-now", async (_req, res) => {
 });
 
 // Full rebuild: nuke Attio, re-enrich everything, reprocess all events
-app.post("/api/full-rebuild", async (req, res) => {
-  const steps: Array<{ step: string; status: string; details?: unknown }> = [];
+// Track rebuild progress in memory so we can poll it
+let rebuildStatus: { running: boolean; steps: Array<{ step: string; status: string; details?: unknown }>; error?: string } = { running: false, steps: [] };
 
-  try {
-    const config = getConfig();
-    const { getSupabase } = await import("./utils/supabase");
-    const supabase = getSupabase();
+app.post("/api/full-rebuild", async (_req, res) => {
+  if (rebuildStatus.running) {
+    return res.json({ message: "Rebuild already in progress", steps: rebuildStatus.steps });
+  }
 
-    // Step 0: Ensure custom People fields exist
-    const peopleFieldsToCreate = ["company", "job_title", "linkedin_url", "lead_source", "industry"];
-    for (const slug of peopleFieldsToCreate) {
-      try {
-        await fetch("https://api.attio.com/v2/objects/people/attributes", {
-          method: "POST",
-          headers: { Authorization: `Bearer ${config.ATTIO_API_KEY}`, "Content-Type": "application/json" },
-          body: JSON.stringify({
-            data: { title: slug.replace("_", " ").replace(/\b\w/g, c => c.toUpperCase()), api_slug: slug, type: "text", is_required: false, is_unique: false, is_multiselect: false },
-          }),
-        });
-      } catch { /* already exists or error — continue */ }
-    }
-    steps.push({ step: "setup_people_fields", status: "done", details: { fields: peopleFieldsToCreate } });
+  rebuildStatus = { running: true, steps: [] };
+  res.json({ message: "Rebuild started. Poll GET /api/rebuild-status to track progress." });
 
-    // Step 1: Nuke Attio
-    let peopleDeleted = 0;
-    let dealsDeleted = 0;
+  // Run everything in background (not blocking the HTTP response)
+  (async () => {
+    try {
+      const config = getConfig();
+      const { getSupabase } = await import("./utils/supabase");
+      const supabase = getSupabase();
 
-    const pipelineId = config.ATTIO_PIPELINE_ID;
-    if (pipelineId) {
+      // Step 0: Ensure custom People fields exist
+      const peopleFieldsToCreate = ["company", "job_title", "linkedin_url", "lead_source", "industry"];
+      for (const slug of peopleFieldsToCreate) {
+        try {
+          await fetch("https://api.attio.com/v2/objects/people/attributes", {
+            method: "POST",
+            headers: { Authorization: `Bearer ${config.ATTIO_API_KEY}`, "Content-Type": "application/json" },
+            body: JSON.stringify({
+              data: { title: slug.replace("_", " ").replace(/\b\w/g, c => c.toUpperCase()), api_slug: slug, type: "text", is_required: false, is_unique: false, is_multiselect: false },
+            }),
+          });
+        } catch { /* already exists */ }
+      }
+      rebuildStatus.steps.push({ step: "setup_people_fields", status: "done" });
+
+      // Step 1: Nuke Attio
+      let peopleDeleted = 0;
+      let dealsDeleted = 0;
+      const pipelineId = config.ATTIO_PIPELINE_ID;
+      if (pipelineId) {
+        while (true) {
+          const dealsResp = await fetch(`https://api.attio.com/v2/lists/${pipelineId}/entries/query`, {
+            method: "POST",
+            headers: { Authorization: `Bearer ${config.ATTIO_API_KEY}`, "Content-Type": "application/json" },
+            body: JSON.stringify({ limit: 50 }),
+          });
+          if (!dealsResp.ok) break;
+          const dealsData = await dealsResp.json() as { data: Array<Record<string, unknown>> };
+          if (!dealsData.data || dealsData.data.length === 0) break;
+          for (const deal of dealsData.data) {
+            try {
+              await fetch(`https://api.attio.com/v2/lists/${pipelineId}/entries/${deal.entry_id}`, {
+                method: "DELETE", headers: { Authorization: `Bearer ${config.ATTIO_API_KEY}` },
+              });
+              dealsDeleted++;
+            } catch { /* continue */ }
+          }
+        }
+      }
       while (true) {
-        const dealsResp = await fetch(`https://api.attio.com/v2/lists/${pipelineId}/entries/query`, {
+        const resp = await fetch("https://api.attio.com/v2/objects/people/records/query", {
           method: "POST",
           headers: { Authorization: `Bearer ${config.ATTIO_API_KEY}`, "Content-Type": "application/json" },
           body: JSON.stringify({ limit: 50 }),
         });
-        if (!dealsResp.ok) break;
-        const dealsData = await dealsResp.json() as { data: Array<Record<string, unknown>> };
-        if (!dealsData.data || dealsData.data.length === 0) break;
-        for (const deal of dealsData.data) {
+        if (!resp.ok) break;
+        const data = await resp.json() as { data: Array<Record<string, unknown>> };
+        if (!data.data || data.data.length === 0) break;
+        for (const person of data.data) {
+          const id = (person.id as Record<string, string>)?.record_id;
           try {
-            await fetch(`https://api.attio.com/v2/lists/${pipelineId}/entries/${deal.entry_id}`, {
+            await fetch(`https://api.attio.com/v2/objects/people/records/${id}`, {
               method: "DELETE", headers: { Authorization: `Bearer ${config.ATTIO_API_KEY}` },
             });
-            dealsDeleted++;
+            peopleDeleted++;
           } catch { /* continue */ }
         }
       }
-    }
-    while (true) {
-      const resp = await fetch("https://api.attio.com/v2/objects/people/records/query", {
-        method: "POST",
-        headers: { Authorization: `Bearer ${config.ATTIO_API_KEY}`, "Content-Type": "application/json" },
-        body: JSON.stringify({ limit: 50 }),
-      });
-      if (!resp.ok) break;
-      const data = await resp.json() as { data: Array<Record<string, unknown>> };
-      if (!data.data || data.data.length === 0) break;
-      for (const person of data.data) {
-        const id = (person.id as Record<string, string>)?.record_id;
-        try {
-          await fetch(`https://api.attio.com/v2/objects/people/records/${id}`, {
-            method: "DELETE", headers: { Authorization: `Bearer ${config.ATTIO_API_KEY}` },
-          });
-          peopleDeleted++;
-        } catch { /* continue */ }
-      }
-    }
-    steps.push({ step: "cleanup_attio", status: "done", details: { peopleDeleted, dealsDeleted } });
+      rebuildStatus.steps.push({ step: "cleanup_attio", status: "done", details: { peopleDeleted, dealsDeleted } });
 
-    // Step 2: Clear interaction log (stale data from previous runs)
-    await supabase.from("interaction_log").delete().neq("id", "00000000-0000-0000-0000-000000000000");
-    steps.push({ step: "clear_interaction_log", status: "done" });
+      // Step 2: Clear interaction log
+      await supabase.from("interaction_log").delete().neq("id", "00000000-0000-0000-0000-000000000000");
+      rebuildStatus.steps.push({ step: "clear_interaction_log", status: "done" });
 
-    // Step 3: Re-enrich meetings with Zoom transcripts
-    const zoomService = await import("./services/zoom");
-    const { data: meetingEvents } = await supabase
-      .from("webhook_events")
-      .select("id, payload, event_type")
-      .eq("source", "zoom_meeting")
-      .neq("event_type", "unknown");
+      // Step 3: Re-enrich with Apollo (meetings by name) — skip already enriched
+      let apolloEnriched = 0;
+      let apolloSkipped = 0;
+      try {
+        const { searchContactByName } = await import("./services/apollo");
+        const { data: meetingEvents } = await supabase
+          .from("webhook_events")
+          .select("id, payload")
+          .eq("source", "zoom_meeting")
+          .neq("event_type", "unknown");
 
-    let transcriptsFound = 0;
-    let meetingsSkipped = 0;
-    for (const event of meetingEvents || []) {
-      if (event.payload?.transcript) { meetingsSkipped++; continue; }
-      const obj = (event.payload?.payload as Record<string, unknown>)?.object as Record<string, unknown> | undefined;
-      const meetingUuid = obj?.uuid as string | undefined;
-      const meetingNumId = obj?.id as string | number | undefined;
-      if (!meetingUuid && !meetingNumId) continue;
-
-      let transcript: string | null = null;
-
-      // Try from recording_files in payload first
-      const recFiles = obj?.recording_files as Array<Record<string, unknown>> | undefined;
-      if (recFiles?.length) {
-        const tf = recFiles.find((f) => f.file_type === "TRANSCRIPT" || f.recording_type === "audio_transcript" || f.file_type === "VTT");
-        if (tf?.download_url) {
-          try {
-            const token = await zoomService.getZoomAccessToken();
-            const r = await fetch(`${tf.download_url}?access_token=${token}`);
-            if (r.ok) transcript = await r.text();
-          } catch { /* fallthrough */ }
-        }
-      }
-
-      // Try API with UUID then numeric ID
-      if (!transcript) {
-        for (const id of [meetingUuid, meetingNumId].filter(Boolean)) {
-          try { transcript = await zoomService.getMeetingTranscript(String(id)); } catch { /* next */ }
-          if (transcript) break;
-        }
-      }
-
-      if (transcript) {
-        const aiSummary = await zoomService.getMeetingSummary(String(meetingUuid || meetingNumId)).catch(() => null);
-        await supabase.from("webhook_events").update({
-          payload: {
-            ...event.payload,
-            transcript,
-            ...(aiSummary?.summary_url ? { zoom_ai_summary_url: aiSummary.summary_url } : {}),
-            ...(aiSummary?.summary ? { zoom_ai_summary: aiSummary.summary } : {}),
-          },
-        }).eq("id", event.id);
-        transcriptsFound++;
-      }
-    }
-    steps.push({ step: "enrich_meeting_transcripts", status: "done", details: { transcriptsFound, alreadyHad: meetingsSkipped, total: meetingEvents?.length || 0 } });
-
-    // Step 4: Re-enrich with Apollo (meetings by name)
-    let apolloEnriched = 0;
-    try {
-      const { searchContactByName } = await import("./services/apollo");
-      for (const event of meetingEvents || []) {
-        if (event.payload?.enriched_contact?.email) continue;
-        const obj = (event.payload?.payload as Record<string, unknown>)?.object as Record<string, unknown> | undefined;
-        const topic = (obj?.topic || "") as string;
-        const nameMatch = topic.match(/- (.+?) and Joshua/i) || topic.match(/- (.+?) and Josh/i);
-        if (!nameMatch) continue;
-        const prospectName = nameMatch[1].trim();
-        if (!prospectName) continue;
-        const [firstName, ...lastParts] = prospectName.split(" ");
-        const lastName = lastParts.join(" ");
-        const contact = await searchContactByName(firstName, lastName);
-        if (contact?.email) {
-          await supabase.from("webhook_events").update({
-            payload: {
-              ...event.payload,
-              enriched_contact: {
-                email: contact.email,
-                first_name: contact.first_name || firstName,
-                last_name: contact.last_name || lastName,
-                company: contact.company,
-                title: contact.title,
-                linkedin_url: contact.linkedin_url,
+        for (const event of meetingEvents || []) {
+          if (event.payload?.enriched_contact?.email) { apolloSkipped++; continue; }
+          const obj = (event.payload?.payload as Record<string, unknown>)?.object as Record<string, unknown> | undefined;
+          const topic = (obj?.topic || "") as string;
+          const nameMatch = topic.match(/- (.+?) and Joshua/i) || topic.match(/- (.+?) and Josh/i);
+          if (!nameMatch) continue;
+          const prospectName = nameMatch[1].trim();
+          if (!prospectName) continue;
+          const [firstName, ...lastParts] = prospectName.split(" ");
+          const lastName = lastParts.join(" ");
+          const contact = await searchContactByName(firstName, lastName);
+          if (contact?.email) {
+            await supabase.from("webhook_events").update({
+              payload: {
+                ...event.payload,
+                enriched_contact: {
+                  email: contact.email,
+                  first_name: contact.first_name || firstName,
+                  last_name: contact.last_name || lastName,
+                  company: contact.company,
+                  title: contact.title,
+                  linkedin_url: contact.linkedin_url,
+                },
               },
-            },
-          }).eq("id", event.id);
-          apolloEnriched++;
+            }).eq("id", event.id);
+            apolloEnriched++;
+          }
         }
+      } catch (err) {
+        rebuildStatus.steps.push({ step: "apollo_enrich", status: "error", details: String(err) });
       }
+      rebuildStatus.steps.push({ step: "apollo_enrich_meetings", status: "done", details: { apolloEnriched, apolloSkipped } });
+
+      // Step 4: Reset ALL events to unprocessed
+      await supabase.from("webhook_events").update({ processed: false, processed_at: null }).eq("processed", true);
+      rebuildStatus.steps.push({ step: "reset_events", status: "done" });
+
+      // Step 5: Process events — the cron job will handle this in batches
+      // Don't do it inline to avoid timeout. Just let the 30-second cron pick it up.
+      rebuildStatus.steps.push({ step: "waiting_for_cron", status: "done", details: "Events reset. Cron will process in batches every 30s." });
+
+      rebuildStatus.running = false;
+      rebuildStatus.steps.push({ step: "complete", status: "done" });
     } catch (err) {
-      steps.push({ step: "apollo_enrich", status: "error", details: String(err) });
+      rebuildStatus.running = false;
+      rebuildStatus.error = err instanceof Error ? err.message : String(err);
+      rebuildStatus.steps.push({ step: "failed", status: "error", details: rebuildStatus.error });
     }
-    steps.push({ step: "apollo_enrich_meetings", status: "done", details: { apolloEnriched } });
+  })();
+});
 
-    // Step 5: Reset ALL events to unprocessed
-    await supabase.from("webhook_events").update({ processed: false, processed_at: null }).eq("processed", true);
-    steps.push({ step: "reset_events", status: "done" });
+app.get("/api/rebuild-status", async (_req, res) => {
+  const { getSupabase } = await import("./utils/supabase");
+  const supabase = getSupabase();
+  const config = getConfig();
 
-    // Step 6: Process the queue immediately
-    await processEventQueue();
-    steps.push({ step: "process_queue_pass_1", status: "done" });
+  const { count: processedCount } = await supabase.from("webhook_events").select("*", { count: "exact", head: true }).eq("processed", true);
+  const { count: unprocessedCount } = await supabase.from("webhook_events").select("*", { count: "exact", head: true }).eq("processed", false);
 
-    // Step 7: Check results
+  let attio: Record<string, unknown> = {};
+  try {
     const peopleResp = await fetch("https://api.attio.com/v2/objects/people/records/query", {
       method: "POST",
       headers: { Authorization: `Bearer ${config.ATTIO_API_KEY}`, "Content-Type": "application/json" },
-      body: JSON.stringify({ limit: 5 }),
+      body: JSON.stringify({ limit: 1 }),
     });
-    let attioResults: Record<string, unknown> = {};
     if (peopleResp.ok) {
-      const people = await peopleResp.json() as { data: unknown[] };
-      attioResults.people_count = people.data?.length || 0;
+      const p = await peopleResp.json() as { data: unknown[] };
+      attio.people_count = p.data?.length || 0;
     }
-    if (pipelineId) {
-      const dealsResp = await fetch(`https://api.attio.com/v2/lists/${pipelineId}/entries/query`, {
+    if (config.ATTIO_PIPELINE_ID) {
+      const dealsResp = await fetch(`https://api.attio.com/v2/lists/${config.ATTIO_PIPELINE_ID}/entries/query`, {
         method: "POST",
         headers: { Authorization: `Bearer ${config.ATTIO_API_KEY}`, "Content-Type": "application/json" },
-        body: JSON.stringify({ limit: 5 }),
+        body: JSON.stringify({ limit: 1 }),
       });
       if (dealsResp.ok) {
-        const deals = await dealsResp.json() as { data: unknown[] };
-        attioResults.deals_count = deals.data?.length || 0;
+        const d = await dealsResp.json() as { data: unknown[] };
+        attio.deals_count = d.data?.length || 0;
       }
     }
+  } catch { /* ignore */ }
 
-    const { count: processedCount } = await supabase.from("webhook_events").select("*", { count: "exact", head: true }).eq("processed", true);
-    const { count: unprocessedCount } = await supabase.from("webhook_events").select("*", { count: "exact", head: true }).eq("processed", false);
-
-    steps.push({ step: "verify", status: "done", details: { attio: attioResults, events: { processed: processedCount, remaining: unprocessedCount } } });
-
-    res.json({
-      message: "Full rebuild complete. Check Attio for contacts and deals.",
-      steps,
-      note: unprocessedCount && unprocessedCount > 0
-        ? `${unprocessedCount} events still unprocessed — the cron job will pick them up in the next 30 seconds, or call POST /api/process-now`
-        : "All events processed!",
-    });
-  } catch (err) {
-    res.status(500).json({
-      error: err instanceof Error ? err.message : String(err),
-      steps_completed: steps,
-    });
-  }
+  res.json({
+    rebuild: rebuildStatus,
+    events: { processed: processedCount, unprocessed: unprocessedCount },
+    attio,
+  });
 });
 
 // Start server

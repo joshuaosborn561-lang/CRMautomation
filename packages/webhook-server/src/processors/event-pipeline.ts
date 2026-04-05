@@ -224,36 +224,8 @@ export async function applyToAttio(
 
   // --- LEAD SOURCE: Create new contacts and deals ---
 
-  // Enrich contact with LeadMagic before pushing to Attio
-  try {
-    const enriched = await enrichContact({
-      email: contact.email,
-      first_name: contact.first_name,
-      last_name: contact.last_name,
-      company: contact.company,
-      linkedin_url: contact.linkedin_url,
-      phone: contact.phone,
-    });
-
-    if (enriched.enriched) {
-      // If we had no valid email and LeadMagic found one, use it
-      if ((!contact.email || contact.email === "unknown") && enriched.email) {
-        contact.email = enriched.email;
-      }
-      contact.first_name = contact.first_name || enriched.first_name;
-      contact.last_name = contact.last_name || enriched.last_name;
-      contact.company = contact.company || enriched.company;
-      contact.linkedin_url = contact.linkedin_url || enriched.linkedin_url;
-      contact.phone = contact.phone || enriched.phone;
-
-      logger.info("Contact enriched via LeadMagic", {
-        email: contact.email,
-        company: contact.company,
-      });
-    }
-  } catch (err) {
-    logger.warn("LeadMagic enrichment failed, proceeding without", { error: String(err) });
-  }
+  // LeadMagic enrichment DISABLED to save credits.
+  // Apollo enrichment happens in /api/re-enrich-apollo or /api/full-rebuild instead.
 
   // 1. Find or create the contact in Attio
   const contactId = await findOrCreateContact({
