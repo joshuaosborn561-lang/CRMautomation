@@ -233,12 +233,20 @@ export async function createContact(contact: AttioContact & { title?: string; le
     }
   }
 
+  // Use matching_attribute for built-in dedup:
+  // - If contact has email, match on email (prevents duplicates)
+  // - Attio will update existing record or create new one
+  const data: Record<string, unknown> = { values };
+  if (values.email_addresses) {
+    data.matching_attribute = "email_addresses";
+  }
+
   const result = (await attioFetch("/objects/people/records", {
     method: "POST",
-    body: JSON.stringify({ data: { values } }),
+    body: JSON.stringify({ data }),
   })) as { data: { id: { record_id: string } } };
 
-  logger.info("Created Attio contact", {
+  logger.info("Upserted Attio contact", {
     email: contact.email,
     name: `${contact.first_name} ${contact.last_name}`,
     company: contact.company,
@@ -295,28 +303,35 @@ export async function findOrCreateContact(contact: AttioContact & { title?: stri
 // --- Companies ---
 
 export async function findOrCreateCompany(name: string): Promise<string> {
-  const result = (await attioFetch("/objects/companies/records/query", {
-    method: "POST",
-    body: JSON.stringify({
-      filter: { name: { contains: name } },
-    }),
-  })) as { data: Array<{ id: { record_id: string } }> };
+  // Use Attio's upsert: matching_attribute finds existing by name or creates new
+  try {
+    const result = (await attioFetch("/objects/companies/records", {
+      method: "POST",
+      body: JSON.stringify({
+        data: {
+          values: { name: [{ value: name }] },
+          matching_attribute: "name",
+        },
+      }),
+    })) as { data: { id: { record_id: string } } };
 
-  if (result.data.length > 0) {
-    return result.data[0].id.record_id;
+    logger.info("Found/created Attio company", { name, id: result.data.id.record_id });
+    return result.data.id.record_id;
+  } catch (err) {
+    // Fallback: try without matching_attribute (just create)
+    logger.warn("Company upsert failed, creating new", { name, error: String(err) });
+    const created = (await attioFetch("/objects/companies/records", {
+      method: "POST",
+      body: JSON.stringify({
+        data: {
+          values: { name: [{ value: name }] },
+        },
+      }),
+    })) as { data: { id: { record_id: string } } };
+
+    logger.info("Created Attio company", { name, id: created.data.id.record_id });
+    return created.data.id.record_id;
   }
-
-  const created = (await attioFetch("/objects/companies/records", {
-    method: "POST",
-    body: JSON.stringify({
-      data: {
-        values: { name: [{ value: name }] },
-      },
-    }),
-  })) as { data: { id: { record_id: string } } };
-
-  logger.info("Created Attio company", { name, id: created.data.id.record_id });
-  return created.data.id.record_id;
 }
 
 // --- Deals ---
@@ -349,11 +364,36 @@ export async function findDealByContact(contactId: string): Promise<{ id: string
   return null;
 }
 
+// Cache the pipeline's parent_object so we only fetch it once
+let _pipelineParentObject: string | null = null;
+
+async function getPipelineParentObject(): Promise<string> {
+  if (_pipelineParentObject) return _pipelineParentObject;
+  const config = getConfig();
+  const pipelineId = config.ATTIO_PIPELINE_ID;
+  if (!pipelineId) return "people";
+  try {
+    const resp = await fetch(`${ATTIO_BASE_URL}/lists/${pipelineId}`, {
+      headers: { Authorization: `Bearer ${config.ATTIO_API_KEY}` },
+    });
+    if (resp.ok) {
+      const data = await resp.json() as { data?: { parent_object?: string } };
+      _pipelineParentObject = data.data?.parent_object || "people";
+      logger.info("Pipeline parent_object", { parent: _pipelineParentObject });
+      return _pipelineParentObject;
+    }
+  } catch {
+    // fallback
+  }
+  return "people";
+}
+
 export async function createDeal(deal: AttioDeal & { value?: number; term_months?: number }): Promise<string> {
   const config = getConfig();
   const pipelineId = config.ATTIO_PIPELINE_ID;
   if (!pipelineId) throw new Error("ATTIO_PIPELINE_ID not configured");
 
+  const parentObject = await getPipelineParentObject();
   const stageName = STAGE_MAP[deal.stage];
 
   const entryValues: Record<string, unknown> = {};
@@ -374,7 +414,7 @@ export async function createDeal(deal: AttioDeal & { value?: number; term_months
       method: "POST",
       body: JSON.stringify({
         data: {
-          parent_object: "people",
+          parent_object: parentObject,
           parent_record_id: deal.contact_id,
           entry_values: entryValues,
           current_status_title: stageName,
@@ -392,7 +432,7 @@ export async function createDeal(deal: AttioDeal & { value?: number; term_months
         method: "POST",
         body: JSON.stringify({
           data: {
-            parent_object: "people",
+            parent_object: parentObject,
             parent_record_id: deal.contact_id,
             entry_values: {},
             current_status_title: stageName,
@@ -409,7 +449,7 @@ export async function createDeal(deal: AttioDeal & { value?: number; term_months
         method: "POST",
         body: JSON.stringify({
           data: {
-            parent_object: "people",
+            parent_object: parentObject,
             parent_record_id: deal.contact_id,
             entry_values: {},
           },

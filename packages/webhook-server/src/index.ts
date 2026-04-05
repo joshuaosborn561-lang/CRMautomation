@@ -336,21 +336,55 @@ app.get("/api/debug/test-attio-write", async (_req, res) => {
       steps.push({ step: "update_company_ref", status: "ERROR", details: String(err) });
     }
 
-    // Step 4: Test deal creation (with entry_values as empty object)
+    // Step 4: Get pipeline config to see what parent objects it accepts
+    let pipelineParentObject: string | null = null;
     if (config.ATTIO_PIPELINE_ID) {
+      try {
+        const listResp = await fetch(`https://api.attio.com/v2/lists/${config.ATTIO_PIPELINE_ID}`, {
+          headers: { Authorization: `Bearer ${config.ATTIO_API_KEY}` },
+        });
+        const listBody = await listResp.text();
+        if (listResp.ok) {
+          const listData = JSON.parse(listBody);
+          pipelineParentObject = listData?.data?.parent_object;
+          steps.push({ step: "pipeline_config", status: "OK", details: {
+            parent_object: listData?.data?.parent_object,
+            name: listData?.data?.name,
+            statuses: listData?.data?.statuses?.map((s: any) => s.title),
+          }});
+        } else {
+          steps.push({ step: "pipeline_config", status: "FAIL", details: { http: listResp.status, body: listBody.substring(0, 300) } });
+        }
+      } catch (err) {
+        steps.push({ step: "pipeline_config", status: "ERROR", details: String(err) });
+      }
+
+      // Try deal creation with the correct parent_object from pipeline config
+      const parentObj = pipelineParentObject || "people";
       try {
         const resp = await fetch(`https://api.attio.com/v2/lists/${config.ATTIO_PIPELINE_ID}/entries`, {
           method: "POST", headers,
           body: JSON.stringify({
             data: {
-              parent_object: "people",
+              parent_object: parentObj,
               parent_record_id: testContactId,
               entry_values: {},
             },
           }),
         });
         const body = await resp.text();
-        steps.push({ step: "create_deal", status: resp.ok ? "OK" : "FAIL", details: { http: resp.status, body: body.substring(0, 500) } });
+        steps.push({ step: "create_deal", status: resp.ok ? "OK" : "FAIL", details: { http: resp.status, parent_object_used: parentObj, body: body.substring(0, 500) } });
+
+        // Clean up the deal if created
+        if (resp.ok) {
+          const dealData = JSON.parse(body);
+          const entryId = dealData?.data?.entry_id;
+          if (entryId) {
+            await fetch(`https://api.attio.com/v2/lists/${config.ATTIO_PIPELINE_ID}/entries/${entryId}`, {
+              method: "DELETE", headers: { Authorization: `Bearer ${config.ATTIO_API_KEY}` },
+            });
+          }
+        }
       } catch (err) {
         steps.push({ step: "create_deal", status: "ERROR", details: String(err) });
       }
