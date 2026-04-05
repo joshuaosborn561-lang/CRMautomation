@@ -511,12 +511,33 @@ async function getDealStageOptions(): Promise<Array<{ title: string; id: string 
 // --- Deals ---
 
 export async function findDealByContact(contactId: string): Promise<{ id: string; stage: string } | null> {
+  // Search deal records for ones with associated_people matching this contactId
+  try {
+    const result = (await attioFetch("/objects/deals/records/query", {
+      method: "POST",
+      body: JSON.stringify({
+        filter: {
+          associated_people: { contains: contactId },
+        },
+      }),
+    })) as { data: Array<{ id: { record_id: string }; values: Record<string, unknown> }> };
+
+    if (result.data.length > 0) {
+      const deal = result.data[0];
+      const stageValues = deal.values?.stage as Array<{ status: { title: string } }> | undefined;
+      const stageName = stageValues?.[0]?.status?.title || "unknown";
+      return { id: deal.id.record_id, stage: stageName };
+    }
+  } catch (err) {
+    logger.warn("findDealByContact query failed, trying pipeline fallback", { contactId, error: String(err) });
+  }
+
+  // Fallback: check pipeline entries
   const config = getConfig();
   const pipelineId = config.ATTIO_PIPELINE_ID;
   if (!pipelineId) return null;
 
   try {
-    // Query pipeline entries and check if any deal is linked to this person
     const result = (await attioFetch(`/lists/${pipelineId}/entries/query`, {
       method: "POST",
       body: JSON.stringify({ filter: {} }),
@@ -524,17 +545,14 @@ export async function findDealByContact(contactId: string): Promise<{ id: string
       data: Array<{
         entry_id: string;
         parent_record_id: string;
-        record_id?: string;
         current_status?: { title: string };
-        entry_values?: Record<string, unknown>;
       }>;
     };
 
-    // Check each entry — look for associated_people or parent that links to this contactId
     for (const entry of result.data) {
-      // Direct match on parent_record_id (in case pipeline is linked differently)
       if (entry.parent_record_id === contactId) {
-        return { id: entry.entry_id, stage: entry.current_status?.title || "unknown" };
+        // Return the deal record ID (parent_record_id) not the entry_id
+        return { id: entry.parent_record_id, stage: entry.current_status?.title || "unknown" };
       }
     }
 
@@ -692,31 +710,61 @@ export async function createDeal(deal: AttioDeal & { value?: number; term_months
     stage: stageName,
     value: deal.value,
     term_months: deal.term_months,
-    id: result.data.entry_id,
+    dealRecordId,
+    pipelineEntryId: result.data.entry_id,
   });
-  return result.data.entry_id;
+  // Return the deal RECORD ID (not pipeline entry ID) — needed for notes and tasks
+  return dealRecordId;
 }
 
-export async function updateDealStage(dealId: string, stage: DealStage): Promise<void> {
+export async function updateDealStage(dealRecordId: string, stage: DealStage): Promise<void> {
   const config = getConfig();
   const pipelineId = config.ATTIO_PIPELINE_ID;
   if (!pipelineId) throw new Error("ATTIO_PIPELINE_ID not configured");
 
   const stageName = STAGE_MAP[stage];
 
+  // Update the deal record's stage field directly
   try {
-    await attioFetch(`/lists/${pipelineId}/entries/${dealId}`, {
-      method: "PATCH",
-      body: JSON.stringify({
-        data: {
-          current_status_title: stageName,
-        },
-      }),
-    });
-    logger.info("Updated Attio deal stage", { dealId, stage: stageName });
+    const stageOptions = await getDealStageOptions();
+    const matchedStage = stageOptions.find(s =>
+      s.title.toLowerCase().includes(stageName.toLowerCase()) ||
+      stageName.toLowerCase().includes(s.title.toLowerCase())
+    );
+    const stageTitle = matchedStage?.title || stageOptions[0]?.title;
+    if (stageTitle) {
+      await attioFetch(`/objects/deals/records/${dealRecordId}`, {
+        method: "PATCH",
+        body: JSON.stringify({
+          data: { values: { stage: [{ status: stageTitle }] } },
+        }),
+      });
+    }
   } catch (err) {
-    logger.warn("Failed to update deal stage (stage may not exist in Attio)", {
-      dealId,
+    logger.warn("Failed to update deal record stage", { dealRecordId, error: String(err) });
+  }
+
+  // Also update the pipeline entry's status
+  try {
+    // Find the pipeline entry for this deal record
+    const entries = (await attioFetch(`/lists/${pipelineId}/entries/query`, {
+      method: "POST",
+      body: JSON.stringify({ filter: {} }),
+    })) as { data: Array<{ entry_id: string; parent_record_id: string }> };
+
+    const entry = entries.data.find(e => e.parent_record_id === dealRecordId);
+    if (entry) {
+      await attioFetch(`/lists/${pipelineId}/entries/${entry.entry_id}`, {
+        method: "PATCH",
+        body: JSON.stringify({
+          data: { current_status_title: stageName },
+        }),
+      });
+      logger.info("Updated Attio deal stage", { dealRecordId, entryId: entry.entry_id, stage: stageName });
+    }
+  } catch (err) {
+    logger.warn("Failed to update pipeline entry stage", {
+      dealRecordId,
       stage: stageName,
       error: String(err),
     });
@@ -726,24 +774,35 @@ export async function updateDealStage(dealId: string, stage: DealStage): Promise
 // --- Notes ---
 
 export async function createNote(note: AttioNote): Promise<void> {
-  await attioFetch("/notes", {
-    method: "POST",
-    body: JSON.stringify({
-      data: {
-        parent_object: note.parent_object === "deals" ? "lists" : "people",
-        parent_record_id: note.parent_id,
-        title: note.title,
-        content: [
-          {
-            type: "paragraph",
-            children: [{ text: note.content }],
-          },
-        ],
-      },
-    }),
-  });
+  // Attio Notes API: parent_object should be the object slug ("people" or "deals")
+  // parent_record_id is the record ID within that object
+  // Content is rich-text blocks
+  const parentObject = note.parent_object === "contacts" ? "people" : note.parent_object;
 
-  logger.info("Created Attio note", { parentId: note.parent_id, title: note.title });
+  // Split long content into paragraphs for better readability
+  const paragraphs = note.content.split("\n\n").filter(p => p.trim());
+  const contentBlocks = paragraphs.map(p => ({
+    type: "paragraph" as const,
+    children: [{ text: p.trim() }],
+  }));
+
+  try {
+    await attioFetch("/notes", {
+      method: "POST",
+      body: JSON.stringify({
+        data: {
+          parent_object: parentObject,
+          parent_record_id: note.parent_id,
+          title: note.title,
+          content: contentBlocks.length > 0 ? contentBlocks : [{ type: "paragraph", children: [{ text: note.content }] }],
+        },
+      }),
+    });
+    logger.info("Created Attio note", { parentObject, parentId: note.parent_id, title: note.title });
+  } catch (err) {
+    // If note creation fails on deals, try linking to people instead
+    logger.warn("Note creation failed", { parentObject, parentId: note.parent_id, error: String(err) });
+  }
 }
 
 // --- Tasks ---

@@ -149,6 +149,7 @@ export interface AttioDeal {
   contact_id: string;
   company?: string;
   value?: number;
+  term_months?: number;
 }
 
 export interface AttioNote {
