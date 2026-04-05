@@ -56,6 +56,13 @@ async function attioFetch(
 
 let _fieldsEnsured = false;
 
+export function resetFieldsCache(): void {
+  _fieldsEnsured = false;
+  _dealStageOptions = null;
+  _workspaceMemberId = null;
+  _pipelineParentObject = null;
+}
+
 export async function ensureAttioFieldsExist(): Promise<void> {
   if (_fieldsEnsured) return;
 
@@ -177,69 +184,64 @@ export async function ensureAttioFieldsExist(): Promise<void> {
   }
 
   // 4. Ensure deal stage statuses exist on the Deals object's "stage" attribute
+  // Uses dedicated endpoint: POST /objects/deals/attributes/stage/statuses
   try {
-    const stageResp = await fetch(`${ATTIO_BASE_URL}/objects/deals/attributes/stage`, {
+    // First list existing statuses
+    const listResp = await fetch(`${ATTIO_BASE_URL}/objects/deals/attributes/stage/statuses`, {
       headers: { Authorization: `Bearer ${config.ATTIO_API_KEY}` },
     });
-    if (stageResp.ok) {
-      const stageData = await stageResp.json() as { data: { id: unknown; config?: { statuses?: Array<{ title: string }> } } };
-      const existingStatuses = stageData.data?.config?.statuses || [];
-      logger.info("Deal stage attribute", { existingStatuses: existingStatuses.map(s => s.title) });
+    let existingTitles: string[] = [];
+    if (listResp.ok) {
+      const listData = await listResp.json() as { data: Array<{ title: string }> };
+      existingTitles = (listData.data || []).map(s => s.title);
+      logger.info("Existing deal stage statuses", { statuses: existingTitles });
+    }
 
-      if (existingStatuses.length === 0) {
-        // No statuses configured — create them via PATCH
-        const dealStageStatuses = [
-          { title: "Open", target_archive_state: "active" as const },
-          { title: "Replied / Showed Interest", target_archive_state: "active" as const },
-          { title: "Call or Meeting Booked", target_archive_state: "active" as const },
-          { title: "Discovery Completed", target_archive_state: "active" as const },
-          { title: "Proposal Sent", target_archive_state: "active" as const },
-          { title: "Negotiating", target_archive_state: "active" as const },
-          { title: "Closed Won", target_archive_state: "archived-won" as const },
-          { title: "Closed Lost", target_archive_state: "archived-lost" as const },
-          { title: "Nurture", target_archive_state: "active" as const },
-        ];
+    const desiredStages = [
+      "Open",
+      "Replied / Showed Interest",
+      "Call or Meeting Booked",
+      "Discovery Completed",
+      "Proposal Sent",
+      "Negotiating",
+      "Closed Won",
+      "Closed Lost",
+      "Nurture",
+    ];
 
-        const patchResp = await fetch(`${ATTIO_BASE_URL}/objects/deals/attributes/stage`, {
-          method: "PATCH",
-          headers,
-          body: JSON.stringify({
-            data: {
-              config: {
-                statuses: dealStageStatuses,
-              },
-            },
-          }),
-        });
-        if (patchResp.ok) {
-          logger.info("Created deal stage statuses", { count: dealStageStatuses.length });
-          // Clear cached stage options so they're re-fetched
-          _dealStageOptions = null;
-        } else {
-          const patchBody = await patchResp.text();
-          logger.warn("Failed to create deal stage statuses via PATCH", { status: patchResp.status, body: patchBody });
-
-          // Fallback: Try updating with simpler format (just titles)
-          const simplePatchResp = await fetch(`${ATTIO_BASE_URL}/objects/deals/attributes/stage`, {
-            method: "PATCH",
+    const missingStages = desiredStages.filter(s => !existingTitles.includes(s));
+    if (missingStages.length > 0) {
+      logger.info("Creating missing deal stage statuses", { missing: missingStages });
+      for (const title of missingStages) {
+        try {
+          const createResp = await fetch(`${ATTIO_BASE_URL}/objects/deals/attributes/stage/statuses`, {
+            method: "POST",
             headers,
             body: JSON.stringify({
               data: {
-                config: {
-                  statuses: dealStageStatuses.map(s => ({ title: s.title })),
-                },
+                title,
+                celebration_enabled: title === "Closed Won",
               },
             }),
           });
-          if (simplePatchResp.ok) {
-            logger.info("Created deal stage statuses (simple format)");
-            _dealStageOptions = null;
+          if (createResp.ok) {
+            logger.info(`Created deal stage status: ${title}`);
           } else {
-            const simpleBody = await simplePatchResp.text();
-            logger.warn("Failed to create deal stage statuses (simple format)", { status: simplePatchResp.status, body: simpleBody });
+            const body = await createResp.text();
+            if (createResp.status === 409 || body.includes("already") || body.includes("exists")) {
+              // Already exists
+            } else {
+              logger.warn(`Failed to create deal stage status: ${title}`, { status: createResp.status, body });
+            }
           }
+        } catch (err) {
+          logger.warn(`Error creating deal stage status: ${title}`, { error: String(err) });
         }
       }
+      // Clear cached stage options so they're re-fetched
+      _dealStageOptions = null;
+    } else {
+      logger.info("All deal stage statuses already exist");
     }
   } catch (err) {
     logger.warn("Could not check/create deal stage statuses", { error: String(err) });
@@ -432,12 +434,12 @@ let _dealStageOptions: Array<{ title: string; id: string }> | null = null;
 async function getDealStageOptions(): Promise<Array<{ title: string; id: string }>> {
   if (_dealStageOptions) return _dealStageOptions;
   try {
-    // Get the "stage" attribute on the deals object to find valid status options
-    const result = (await attioFetch("/objects/deals/attributes/stage", {
+    // Use dedicated statuses endpoint (not attribute config)
+    const result = (await attioFetch("/objects/deals/attributes/stage/statuses", {
       method: "GET",
-    })) as { data: { config?: { statuses?: Array<{ title: string; id: string }> } } };
+    })) as { data: Array<{ title: string; id: { status_id: string } }> };
 
-    _dealStageOptions = result.data?.config?.statuses || [];
+    _dealStageOptions = (result.data || []).map(s => ({ title: s.title, id: s.id?.status_id || "" }));
     logger.info("Got deal stage options", { options: _dealStageOptions.map(s => s.title) });
     return _dealStageOptions;
   } catch (err) {

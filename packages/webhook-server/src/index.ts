@@ -378,155 +378,52 @@ app.get("/api/debug/test-attio-write", async (_req, res) => {
         steps.push({ step: "get_workspace_member", status: "ERROR", details: String(err) });
       }
 
-      // Step 4b: Get raw deal stage attribute + try to create statuses if empty
+      // Step 4b: Ensure deal stages exist via dedicated statuses endpoint, then get them
       let testStageTitle: string | null = null;
       try {
-        // Fetch the raw stage attribute to see its full structure
-        const stageResp = await fetch("https://api.attio.com/v2/objects/deals/attributes/stage", {
+        // Run ensureAttioFieldsExist to create stages via POST /objects/deals/attributes/stage/statuses
+        const { ensureAttioFieldsExist: ensureFields, resetFieldsCache } = await import("./services/attio");
+        resetFieldsCache(); // Reset so it actually runs
+        await ensureFields();
+
+        // Now list the statuses to confirm they exist
+        const listResp = await fetch("https://api.attio.com/v2/objects/deals/attributes/stage/statuses", {
           headers: { Authorization: `Bearer ${config.ATTIO_API_KEY}` },
         });
-        if (stageResp.ok) {
-          const stageData = await stageResp.json() as { data: Record<string, unknown> };
-          const rawConfig = (stageData.data as any)?.config;
-          const statuses = rawConfig?.statuses || [];
-          steps.push({ step: "get_deal_stage_raw", status: "OK", details: {
-            config: rawConfig,
-            statusCount: statuses.length,
-            statuses: statuses.map((s: any) => s.title),
-          }});
-
-          if (statuses.length === 0) {
-            // Try PATCH with multiple formats to create statuses
-            const formats = [
-              {
-                name: "format1_with_archive",
-                body: { data: { config: { statuses: [
-                  { title: "Open", target_archive_state: "active" },
-                  { title: "Won", target_archive_state: "archived-won" },
-                  { title: "Lost", target_archive_state: "archived-lost" },
-                ]}}}
-              },
-              {
-                name: "format2_simple",
-                body: { data: { config: { statuses: [
-                  { title: "Open" },
-                  { title: "Won" },
-                  { title: "Lost" },
-                ]}}}
-              },
-              {
-                name: "format3_top_level",
-                body: { config: { statuses: [
-                  { title: "Open" },
-                  { title: "Won" },
-                  { title: "Lost" },
-                ]}}
-              },
-              {
-                name: "format4_put",
-                body: { data: { config: { statuses: [
-                  { title: "Open", target_archive_state: "active" },
-                  { title: "Won", target_archive_state: "archived-won" },
-                  { title: "Lost", target_archive_state: "archived-lost" },
-                ]}}},
-                method: "PUT",
-              },
-            ];
-
-            for (const fmt of formats) {
-              try {
-                const patchResp = await fetch("https://api.attio.com/v2/objects/deals/attributes/stage", {
-                  method: fmt.method || "PATCH",
-                  headers,
-                  body: JSON.stringify(fmt.body),
-                });
-                const patchBody = await patchResp.text();
-                steps.push({ step: `create_stages_${fmt.name}`, status: patchResp.ok ? "OK" : "FAIL", details: { http: patchResp.status, body: patchBody.substring(0, 500) } });
-                if (patchResp.ok) {
-                  // Re-fetch to confirm
-                  const recheckResp = await fetch("https://api.attio.com/v2/objects/deals/attributes/stage", {
-                    headers: { Authorization: `Bearer ${config.ATTIO_API_KEY}` },
-                  });
-                  if (recheckResp.ok) {
-                    const recheckData = await recheckResp.json() as any;
-                    const newStatuses = recheckData?.data?.config?.statuses || [];
-                    testStageTitle = newStatuses[0]?.title || null;
-                    steps.push({ step: "stages_after_create", status: "OK", details: { stages: newStatuses.map((s: any) => s.title) } });
-                  }
-                  break; // Success — stop trying formats
-                }
-              } catch (err) {
-                steps.push({ step: `create_stages_${fmt.name}`, status: "ERROR", details: String(err) });
-              }
-            }
-          } else {
-            testStageTitle = statuses[0]?.title || null;
-          }
-
-          steps.push({ step: "deal_stage_result", status: testStageTitle ? "OK" : "NO STAGES", details: { using: testStageTitle } });
+        if (listResp.ok) {
+          const listData = await listResp.json() as { data: Array<{ title: string }> };
+          const statuses = listData.data || [];
+          testStageTitle = statuses[0]?.title || null;
+          steps.push({ step: "get_deal_stages", status: statuses.length > 0 ? "OK" : "WARN (no stages)", details: { stages: statuses.map(s => s.title), using: testStageTitle } });
         } else {
-          const body = await stageResp.text();
-          steps.push({ step: "get_deal_stage_raw", status: "FAIL", details: { http: stageResp.status, body: body.substring(0, 300) } });
+          const body = await listResp.text();
+          steps.push({ step: "get_deal_stages", status: "FAIL", details: { http: listResp.status, body: body.substring(0, 300) } });
         }
       } catch (err) {
         steps.push({ step: "get_deal_stages", status: "ERROR", details: String(err) });
       }
 
-      // Step 4c: Try multiple stage value formats to find what works
+      // Step 4c: Create a deal record with ALL required fields (name, stage, owner)
       let testDealRecordId: string | null = null;
-      const stageFormats = [
-        { name: "status_title", value: [{ status: testStageTitle || "Open" }] },
-        { name: "bare_string", value: testStageTitle || "Open" },
-        { name: "status_object", value: [{ title: testStageTitle || "Open" }] },
-        { name: "string_array", value: [testStageTitle || "Open"] },
-      ];
+      try {
+        const dealValues: Record<string, unknown> = { name: "Test Deal - CRM Debug" };
+        if (testStageTitle) dealValues.stage = [{ status: testStageTitle }];
+        if (testOwnerId) dealValues.owner = [{ referenced_actor_type: "workspace-member", referenced_actor_id: testOwnerId }];
 
-      for (const fmt of stageFormats) {
-        try {
-          const dealValues: Record<string, unknown> = {
-            name: `Test Deal - ${fmt.name}`,
-            stage: fmt.value,
-          };
-          if (testOwnerId) {
-            dealValues.owner = [{ referenced_actor_type: "workspace-member", referenced_actor_id: testOwnerId }];
-          }
-
-          const dealResp = await fetch("https://api.attio.com/v2/objects/deals/records", {
-            method: "POST", headers,
-            body: JSON.stringify({ data: { values: dealValues } }),
-          });
-          const dealBody = await dealResp.text();
-          if (dealResp.ok) {
-            const dealData = JSON.parse(dealBody);
-            testDealRecordId = dealData?.data?.id?.record_id;
-            steps.push({ step: `create_deal_${fmt.name}`, status: "OK", details: { dealRecordId: testDealRecordId, format: fmt.name, stageValue: fmt.value } });
-            break; // Found working format
-          } else {
-            steps.push({ step: `create_deal_${fmt.name}`, status: "FAIL", details: { http: dealResp.status, body: dealBody.substring(0, 300), stageValue: fmt.value } });
-          }
-        } catch (err) {
-          steps.push({ step: `create_deal_${fmt.name}`, status: "ERROR", details: String(err) });
+        const dealResp = await fetch("https://api.attio.com/v2/objects/deals/records", {
+          method: "POST", headers,
+          body: JSON.stringify({ data: { values: dealValues } }),
+        });
+        const dealBody = await dealResp.text();
+        if (dealResp.ok) {
+          const dealData = JSON.parse(dealBody);
+          testDealRecordId = dealData?.data?.id?.record_id;
+          steps.push({ step: "create_deal_record", status: "OK", details: { dealRecordId: testDealRecordId, sentValues: Object.keys(dealValues) } });
+        } else {
+          steps.push({ step: "create_deal_record", status: "FAIL", details: { http: dealResp.status, body: dealBody.substring(0, 500), sentValues: dealValues } });
         }
-      }
-
-      // If none of the stage formats worked, try WITHOUT stage to see if error changes
-      if (!testDealRecordId) {
-        try {
-          const dealValues: Record<string, unknown> = { name: "Test Deal - no_stage" };
-          if (testOwnerId) dealValues.owner = [{ referenced_actor_type: "workspace-member", referenced_actor_id: testOwnerId }];
-          const dealResp = await fetch("https://api.attio.com/v2/objects/deals/records", {
-            method: "POST", headers,
-            body: JSON.stringify({ data: { values: dealValues } }),
-          });
-          const dealBody = await dealResp.text();
-          steps.push({ step: "create_deal_no_stage", status: dealResp.ok ? "OK" : "FAIL", details: { http: dealResp.status, body: dealBody.substring(0, 500) } });
-          if (dealResp.ok) {
-            const dealData = JSON.parse(dealBody);
-            testDealRecordId = dealData?.data?.id?.record_id;
-          }
-        } catch (err) {
-          steps.push({ step: "create_deal_no_stage", status: "ERROR", details: String(err) });
-        }
+      } catch (err) {
+        steps.push({ step: "create_deal_record", status: "ERROR", details: String(err) });
       }
 
       // Step 4b: Create pipeline entry for the deal record
