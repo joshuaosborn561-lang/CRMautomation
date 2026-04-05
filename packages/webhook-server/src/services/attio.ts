@@ -63,6 +63,12 @@ export function resetFieldsCache(): void {
   _pipelineParentObject = null;
 }
 
+export function resetDedupeCache(): void {
+  _contactCacheByEmail.clear();
+  _contactCacheByName.clear();
+  _companyCache.clear();
+}
+
 export async function ensureAttioFieldsExist(): Promise<void> {
   if (_fieldsEnsured) return;
 
@@ -278,10 +284,13 @@ export async function createContact(contact: AttioContact & { title?: string; le
     values.email_addresses = [{ email_address: contact.email }];
   }
   if (contact.first_name || contact.last_name) {
+    // Normalize to Title Case so "CARL DUGAN" and "carl dugan" both become "Carl Dugan"
+    const first = normalizeName(contact.first_name || "");
+    const last = normalizeName(contact.last_name || "");
     values.name = [{
-      first_name: contact.first_name || "",
-      last_name: contact.last_name || "",
-      full_name: `${contact.first_name || ""} ${contact.last_name || ""}`.trim(),
+      first_name: first,
+      last_name: last,
+      full_name: `${first} ${last}`.trim(),
     }];
   }
   if (contact.phone) values.phone_numbers = [{ original_phone_number: contact.phone }];
@@ -341,51 +350,103 @@ export async function createContact(contact: AttioContact & { title?: string; le
   return result.data.id.record_id;
 }
 
-export async function findContactByName(firstName: string, lastName: string): Promise<{ id: string } | null> {
-  try {
-    const result = (await attioFetch("/objects/people/records/query", {
-      method: "POST",
-      body: JSON.stringify({
-        filter: {
-          name: { full_name: { contains: `${firstName} ${lastName}`.trim() } },
-        },
-      }),
-    })) as { data: Array<{ id: { record_id: string } }> };
+// Normalize name to Title Case for consistent matching
+function normalizeName(name: string): string {
+  return name.trim().toLowerCase().replace(/\b\w/g, c => c.toUpperCase());
+}
 
-    if (result.data.length > 0) {
-      return { id: result.data[0].id.record_id };
+export async function findContactByName(firstName: string, lastName: string): Promise<{ id: string } | null> {
+  const searchName = `${firstName} ${lastName}`.trim();
+  if (!searchName) return null;
+
+  // Try multiple search strategies to handle case differences
+  const searches = [
+    searchName,                    // original: "CARL DUGAN"
+    normalizeName(searchName),     // title case: "Carl Dugan"
+    searchName.toLowerCase(),      // lower: "carl dugan"
+  ];
+
+  // Dedupe search terms
+  const uniqueSearches = [...new Set(searches)];
+
+  for (const term of uniqueSearches) {
+    try {
+      const result = (await attioFetch("/objects/people/records/query", {
+        method: "POST",
+        body: JSON.stringify({
+          filter: {
+            name: { full_name: { contains: term } },
+          },
+        }),
+      })) as { data: Array<{ id: { record_id: string } }> };
+
+      if (result.data.length > 0) {
+        return { id: result.data[0].id.record_id };
+      }
+    } catch (err) {
+      logger.warn("Name-based contact search failed", { term, error: String(err) });
     }
-  } catch (err) {
-    logger.warn("Name-based contact search failed", { error: String(err) });
   }
   return null;
 }
 
+// In-memory contact cache: email → recordId and name → recordId
+// Prevents duplicate creation within the same process run (e.g., rebuild batch)
+const _contactCacheByEmail = new Map<string, string>();
+const _contactCacheByName = new Map<string, string>();
+
 export async function findOrCreateContact(contact: AttioContact & { title?: string; lead_source?: string; industry?: string }): Promise<string> {
-  // Try finding by email first
-  if (contact.email && contact.email !== "unknown") {
-    const existing = await findContact(contact.email);
+  const email = contact.email && contact.email !== "unknown" ? contact.email.toLowerCase() : null;
+  const fullName = contact.first_name && contact.last_name
+    ? normalizeName(`${contact.first_name} ${contact.last_name}`)
+    : null;
+
+  // Check in-memory cache first (catches same person across multiple events in one batch)
+  if (email && _contactCacheByEmail.has(email)) {
+    const cachedId = _contactCacheByEmail.get(email)!;
+    logger.info("Contact found in cache by email", { email, id: cachedId });
+    await updateExistingContact(cachedId, contact);
+    return cachedId;
+  }
+  if (fullName && _contactCacheByName.has(fullName)) {
+    const cachedId = _contactCacheByName.get(fullName)!;
+    logger.info("Contact found in cache by name", { name: fullName, id: cachedId });
+    await updateExistingContact(cachedId, contact);
+    return cachedId;
+  }
+
+  // Try finding by email in Attio
+  if (email) {
+    const existing = await findContact(email);
     if (existing) {
-      logger.info("Found existing Attio contact by email — updating with enrichment data", { email: contact.email, id: existing.id });
+      logger.info("Found existing Attio contact by email — updating", { email, id: existing.id });
+      _contactCacheByEmail.set(email, existing.id);
+      if (fullName) _contactCacheByName.set(fullName, existing.id);
       await updateExistingContact(existing.id, contact);
       return existing.id;
     }
   }
 
-  // Try finding by name (prevents duplicates for contacts without email)
+  // Try finding by name in Attio
   if (contact.first_name && contact.last_name) {
     const existing = await findContactByName(contact.first_name, contact.last_name);
     if (existing) {
-      logger.info("Found existing Attio contact by name — updating with enrichment data", {
-        name: `${contact.first_name} ${contact.last_name}`,
+      logger.info("Found existing Attio contact by name — updating", {
+        name: fullName,
         id: existing.id,
       });
+      if (email) _contactCacheByEmail.set(email, existing.id);
+      if (fullName) _contactCacheByName.set(fullName, existing.id);
       await updateExistingContact(existing.id, contact);
       return existing.id;
     }
   }
 
-  return createContact(contact);
+  // Create new contact
+  const newId = await createContact(contact);
+  if (email) _contactCacheByEmail.set(email, newId);
+  if (fullName) _contactCacheByName.set(fullName, newId);
+  return newId;
 }
 
 // Update an existing contact with any new data we have (fill blanks, don't overwrite)
@@ -433,36 +494,32 @@ async function updateExistingContact(
 
 // --- Companies ---
 
+// Cache company IDs to avoid redundant API calls within same process run
+const _companyCache = new Map<string, string>();
+
 export async function findOrCreateCompany(name: string): Promise<string> {
-  // Use Attio's upsert: matching_attribute finds existing by name or creates new
-  try {
-    const result = (await attioFetch("/objects/companies/records", {
-      method: "POST",
-      body: JSON.stringify({
-        data: {
-          values: { name: [{ value: name }] },
-          matching_attribute: "name",
-        },
-      }),
-    })) as { data: { id: { record_id: string } } };
+  const normalizedName = normalizeName(name);
 
-    logger.info("Found/created Attio company", { name, id: result.data.id.record_id });
-    return result.data.id.record_id;
-  } catch (err) {
-    // Fallback: try without matching_attribute (just create)
-    logger.warn("Company upsert failed, creating new", { name, error: String(err) });
-    const created = (await attioFetch("/objects/companies/records", {
-      method: "POST",
-      body: JSON.stringify({
-        data: {
-          values: { name: [{ value: name }] },
-        },
-      }),
-    })) as { data: { id: { record_id: string } } };
-
-    logger.info("Created Attio company", { name, id: created.data.id.record_id });
-    return created.data.id.record_id;
+  // Check in-memory cache first
+  if (_companyCache.has(normalizedName)) {
+    return _companyCache.get(normalizedName)!;
   }
+
+  // Use Attio's upsert: matching_attribute finds existing by name or creates new
+  const result = (await attioFetch("/objects/companies/records", {
+    method: "POST",
+    body: JSON.stringify({
+      data: {
+        values: { name: [{ value: normalizedName }] },
+        matching_attribute: "name",
+      },
+    }),
+  })) as { data: { id: { record_id: string } } };
+
+  const id = result.data.id.record_id;
+  _companyCache.set(normalizedName, id);
+  logger.info("Found/created Attio company", { name: normalizedName, id });
+  return id;
 }
 
 // --- Workspace Members ---
@@ -511,57 +568,37 @@ async function getDealStageOptions(): Promise<Array<{ title: string; id: string 
 // --- Deals ---
 
 export async function findDealByContact(contactId: string): Promise<{ id: string; stage: string } | null> {
-  // Search deal records for ones with associated_people matching this contactId
+  // Query ALL deal records and check associated_people in code
+  // (Attio's "contains" filter doesn't work on record-reference fields)
   try {
     const result = (await attioFetch("/objects/deals/records/query", {
       method: "POST",
-      body: JSON.stringify({
-        filter: {
-          associated_people: { contains: contactId },
-        },
-      }),
-    })) as { data: Array<{ id: { record_id: string }; values: Record<string, unknown> }> };
-
-    if (result.data.length > 0) {
-      const deal = result.data[0];
-      const stageValues = deal.values?.stage as Array<{ status: { title: string } }> | undefined;
-      const stageName = stageValues?.[0]?.status?.title || "unknown";
-      return { id: deal.id.record_id, stage: stageName };
-    }
-  } catch (err) {
-    logger.warn("findDealByContact query failed, trying pipeline fallback", { contactId, error: String(err) });
-  }
-
-  // Fallback: check pipeline entries
-  const config = getConfig();
-  const pipelineId = config.ATTIO_PIPELINE_ID;
-  if (!pipelineId) return null;
-
-  try {
-    const result = (await attioFetch(`/lists/${pipelineId}/entries/query`, {
-      method: "POST",
-      body: JSON.stringify({ filter: {} }),
+      body: JSON.stringify({ limit: 500 }),
     })) as {
       data: Array<{
-        entry_id: string;
-        parent_record_id: string;
-        current_status?: { title: string };
+        id: { record_id: string };
+        values: Record<string, unknown>;
       }>;
     };
 
-    for (const entry of result.data) {
-      if (entry.parent_record_id === contactId) {
-        // Return the deal record ID (parent_record_id) not the entry_id
-        return { id: entry.parent_record_id, stage: entry.current_status?.title || "unknown" };
+    for (const deal of result.data) {
+      // associated_people is an array of record-references
+      const people = deal.values?.associated_people as Array<{
+        target_object: string;
+        target_record_id: string;
+      }> | undefined;
+
+      if (people?.some(p => p.target_record_id === contactId)) {
+        const stageValues = deal.values?.stage as Array<{ status?: { title: string } }> | undefined;
+        const stageName = stageValues?.[0]?.status?.title || "unknown";
+        logger.info("Found existing deal for contact", { contactId, dealId: deal.id.record_id, stage: stageName });
+        return { id: deal.id.record_id, stage: stageName };
       }
     }
-
-    // Also check deal records directly for this person
-    // (deals may have associated_people linking to the contact)
-    // For now, return null — we'll create a new deal
   } catch (err) {
-    logger.warn("findDealByContact failed", { contactId, error: String(err) });
+    logger.warn("findDealByContact query failed", { contactId, error: String(err) });
   }
+
   return null;
 }
 

@@ -1360,8 +1360,10 @@ app.post("/api/full-rebuild", async (_req, res) => {
       const { getSupabase } = await import("./utils/supabase");
       const supabase = getSupabase();
 
-      // Step 0: Ensure all Attio custom fields + pipeline stages exist
-      const { ensureAttioFieldsExist: ensureFields } = await import("./services/attio");
+      // Step 0: Clear dedup caches and ensure all Attio custom fields + pipeline stages exist
+      const { ensureAttioFieldsExist: ensureFields, resetFieldsCache: resetFields, resetDedupeCache } = await import("./services/attio");
+      resetFields();
+      resetDedupeCache();
       await ensureFields();
       rebuildStatus.steps.push({ step: "setup_attio_fields", status: "done" });
 
