@@ -76,8 +76,14 @@ export async function createContact(contact: AttioContact): Promise<string> {
   if (contact.email && contact.email !== "unknown" && contact.email.includes("@")) {
     values.email_addresses = [{ email_address: contact.email }];
   }
-  if (contact.first_name) values.first_name = [{ first_name: contact.first_name }];
-  if (contact.last_name) values.last_name = [{ last_name: contact.last_name }];
+  // Attio uses a single "name" attribute with first_name/last_name subfields
+  if (contact.first_name || contact.last_name) {
+    values.name = [{
+      first_name: contact.first_name || "",
+      last_name: contact.last_name || "",
+      full_name: `${contact.first_name || ""} ${contact.last_name || ""}`.trim(),
+    }];
+  }
   if (contact.phone) values.phone_numbers = [{ original_phone_number: contact.phone }];
 
   const result = (await attioFetch("/objects/people/records", {
