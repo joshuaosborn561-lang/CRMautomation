@@ -335,7 +335,7 @@ app.get("/api/debug/attio-check", async (_req, res) => {
         Authorization: `Bearer ${config.ATTIO_API_KEY}`,
         "Content-Type": "application/json",
       },
-      body: JSON.stringify({ sorts: [{ attribute: "created_at", field: "created_at", direction: "desc" }], limit: 10 }),
+      body: JSON.stringify({ limit: 10 }),
     });
     if (peopleResp.ok) {
       const people = await peopleResp.json() as { data: unknown[] };
@@ -390,6 +390,154 @@ app.get("/api/debug/attio-check", async (_req, res) => {
     };
 
     res.json(results);
+  } catch (err) {
+    res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+  }
+});
+
+// Debug: Show raw event payloads to diagnose data issues
+app.get("/api/debug/sample-events", async (_req, res) => {
+  try {
+    const { getSupabase } = await import("./utils/supabase");
+    const supabase = getSupabase();
+
+    // Get a sample of each source type
+    const sources = ["zoom_phone", "zoom_meeting", "smartlead", "heyreach"];
+    const samples: Record<string, unknown> = {};
+
+    for (const source of sources) {
+      const { data } = await supabase
+        .from("webhook_events")
+        .select("id, source, event_type, payload, received_at")
+        .eq("source", source)
+        .limit(2);
+      samples[source] = (data || []).map((e: any) => ({
+        id: e.id,
+        event_type: e.event_type,
+        received_at: e.received_at,
+        has_enriched_contact: !!e.payload?.enriched_contact,
+        has_transcript: !!e.payload?.transcript,
+        has_call_details: !!e.payload?.call_details,
+        enriched_contact: e.payload?.enriched_contact || null,
+        // For zoom_phone: extract phone numbers
+        caller_number: e.payload?.call_details?.caller_number || e.payload?.payload?.object?.caller_number,
+        callee_number: e.payload?.call_details?.callee_number || e.payload?.payload?.object?.callee_number,
+        direction: e.payload?.call_details?.direction || e.payload?.payload?.object?.direction,
+        // For zoom_meeting: extract participants
+        host_email: e.payload?.payload?.object?.host_email,
+        participants: e.payload?.payload?.object?.participant_count || e.payload?.payload?.object?.participants,
+        topic: e.payload?.payload?.object?.topic,
+        // Payload keys for debugging
+        payload_keys: Object.keys(e.payload || {}),
+        payload_nested_keys: e.payload?.payload ? Object.keys(e.payload.payload) : null,
+      }));
+    }
+
+    res.json(samples);
+  } catch (err) {
+    res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+  }
+});
+
+// Re-enrich zoom_phone events with LeadMagic (for events that missed enrichment at webhook time)
+app.post("/api/re-enrich", async (_req, res) => {
+  try {
+    const { getSupabase } = await import("./utils/supabase");
+    const { enrichContact } = await import("./services/leadmagic");
+    const supabase = getSupabase();
+
+    // Get all zoom_phone events that don't have enriched_contact
+    const { data: events } = await supabase
+      .from("webhook_events")
+      .select("id, payload")
+      .eq("source", "zoom_phone");
+
+    let enriched = 0;
+    let skipped = 0;
+    let failed = 0;
+    const results: Array<{ id: string; phone: string | null; email: string | null; status: string }> = [];
+
+    for (const event of events || []) {
+      // Skip if already enriched
+      if (event.payload?.enriched_contact?.email) {
+        skipped++;
+        continue;
+      }
+
+      // Extract phone number from payload
+      const callDetails = event.payload?.call_details as Record<string, unknown> | undefined;
+      const obj = (event.payload?.payload as Record<string, unknown>)?.object as Record<string, unknown> | undefined;
+      const direction = (callDetails?.direction || obj?.direction || "") as string;
+      const callerNumber = (callDetails?.caller_number || obj?.caller_number || "") as string;
+      const calleeNumber = (callDetails?.callee_number || obj?.callee_number || "") as string;
+      const callerName = (callDetails?.caller_name || obj?.caller_name || "") as string;
+      const calleeName = (callDetails?.callee_name || obj?.callee_name || "") as string;
+
+      // Determine external party
+      let phone: string | null = null;
+      let name = "";
+      if (direction === "outbound") {
+        phone = calleeNumber || null;
+        name = calleeName as string;
+      } else if (direction === "inbound") {
+        phone = callerNumber || null;
+        name = callerName as string;
+      } else {
+        phone = (calleeNumber?.length > 6 ? calleeNumber : callerNumber) || null;
+        name = calleeName || callerName;
+      }
+
+      if (!phone) {
+        results.push({ id: event.id, phone: null, email: null, status: "no_phone" });
+        failed++;
+        continue;
+      }
+
+      try {
+        const result = await enrichContact({
+          phone,
+          first_name: name ? name.split(" ")[0] : undefined,
+          last_name: name ? name.split(" ").slice(1).join(" ") : undefined,
+        });
+
+        if (result.enriched && result.email) {
+          // Update the event payload with enriched contact
+          const updatedPayload = {
+            ...event.payload,
+            enriched_contact: {
+              email: result.email,
+              first_name: result.first_name,
+              last_name: result.last_name,
+              company: result.company,
+              title: result.title,
+              linkedin_url: result.linkedin_url,
+              phone,
+            },
+          };
+          await supabase
+            .from("webhook_events")
+            .update({ payload: updatedPayload, processed: false, processed_at: null })
+            .eq("id", event.id);
+          enriched++;
+          results.push({ id: event.id, phone, email: result.email, status: "enriched" });
+        } else {
+          results.push({ id: event.id, phone, email: null, status: "no_match" });
+          failed++;
+        }
+      } catch (err) {
+        results.push({ id: event.id, phone, email: null, status: `error: ${String(err)}` });
+        failed++;
+      }
+    }
+
+    res.json({
+      message: `Re-enrichment complete. ${enriched} enriched, ${skipped} already had data, ${failed} no match.`,
+      enriched,
+      skipped,
+      failed,
+      total: events?.length || 0,
+      sample_results: results.slice(0, 20),
+    });
   } catch (err) {
     res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
   }
