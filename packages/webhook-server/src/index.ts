@@ -535,6 +535,141 @@ app.post("/api/re-enrich", async (_req, res) => {
   }
 });
 
+// Re-enrich ALL zoom events using Apollo (phone→contact for calls, name→contact for meetings)
+app.post("/api/re-enrich-apollo", async (_req, res) => {
+  try {
+    const { getSupabase } = await import("./utils/supabase");
+    const { searchContactByPhone, searchContactByName } = await import("./services/apollo");
+    const supabase = getSupabase();
+
+    const results: Record<string, unknown> = {};
+    let phonesEnriched = 0;
+    let meetingsEnriched = 0;
+    let noMatch = 0;
+    const sampleResults: Array<Record<string, unknown>> = [];
+
+    // 1. Enrich zoom_phone events by phone number
+    const { data: phoneEvents } = await supabase
+      .from("webhook_events")
+      .select("id, payload")
+      .eq("source", "zoom_phone");
+
+    for (const event of phoneEvents || []) {
+      if (event.payload?.enriched_contact?.email) continue; // already enriched
+
+      const obj = (event.payload?.payload as Record<string, unknown>)?.object as Record<string, unknown> | undefined;
+      const caller = obj?.caller as Record<string, unknown> | undefined;
+      const callee = obj?.callee as Record<string, unknown> | undefined;
+      const externalParty = callee?.extension_type === "pstn" ? callee : (caller?.extension_type === "pstn" ? caller : null);
+      const phone = (externalParty?.phone_number || "") as string;
+
+      if (!phone) { noMatch++; continue; }
+
+      const contact = await searchContactByPhone(phone);
+      if (contact?.email) {
+        await supabase
+          .from("webhook_events")
+          .update({
+            payload: {
+              ...event.payload,
+              enriched_contact: {
+                email: contact.email,
+                first_name: contact.first_name,
+                last_name: contact.last_name,
+                company: contact.company,
+                title: contact.title,
+                linkedin_url: contact.linkedin_url,
+                phone,
+              },
+            },
+            processed: false,
+            processed_at: null,
+          })
+          .eq("id", event.id);
+        phonesEnriched++;
+        if (sampleResults.length < 10) {
+          sampleResults.push({ id: event.id, type: "phone", phone, email: contact.email, name: contact.name });
+        }
+      } else {
+        noMatch++;
+        if (sampleResults.length < 10) {
+          sampleResults.push({ id: event.id, type: "phone", phone, email: null, status: "no_match" });
+        }
+      }
+    }
+
+    // 2. Enrich zoom_meeting events by prospect name from topic
+    const { data: meetingEvents } = await supabase
+      .from("webhook_events")
+      .select("id, payload")
+      .eq("source", "zoom_meeting")
+      .neq("event_type", "unknown");
+
+    for (const event of meetingEvents || []) {
+      if (event.payload?.enriched_contact?.email) continue;
+
+      const obj = (event.payload?.payload as Record<string, unknown>)?.object as Record<string, unknown> | undefined;
+      const topic = (obj?.topic || "") as string;
+
+      // Extract prospect name from topic like "SalesGlider Followup - Ramon Guitard and Joshua Osborn"
+      const nameMatch = topic.match(/- (.+?) and Joshua/i) || topic.match(/- (.+?) and Josh/i);
+      if (!nameMatch) {
+        // Try other patterns
+        const altMatch = topic.match(/^(.+?)(?:\s*\/\s*|\s+and\s+)/i);
+        if (!altMatch) { noMatch++; continue; }
+      }
+
+      const prospectName = nameMatch ? nameMatch[1].trim() : "";
+      if (!prospectName) { noMatch++; continue; }
+
+      const [firstName, ...lastParts] = prospectName.split(" ");
+      const lastName = lastParts.join(" ");
+
+      const contact = await searchContactByName(firstName, lastName);
+      if (contact?.email) {
+        await supabase
+          .from("webhook_events")
+          .update({
+            payload: {
+              ...event.payload,
+              enriched_contact: {
+                email: contact.email,
+                first_name: contact.first_name || firstName,
+                last_name: contact.last_name || lastName,
+                company: contact.company,
+                title: contact.title,
+                linkedin_url: contact.linkedin_url,
+              },
+            },
+            processed: false,
+            processed_at: null,
+          })
+          .eq("id", event.id);
+        meetingsEnriched++;
+        if (sampleResults.length < 20) {
+          sampleResults.push({ id: event.id, type: "meeting", name: prospectName, email: contact.email, company: contact.company });
+        }
+      } else {
+        noMatch++;
+        if (sampleResults.length < 20) {
+          sampleResults.push({ id: event.id, type: "meeting", name: prospectName, email: null, status: "no_match" });
+        }
+      }
+    }
+
+    results.phones_enriched = phonesEnriched;
+    results.meetings_enriched = meetingsEnriched;
+    results.no_match = noMatch;
+    results.phone_events_total = phoneEvents?.length || 0;
+    results.meeting_events_total = meetingEvents?.length || 0;
+    results.sample_results = sampleResults;
+
+    res.json(results);
+  } catch (err) {
+    res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+  }
+});
+
 // Re-enrich zoom_meeting events: fetch transcripts and AI summaries from Zoom API
 app.post("/api/re-enrich-meetings", async (_req, res) => {
   try {

@@ -42,6 +42,9 @@ const envSchema = z.object({
   // LeadMagic (lead enrichment)
   LEADMAGIC_API_KEY: z.string().min(1),
 
+  // Apollo (contact search/enrichment)
+  APOLLO_API_KEY: z.string().optional(),
+
   // Notifications
   NOTIFICATION_EMAIL: z.string().optional(),
   SERVER_URL: z.string().optional(),
