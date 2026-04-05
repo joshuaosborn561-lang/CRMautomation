@@ -298,7 +298,16 @@ app.get("/api/debug/test-one", async (_req, res) => {
       try {
         const { applyToAttio } = await import("./processors/event-pipeline");
         await applyToAttio(aiResult, event.source);
-        result.attio_result = "SUCCESS — check Attio!";
+        // Check if it was actually applied or silently skipped
+        const email = aiResult.contact?.email;
+        const phone = aiResult.contact?.phone;
+        const hasValidEmail = email && email !== "unknown" && !email.includes("unknown") && email.includes("@");
+        if (!hasValidEmail && !(phone && event.source === "zoom_phone")) {
+          result.attio_result = "SKIPPED — no valid email, nothing created in Attio";
+          result.skip_reason = { email, phone, source: event.source };
+        } else {
+          result.attio_result = "SUCCESS — created in Attio!";
+        }
       } catch (attioErr) {
         result.attio_error = attioErr instanceof Error ? attioErr.message : String(attioErr);
         result.attio_stack = attioErr instanceof Error ? attioErr.stack : undefined;
@@ -308,6 +317,79 @@ app.get("/api/debug/test-one", async (_req, res) => {
     }
 
     res.json(result);
+  } catch (err) {
+    res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+  }
+});
+
+// Debug: Check what's actually in Attio
+app.get("/api/debug/attio-check", async (_req, res) => {
+  try {
+    const config = getConfig();
+    const results: Record<string, unknown> = {};
+
+    // Check contacts (people)
+    const peopleResp = await fetch("https://api.attio.com/v2/objects/people/records/query", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${config.ATTIO_API_KEY}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ sorts: [{ attribute: "created_at", field: "created_at", direction: "desc" }], limit: 10 }),
+    });
+    if (peopleResp.ok) {
+      const people = await peopleResp.json() as { data: unknown[] };
+      results.people_count = people.data?.length || 0;
+      results.recent_people = people.data?.slice(0, 5);
+    } else {
+      results.people_error = `${peopleResp.status}: ${await peopleResp.text()}`;
+    }
+
+    // Check deals (pipeline entries)
+    if (config.ATTIO_PIPELINE_ID) {
+      const dealsResp = await fetch(`https://api.attio.com/v2/lists/${config.ATTIO_PIPELINE_ID}/entries/query`, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${config.ATTIO_API_KEY}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ limit: 10 }),
+      });
+      if (dealsResp.ok) {
+        const deals = await dealsResp.json() as { data: unknown[] };
+        results.deals_count = deals.data?.length || 0;
+        results.recent_deals = deals.data?.slice(0, 5);
+      } else {
+        results.deals_error = `${dealsResp.status}: ${await dealsResp.text()}`;
+      }
+    }
+
+    // Check interaction log for non-unknown emails
+    const { getSupabase } = await import("./utils/supabase");
+    const supabase = getSupabase();
+    const { data: validInteractions } = await supabase
+      .from("interaction_log")
+      .select("contact_email, source, sentiment")
+      .neq("contact_email", "unknown")
+      .order("occurred_at", { ascending: false })
+      .limit(20);
+    results.valid_interactions = validInteractions;
+
+    // Count how many have "unknown" email
+    const { count: unknownCount } = await supabase
+      .from("interaction_log")
+      .select("*", { count: "exact", head: true })
+      .eq("contact_email", "unknown");
+    const { count: totalCount } = await supabase
+      .from("interaction_log")
+      .select("*", { count: "exact", head: true });
+    results.interaction_stats = {
+      total: totalCount,
+      unknown_email: unknownCount,
+      valid_email: (totalCount || 0) - (unknownCount || 0),
+    };
+
+    res.json(results);
   } catch (err) {
     res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
   }
