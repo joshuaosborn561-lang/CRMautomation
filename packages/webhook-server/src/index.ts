@@ -360,34 +360,70 @@ app.get("/api/debug/test-attio-write", async (_req, res) => {
       }
 
       // Try deal creation with the correct parent_object from pipeline config
-      const rawParent = pipelineParentObject;
-      const parentObj = Array.isArray(rawParent) ? rawParent[0] : (rawParent || "people");
+      // Step 4a: Create a deal record in the Deals object first
+      let testDealRecordId: string | null = null;
       try {
-        const resp = await fetch(`https://api.attio.com/v2/lists/${config.ATTIO_PIPELINE_ID}/entries`, {
+        const dealResp = await fetch("https://api.attio.com/v2/objects/deals/records", {
           method: "POST", headers,
-          body: JSON.stringify({
-            data: {
-              parent_object: parentObj,
-              parent_record_id: testContactId,
-              entry_values: {},
-            },
-          }),
+          body: JSON.stringify({ data: { values: { name: "Test Deal" } } }),
         });
-        const body = await resp.text();
-        steps.push({ step: "create_deal", status: resp.ok ? "OK" : "FAIL", details: { http: resp.status, parent_object_used: parentObj, body: body.substring(0, 500) } });
-
-        // Clean up the deal if created
-        if (resp.ok) {
-          const dealData = JSON.parse(body);
-          const entryId = dealData?.data?.entry_id;
-          if (entryId) {
-            await fetch(`https://api.attio.com/v2/lists/${config.ATTIO_PIPELINE_ID}/entries/${entryId}`, {
-              method: "DELETE", headers: { Authorization: `Bearer ${config.ATTIO_API_KEY}` },
-            });
+        const dealBody = await dealResp.text();
+        if (dealResp.ok) {
+          const dealData = JSON.parse(dealBody);
+          testDealRecordId = dealData?.data?.id?.record_id;
+          steps.push({ step: "create_deal_record", status: "OK", details: { dealRecordId: testDealRecordId } });
+        } else {
+          // Try without name
+          const dealResp2 = await fetch("https://api.attio.com/v2/objects/deals/records", {
+            method: "POST", headers,
+            body: JSON.stringify({ data: { values: {} } }),
+          });
+          const dealBody2 = await dealResp2.text();
+          if (dealResp2.ok) {
+            const dealData2 = JSON.parse(dealBody2);
+            testDealRecordId = dealData2?.data?.id?.record_id;
+            steps.push({ step: "create_deal_record", status: "OK (minimal)", details: { dealRecordId: testDealRecordId, note: "name field failed" } });
+          } else {
+            steps.push({ step: "create_deal_record", status: "FAIL", details: { http: dealResp.status, body1: dealBody.substring(0, 300), body2: dealBody2.substring(0, 300) } });
           }
         }
       } catch (err) {
-        steps.push({ step: "create_deal", status: "ERROR", details: String(err) });
+        steps.push({ step: "create_deal_record", status: "ERROR", details: String(err) });
+      }
+
+      // Step 4b: Create pipeline entry for the deal record
+      if (testDealRecordId) {
+        try {
+          const resp = await fetch(`https://api.attio.com/v2/lists/${config.ATTIO_PIPELINE_ID}/entries`, {
+            method: "POST", headers,
+            body: JSON.stringify({
+              data: {
+                parent_object: "deals",
+                parent_record_id: testDealRecordId,
+                entry_values: {},
+              },
+            }),
+          });
+          const body = await resp.text();
+          steps.push({ step: "create_pipeline_entry", status: resp.ok ? "OK" : "FAIL", details: { http: resp.status, body: body.substring(0, 500) } });
+
+          // Clean up pipeline entry + deal record
+          if (resp.ok) {
+            const entryData = JSON.parse(body);
+            const entryId = entryData?.data?.entry_id;
+            if (entryId) {
+              await fetch(`https://api.attio.com/v2/lists/${config.ATTIO_PIPELINE_ID}/entries/${entryId}`, {
+                method: "DELETE", headers: { Authorization: `Bearer ${config.ATTIO_API_KEY}` },
+              });
+            }
+          }
+          // Clean up deal record
+          await fetch(`https://api.attio.com/v2/objects/deals/records/${testDealRecordId}`, {
+            method: "DELETE", headers,
+          });
+        } catch (err) {
+          steps.push({ step: "create_pipeline_entry", status: "ERROR", details: String(err) });
+        }
       }
     } else {
       steps.push({ step: "create_deal", status: "SKIP", details: "ATTIO_PIPELINE_ID not configured" });

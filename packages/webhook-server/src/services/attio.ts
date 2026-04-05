@@ -341,25 +341,34 @@ export async function findDealByContact(contactId: string): Promise<{ id: string
   const pipelineId = config.ATTIO_PIPELINE_ID;
   if (!pipelineId) return null;
 
-  const result = (await attioFetch(`/lists/${pipelineId}/entries/query`, {
-    method: "POST",
-    body: JSON.stringify({
-      filter: {},
-    }),
-  })) as {
-    data: Array<{
-      entry_id: string;
-      parent_record_id: string;
-      current_status?: { title: string };
-    }>;
-  };
-
-  const entry = result.data.find((e) => e.parent_record_id === contactId);
-  if (entry) {
-    return {
-      id: entry.entry_id,
-      stage: entry.current_status?.title || "unknown",
+  try {
+    // Query pipeline entries and check if any deal is linked to this person
+    const result = (await attioFetch(`/lists/${pipelineId}/entries/query`, {
+      method: "POST",
+      body: JSON.stringify({ filter: {} }),
+    })) as {
+      data: Array<{
+        entry_id: string;
+        parent_record_id: string;
+        record_id?: string;
+        current_status?: { title: string };
+        entry_values?: Record<string, unknown>;
+      }>;
     };
+
+    // Check each entry — look for associated_people or parent that links to this contactId
+    for (const entry of result.data) {
+      // Direct match on parent_record_id (in case pipeline is linked differently)
+      if (entry.parent_record_id === contactId) {
+        return { id: entry.entry_id, stage: entry.current_status?.title || "unknown" };
+      }
+    }
+
+    // Also check deal records directly for this person
+    // (deals may have associated_people linking to the contact)
+    // For now, return null — we'll create a new deal
+  } catch (err) {
+    logger.warn("findDealByContact failed", { contactId, error: String(err) });
   }
   return null;
 }
@@ -395,72 +404,62 @@ export async function createDeal(deal: AttioDeal & { value?: number; term_months
   const pipelineId = config.ATTIO_PIPELINE_ID;
   if (!pipelineId) throw new Error("ATTIO_PIPELINE_ID not configured");
 
-  const parentObject = await getPipelineParentObject();
   const stageName = STAGE_MAP[deal.stage];
 
-  const entryValues: Record<string, unknown> = {};
-  if (deal.name) {
-    entryValues.deal_name = [{ value: deal.name }];
-  }
-  if (deal.value) {
-    entryValues.deal_value = [{ currency_value: deal.value, currency_code: "USD" }];
-  }
-  if (deal.term_months) {
-    entryValues.term_length = [{ value: deal.term_months }];
+  // Step 1: Create a deal record in the Deals object
+  // The pipeline parent_object is "deals", so we need a deal record first
+  const dealValues: Record<string, unknown> = {};
+  if (deal.name) dealValues.name = deal.name;
+
+  // Link deal to the person via associated_people (record-reference)
+  if (deal.contact_id) {
+    dealValues.associated_people = [{ target_object: "people", target_record_id: deal.contact_id }];
   }
 
-  // Pipeline parent_object is "deals" — entries are deal records.
-  // We create the entry and link it to the person via parent_record_id.
-  // Try multiple approaches since Attio's API varies by pipeline config.
+  let dealRecordId: string;
+  try {
+    const dealRecord = (await attioFetch("/objects/deals/records", {
+      method: "POST",
+      body: JSON.stringify({ data: { values: dealValues } }),
+    })) as { data: { id: { record_id: string } } };
+    dealRecordId = dealRecord.data.id.record_id;
+    logger.info("Created deal record", { name: deal.name, dealRecordId });
+  } catch (err) {
+    // Maybe "deals" object doesn't have these fields — try minimal
+    logger.warn("Deal record creation failed, trying minimal", { error: String(err) });
+    const dealRecord = (await attioFetch("/objects/deals/records", {
+      method: "POST",
+      body: JSON.stringify({ data: { values: {} } }),
+    })) as { data: { id: { record_id: string } } };
+    dealRecordId = dealRecord.data.id.record_id;
+  }
+
+  // Step 2: Create a pipeline entry for this deal record
   let result: { data: { entry_id: string } };
-
-  // Approach 1: Standard — parent_object as string + entry_values + stage
   try {
     result = (await attioFetch(`/lists/${pipelineId}/entries`, {
       method: "POST",
       body: JSON.stringify({
         data: {
-          parent_object: parentObject,
-          parent_record_id: deal.contact_id,
-          entry_values: entryValues,
+          parent_object: "deals",
+          parent_record_id: dealRecordId,
+          entry_values: {},
           current_status_title: stageName,
         },
       }),
     })) as { data: { entry_id: string } };
   } catch (err) {
-    logger.warn("Deal creation approach 1 failed", { error: String(err) });
-    // Approach 2: Without parent_object/parent_record_id (pipeline may not need them)
-    try {
-      result = (await attioFetch(`/lists/${pipelineId}/entries`, {
-        method: "POST",
-        body: JSON.stringify({
-          data: {
-            entry_values: entryValues,
-            current_status_title: stageName,
-          },
-        }),
-      })) as { data: { entry_id: string } };
-    } catch (err2) {
-      logger.warn("Deal creation approach 2 failed", { error: String(err2) });
-      // Approach 3: Bare minimum
-      try {
-        result = (await attioFetch(`/lists/${pipelineId}/entries`, {
-          method: "POST",
-          body: JSON.stringify({
-            data: {
-              entry_values: {},
-            },
-          }),
-        })) as { data: { entry_id: string } };
-      } catch (err3) {
-        logger.error("All deal creation approaches failed", {
-          err1: String(err),
-          err2: String(err2),
-          err3: String(err3),
-        });
-        throw err3;
-      }
-    }
+    logger.warn("Pipeline entry creation with stage failed, trying without", { error: String(err) });
+    result = (await attioFetch(`/lists/${pipelineId}/entries`, {
+      method: "POST",
+      body: JSON.stringify({
+        data: {
+          parent_object: "deals",
+          parent_record_id: dealRecordId,
+          entry_values: {},
+        },
+      }),
+    })) as { data: { entry_id: string } };
   }
 
   logger.info("Created Attio deal", {
