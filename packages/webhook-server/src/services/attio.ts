@@ -214,13 +214,13 @@ export async function createContact(contact: AttioContact & { title?: string; le
   }
   if (contact.phone) coreValues.phone_numbers = [{ original_phone_number: contact.phone }];
 
-  // Try with custom fields first, fall back to core-only if custom fields don't exist yet
+  // Custom fields use Attio's value format: [{ value: "..." }]
   const customValues: Record<string, unknown> = {};
-  if (contact.company) customValues.company = contact.company;
-  if (contact.linkedin_url) customValues.linkedin_url = contact.linkedin_url;
-  if (contact.title) customValues.job_title = contact.title;
-  if (contact.lead_source) customValues.lead_source = contact.lead_source;
-  if (contact.industry) customValues.industry = contact.industry;
+  if (contact.company) customValues.company = [{ value: contact.company }];
+  if (contact.linkedin_url) customValues.linkedin_url = [{ value: contact.linkedin_url }];
+  if (contact.title) customValues.job_title = [{ value: contact.title }];
+  if (contact.lead_source) customValues.lead_source = [{ value: contact.lead_source }];
+  if (contact.industry) customValues.industry = [{ value: contact.industry }];
 
   let result: { data: { id: { record_id: string } } };
   try {

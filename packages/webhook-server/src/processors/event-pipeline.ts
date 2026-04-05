@@ -288,40 +288,56 @@ export async function applyToAttio(
     lead_source: source,
   });
 
-  // 2. Find or create the deal
-  const existingDeal = await findDealByContact(contactId);
-
-  let dealId: string;
-  if (existingDeal) {
-    dealId = existingDeal.id;
-    await updateDealStage(dealId, result.deal.stage);
-  } else {
-    dealId = await createDeal({
-      name: result.deal.title,
-      stage: result.deal.stage,
-      contact_id: contactId,
-      company: contact.company,
-      value: result.deal.value,
-      term_months: result.deal.term_months,
+  // 2. Find or create the deal (non-fatal — contact is more important)
+  let dealId: string | null = null;
+  try {
+    const existingDeal = await findDealByContact(contactId);
+    if (existingDeal) {
+      dealId = existingDeal.id;
+      await updateDealStage(dealId, result.deal.stage);
+    } else {
+      dealId = await createDeal({
+        name: result.deal.title,
+        stage: result.deal.stage,
+        contact_id: contactId,
+        company: contact.company,
+        value: result.deal.value,
+        term_months: result.deal.term_months,
+      });
+    }
+  } catch (err) {
+    logger.error("Deal creation failed — contact was created, deal was not", {
+      contactId,
+      error: err instanceof Error ? err.message : String(err),
     });
   }
 
-  // 3. Log a note on the deal
-  await createNote({
-    parent_object: "deals",
-    parent_id: dealId,
-    title: `[${result.note.sentiment.toUpperCase()}] ${result.deal.stage_reason}`,
-    content: buildNoteContent(result, rawPayload),
-  });
+  // 3. Log a note on the deal (non-fatal)
+  if (dealId) {
+    try {
+      await createNote({
+        parent_object: "deals",
+        parent_id: dealId,
+        title: `[${result.note.sentiment.toUpperCase()}] ${result.deal.stage_reason}`,
+        content: buildNoteContent(result, rawPayload),
+      });
+    } catch (err) {
+      logger.warn("Note creation failed", { dealId, error: String(err) });
+    }
+  }
 
-  // 4. Create a follow-up task if warranted
-  if (result.task) {
-    await createTask({
-      title: result.task.title,
-      description: result.task.description,
-      linked_deal_id: dealId,
-      due_date: result.task.due_date,
-    });
+  // 4. Create a follow-up task if warranted (non-fatal)
+  if (result.task && dealId) {
+    try {
+      await createTask({
+        title: result.task.title,
+        description: result.task.description,
+        linked_deal_id: dealId,
+        due_date: result.task.due_date,
+      });
+    } catch (err) {
+      logger.warn("Task creation failed", { dealId, error: String(err) });
+    }
   }
 
   logger.info("Applied event to Attio", {

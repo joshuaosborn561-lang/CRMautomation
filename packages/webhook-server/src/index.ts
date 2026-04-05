@@ -258,6 +258,140 @@ app.all("/api/fix", async (_req, res) => {
   }
 });
 
+// Diagnostic: try to create a test contact in Attio to verify API works
+app.get("/api/debug/test-attio-write", async (_req, res) => {
+  const steps: Array<{ step: string; status: string; details?: unknown }> = [];
+  const config = getConfig();
+  const headers = {
+    Authorization: `Bearer ${config.ATTIO_API_KEY}`,
+    "Content-Type": "application/json",
+  };
+
+  // Step 1: Test read access
+  try {
+    const resp = await fetch("https://api.attio.com/v2/objects/people/records/query", {
+      method: "POST", headers, body: JSON.stringify({ limit: 1 }),
+    });
+    const body = await resp.text();
+    steps.push({ step: "read_people", status: resp.ok ? "OK" : "FAIL", details: { http: resp.status, body: body.substring(0, 300) } });
+  } catch (err) {
+    steps.push({ step: "read_people", status: "ERROR", details: String(err) });
+  }
+
+  // Step 2: Test write access — create a test contact with ONLY core fields
+  let testContactId: string | null = null;
+  try {
+    const resp = await fetch("https://api.attio.com/v2/objects/people/records", {
+      method: "POST", headers,
+      body: JSON.stringify({
+        data: {
+          values: {
+            email_addresses: [{ email_address: "test-debug@crm-autopilot-test.com" }],
+            name: [{ first_name: "CRM", last_name: "Test", full_name: "CRM Test" }],
+          },
+        },
+      }),
+    });
+    const body = await resp.text();
+    if (resp.ok) {
+      const parsed = JSON.parse(body);
+      testContactId = parsed?.data?.id?.record_id;
+      steps.push({ step: "create_contact_core", status: "OK", details: { id: testContactId, http: resp.status } });
+    } else {
+      steps.push({ step: "create_contact_core", status: "FAIL", details: { http: resp.status, body: body.substring(0, 500) } });
+    }
+  } catch (err) {
+    steps.push({ step: "create_contact_core", status: "ERROR", details: String(err) });
+  }
+
+  // Step 3: Test custom field write
+  if (testContactId) {
+    try {
+      const resp = await fetch(`https://api.attio.com/v2/objects/people/records/${testContactId}`, {
+        method: "PATCH", headers,
+        body: JSON.stringify({
+          data: {
+            values: {
+              company: [{ value: "Test Company" }],
+            },
+          },
+        }),
+      });
+      const body = await resp.text();
+      steps.push({ step: "update_custom_field_wrapped", status: resp.ok ? "OK" : "FAIL", details: { http: resp.status, body: body.substring(0, 300) } });
+    } catch (err) {
+      steps.push({ step: "update_custom_field_wrapped", status: "ERROR", details: String(err) });
+    }
+
+    // Try with bare string too
+    try {
+      const resp = await fetch(`https://api.attio.com/v2/objects/people/records/${testContactId}`, {
+        method: "PATCH", headers,
+        body: JSON.stringify({
+          data: {
+            values: {
+              lead_source: "test_source",
+            },
+          },
+        }),
+      });
+      const body = await resp.text();
+      steps.push({ step: "update_custom_field_bare", status: resp.ok ? "OK" : "FAIL", details: { http: resp.status, body: body.substring(0, 300) } });
+    } catch (err) {
+      steps.push({ step: "update_custom_field_bare", status: "ERROR", details: String(err) });
+    }
+
+    // Step 4: Test deal creation
+    if (config.ATTIO_PIPELINE_ID) {
+      try {
+        const resp = await fetch(`https://api.attio.com/v2/lists/${config.ATTIO_PIPELINE_ID}/entries`, {
+          method: "POST", headers,
+          body: JSON.stringify({
+            data: {
+              parent_object: "people",
+              parent_record_id: testContactId,
+            },
+          }),
+        });
+        const body = await resp.text();
+        steps.push({ step: "create_deal", status: resp.ok ? "OK" : "FAIL", details: { http: resp.status, body: body.substring(0, 500) } });
+      } catch (err) {
+        steps.push({ step: "create_deal", status: "ERROR", details: String(err) });
+      }
+    } else {
+      steps.push({ step: "create_deal", status: "SKIP", details: "ATTIO_PIPELINE_ID not configured" });
+    }
+
+    // Step 5: Clean up test contact
+    try {
+      await fetch(`https://api.attio.com/v2/objects/people/records/${testContactId}`, {
+        method: "DELETE", headers,
+      });
+      steps.push({ step: "cleanup", status: "OK" });
+    } catch {
+      steps.push({ step: "cleanup", status: "FAIL" });
+    }
+  }
+
+  // Step 6: List People object attributes to see what fields exist
+  try {
+    const resp = await fetch("https://api.attio.com/v2/objects/people/attributes", {
+      method: "GET", headers: { Authorization: `Bearer ${config.ATTIO_API_KEY}` },
+    });
+    if (resp.ok) {
+      const data = await resp.json() as { data: Array<{ api_slug: string; title: string; type: string }> };
+      const slugs = data.data?.map(a => `${a.api_slug} (${a.type})`).join(", ");
+      steps.push({ step: "list_people_attributes", status: "OK", details: slugs });
+    } else {
+      steps.push({ step: "list_people_attributes", status: "FAIL", details: { http: resp.status } });
+    }
+  } catch (err) {
+    steps.push({ step: "list_people_attributes", status: "ERROR", details: String(err) });
+  }
+
+  res.json({ steps });
+});
+
 // Test processing a single event end-to-end (dry run with full error details)
 app.get("/api/debug/test-one", async (_req, res) => {
   try {
