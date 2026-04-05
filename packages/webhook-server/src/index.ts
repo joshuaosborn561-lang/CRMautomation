@@ -378,9 +378,13 @@ app.get("/api/debug/test-attio-write", async (_req, res) => {
         steps.push({ step: "get_workspace_member", status: "ERROR", details: String(err) });
       }
 
-      // Step 4b: Get deal stage options
+      // Step 4b: Ensure deal stage statuses exist, then get them
       let testStageTitle: string | null = null;
       try {
+        // First ensure fields/stages are set up
+        const { ensureAttioFieldsExist } = await import("./services/attio");
+        await ensureAttioFieldsExist();
+
         const stageResp = await fetch("https://api.attio.com/v2/objects/deals/attributes/stage", {
           headers: { Authorization: `Bearer ${config.ATTIO_API_KEY}` },
         });
@@ -388,7 +392,7 @@ app.get("/api/debug/test-attio-write", async (_req, res) => {
           const stageData = await stageResp.json() as { data: { config?: { statuses?: Array<{ title: string; id: string }> } } };
           const statuses = stageData.data?.config?.statuses || [];
           testStageTitle = statuses[0]?.title || null;
-          steps.push({ step: "get_deal_stages", status: "OK", details: { stages: statuses.map((s: any) => s.title), using: testStageTitle } });
+          steps.push({ step: "get_deal_stages", status: statuses.length > 0 ? "OK" : "WARN (no stages)", details: { stages: statuses.map((s: any) => s.title), using: testStageTitle } });
         } else {
           const body = await stageResp.text();
           steps.push({ step: "get_deal_stages", status: "FAIL", details: { http: stageResp.status, body: body.substring(0, 300) } });

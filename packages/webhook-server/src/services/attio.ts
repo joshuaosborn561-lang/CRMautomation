@@ -176,6 +176,75 @@ export async function ensureAttioFieldsExist(): Promise<void> {
     }
   }
 
+  // 4. Ensure deal stage statuses exist on the Deals object's "stage" attribute
+  try {
+    const stageResp = await fetch(`${ATTIO_BASE_URL}/objects/deals/attributes/stage`, {
+      headers: { Authorization: `Bearer ${config.ATTIO_API_KEY}` },
+    });
+    if (stageResp.ok) {
+      const stageData = await stageResp.json() as { data: { id: unknown; config?: { statuses?: Array<{ title: string }> } } };
+      const existingStatuses = stageData.data?.config?.statuses || [];
+      logger.info("Deal stage attribute", { existingStatuses: existingStatuses.map(s => s.title) });
+
+      if (existingStatuses.length === 0) {
+        // No statuses configured — create them via PATCH
+        const dealStageStatuses = [
+          { title: "Open", target_archive_state: "active" as const },
+          { title: "Replied / Showed Interest", target_archive_state: "active" as const },
+          { title: "Call or Meeting Booked", target_archive_state: "active" as const },
+          { title: "Discovery Completed", target_archive_state: "active" as const },
+          { title: "Proposal Sent", target_archive_state: "active" as const },
+          { title: "Negotiating", target_archive_state: "active" as const },
+          { title: "Closed Won", target_archive_state: "archived-won" as const },
+          { title: "Closed Lost", target_archive_state: "archived-lost" as const },
+          { title: "Nurture", target_archive_state: "active" as const },
+        ];
+
+        const patchResp = await fetch(`${ATTIO_BASE_URL}/objects/deals/attributes/stage`, {
+          method: "PATCH",
+          headers,
+          body: JSON.stringify({
+            data: {
+              config: {
+                statuses: dealStageStatuses,
+              },
+            },
+          }),
+        });
+        if (patchResp.ok) {
+          logger.info("Created deal stage statuses", { count: dealStageStatuses.length });
+          // Clear cached stage options so they're re-fetched
+          _dealStageOptions = null;
+        } else {
+          const patchBody = await patchResp.text();
+          logger.warn("Failed to create deal stage statuses via PATCH", { status: patchResp.status, body: patchBody });
+
+          // Fallback: Try updating with simpler format (just titles)
+          const simplePatchResp = await fetch(`${ATTIO_BASE_URL}/objects/deals/attributes/stage`, {
+            method: "PATCH",
+            headers,
+            body: JSON.stringify({
+              data: {
+                config: {
+                  statuses: dealStageStatuses.map(s => ({ title: s.title })),
+                },
+              },
+            }),
+          });
+          if (simplePatchResp.ok) {
+            logger.info("Created deal stage statuses (simple format)");
+            _dealStageOptions = null;
+          } else {
+            const simpleBody = await simplePatchResp.text();
+            logger.warn("Failed to create deal stage statuses (simple format)", { status: simplePatchResp.status, body: simpleBody });
+          }
+        }
+      }
+    }
+  } catch (err) {
+    logger.warn("Could not check/create deal stage statuses", { error: String(err) });
+  }
+
   _fieldsEnsured = true;
   logger.info("Attio field setup complete");
 }
