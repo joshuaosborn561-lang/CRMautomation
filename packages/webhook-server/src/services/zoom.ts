@@ -203,6 +203,32 @@ export async function getPhoneCallDetails(callId: string): Promise<{
   }
 }
 
+// --- Meeting Summary (Zoom AI Companion) ---
+
+export async function getMeetingSummary(meetingId: string): Promise<{
+  summary_url?: string;
+  summary?: string;
+} | null> {
+  const encodedId = meetingId.includes("/") || meetingId.includes("=")
+    ? encodeURIComponent(encodeURIComponent(meetingId))
+    : meetingId;
+
+  try {
+    const data = (await zoomFetch(`/meetings/${encodedId}/meeting_summary`)) as Record<string, unknown>;
+    return {
+      summary_url: data.share_url as string | undefined,
+      summary: data.summary_overview as string | undefined,
+    };
+  } catch (err) {
+    // 404 = no AI summary available
+    if (err instanceof Error && err.message.includes("404")) {
+      return null;
+    }
+    logger.warn("Could not fetch meeting summary", { meetingId, error: String(err) });
+    return null;
+  }
+}
+
 // --- Webhook Verification ---
 
 import crypto from "crypto";

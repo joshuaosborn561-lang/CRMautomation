@@ -203,17 +203,24 @@ function buildHeyReachContext(payload: Record<string, unknown>): string {
 function buildZoomPhoneContext(payload: Record<string, unknown>): string {
   const p = payload.payload as Record<string, unknown> | undefined;
   const obj = p?.object as Record<string, unknown> | undefined;
+  const caller = obj?.caller as Record<string, unknown> | undefined;
+  const callee = obj?.callee as Record<string, unknown> | undefined;
   const callDetails = payload.call_details as Record<string, unknown> | undefined;
   const transcript = payload.transcript as string | undefined;
   const enrichedContact = (payload.enriched_contact || payload.apollo_contact) as Record<string, unknown> | undefined;
 
+  // Determine internal vs external party using extension_type
+  const isCallerExternal = caller?.extension_type === "pstn";
+  const externalParty = isCallerExternal ? caller : callee;
+  const internalParty = isCallerExternal ? callee : caller;
+
   let context = `Zoom Phone Call Event:
-- Caller: ${callDetails?.caller_number || obj?.caller_number || "unknown"} (${callDetails?.caller_name || obj?.caller_name || "unknown"})
-- Callee: ${callDetails?.callee_number || obj?.callee_number || "unknown"} (${callDetails?.callee_name || obj?.callee_name || "unknown"})
-- Direction: ${callDetails?.direction || obj?.direction || "unknown"}
-- Duration: ${callDetails?.duration || obj?.duration || "unknown"} seconds
-- Date/Time: ${callDetails?.date_time || obj?.date_time || "unknown"}
-- Call Result: ${callDetails?.result || "unknown"}`;
+- Internal (team member): ${internalParty?.phone_number || "unknown"} (${internalParty?.name || "unknown"})
+- External (prospect): ${externalParty?.phone_number || "unknown"} (${externalParty?.name || "unknown"})
+- Direction: ${isCallerExternal ? "inbound" : "outbound"}
+- Call ID: ${obj?.call_id || "unknown"}
+- Call Result: ${obj?.handup_result || callDetails?.result || "unknown"}
+- Call End Time: ${obj?.call_end_time || callDetails?.date_time || "unknown"}`;
 
   if (enrichedContact) {
     context += `
@@ -257,6 +264,10 @@ function buildZoomMeetingContext(payload: Record<string, unknown>): string {
   const obj = p?.object as Record<string, unknown> | undefined;
   const transcript = payload.transcript as string | undefined;
 
+  // Extract recording/share URLs for notes
+  const shareUrl = obj?.share_url as string | undefined;
+  const recordingFiles = obj?.recording_files as Array<Record<string, unknown>> | undefined;
+
   let context = `Zoom Meeting Event:
 - Meeting Topic: ${obj?.topic || "unknown"}
 - Meeting ID: ${obj?.id || "unknown"}
@@ -264,6 +275,13 @@ function buildZoomMeetingContext(payload: Record<string, unknown>): string {
 - Duration: ${obj?.duration || "unknown"} minutes
 - Participants: ${JSON.stringify((obj as Record<string, unknown>)?.participants || [])}
 - Start Time: ${obj?.start_time || "unknown"}`;
+
+  if (shareUrl) {
+    context += `\n- Recording Share URL: ${shareUrl}`;
+  }
+  if (recordingFiles && recordingFiles.length > 0) {
+    context += `\n- Recording Files: ${recordingFiles.length} files available`;
+  }
 
   if (transcript) {
     context += `

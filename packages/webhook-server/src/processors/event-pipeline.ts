@@ -83,7 +83,7 @@ async function processSingleEvent(event: WebhookEvent): Promise<void> {
     await addToReviewQueue(event.id, event.source, result);
     logger.info("Event queued for review", { eventId: event.id });
   } else {
-    await applyToAttio(result, event.source);
+    await applyToAttio(result, event.source, event.payload);
   }
 
   // Mark the raw event as processed
@@ -107,7 +107,8 @@ function isValidEmail(email: string): boolean {
 // Apply an AI processing result to Attio CRM
 export async function applyToAttio(
   result: AIProcessingResult,
-  source?: EventSource
+  source?: EventSource,
+  rawPayload?: Record<string, unknown>
 ): Promise<void> {
   const contact = result.contact;
 
@@ -269,7 +270,7 @@ export async function applyToAttio(
     parent_object: "deals",
     parent_id: dealId,
     title: `[${result.note.sentiment.toUpperCase()}] ${result.deal.stage_reason}`,
-    content: buildNoteContent(result),
+    content: buildNoteContent(result, rawPayload),
   });
 
   // 4. Create a follow-up task if warranted
@@ -290,8 +291,19 @@ export async function applyToAttio(
   });
 }
 
-function buildNoteContent(result: AIProcessingResult): string {
+function buildNoteContent(result: AIProcessingResult, rawPayload?: Record<string, unknown>): string {
   let content = result.note.summary;
+
+  // Add Zoom AI companion doc link if available
+  if (rawPayload?.zoom_ai_summary_url) {
+    content += `\n\nZoom AI Summary: ${rawPayload.zoom_ai_summary_url}`;
+  } else {
+    // Fallback: construct URL from meeting ID
+    const zoomObj = (rawPayload?.payload as Record<string, unknown>)?.object as Record<string, unknown> | undefined;
+    if (zoomObj?.id) {
+      content += `\n\nZoom Meeting: https://zoom.us/j/${zoomObj.id}`;
+    }
+  }
 
   if (result.note.pricing_discussed) {
     content += "\n\n💰 Pricing was discussed in this interaction.";

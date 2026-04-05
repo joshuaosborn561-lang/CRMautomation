@@ -457,27 +457,26 @@ app.post("/api/re-enrich", async (_req, res) => {
         continue;
       }
 
-      // Extract phone number from payload
-      const callDetails = event.payload?.call_details as Record<string, unknown> | undefined;
+      // Extract phone number from payload (Zoom nested structure: object.caller/callee)
       const obj = (event.payload?.payload as Record<string, unknown>)?.object as Record<string, unknown> | undefined;
-      const direction = (callDetails?.direction || obj?.direction || "") as string;
-      const callerNumber = (callDetails?.caller_number || obj?.caller_number || "") as string;
-      const calleeNumber = (callDetails?.callee_number || obj?.callee_number || "") as string;
-      const callerName = (callDetails?.caller_name || obj?.caller_name || "") as string;
-      const calleeName = (callDetails?.callee_name || obj?.callee_name || "") as string;
+      const caller = obj?.caller as Record<string, unknown> | undefined;
+      const callee = obj?.callee as Record<string, unknown> | undefined;
 
-      // Determine external party
+      // External party has extension_type "pstn", internal has "user"
       let phone: string | null = null;
       let name = "";
-      if (direction === "outbound") {
-        phone = calleeNumber || null;
-        name = calleeName as string;
-      } else if (direction === "inbound") {
-        phone = callerNumber || null;
-        name = callerName as string;
+      if (callee?.extension_type === "pstn") {
+        phone = (callee?.phone_number || "") as string || null;
+        name = (callee?.name || "") as string;
+      } else if (caller?.extension_type === "pstn") {
+        phone = (caller?.phone_number || "") as string || null;
+        name = (caller?.name || "") as string;
       } else {
-        phone = (calleeNumber?.length > 6 ? calleeNumber : callerNumber) || null;
-        name = calleeName || callerName;
+        // Fallback: try both
+        const calleeNum = (callee?.phone_number || "") as string;
+        const callerNum = (caller?.phone_number || "") as string;
+        phone = calleeNum.length > 6 ? calleeNum : callerNum.length > 6 ? callerNum : null;
+        name = (callee?.name || caller?.name || "") as string;
       }
 
       if (!phone) {

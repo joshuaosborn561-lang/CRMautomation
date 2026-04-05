@@ -147,13 +147,13 @@ zoomRouter.post("/", async (req: Request, res: Response) => {
 
         // --- LEADMAGIC ENRICHMENT: Match phone number to lead ---
         const externalNumber = getExternalPhoneNumber(callDetails, payload);
-        const callerName = (callDetails?.caller_name || callDetails?.callee_name || "") as string;
-        if (externalNumber || callerName) {
+        const externalName = getExternalCallerName(callDetails, payload);
+        if (externalNumber || externalName) {
           // Use whatever we have from Zoom to enrich via LeadMagic
           const enriched = await enrichContact({
             phone: externalNumber || undefined,
-            first_name: callerName.split(" ")[0] || undefined,
-            last_name: callerName.split(" ").slice(1).join(" ") || undefined,
+            first_name: externalName ? externalName.split(" ")[0] : undefined,
+            last_name: externalName ? externalName.split(" ").slice(1).join(" ") : undefined,
           });
           if (enriched.enriched) {
             enrichedPayload.enriched_contact = {
@@ -181,15 +181,20 @@ zoomRouter.post("/", async (req: Request, res: Response) => {
 
     if (
       eventType === "meeting.ended" ||
-      eventType === "recording.completed"
+      eventType === "recording.completed" ||
+      eventType === "recording.transcript_completed"
     ) {
       const meetingId =
         payload.payload?.object?.id || payload.payload?.object?.uuid;
       if (meetingId) {
-        const transcript = await zoomService.getMeetingTranscript(
-          String(meetingId)
-        );
+        // Fetch transcript and AI summary in parallel
+        const [transcript, aiSummary] = await Promise.all([
+          zoomService.getMeetingTranscript(String(meetingId)),
+          zoomService.getMeetingSummary(String(meetingId)),
+        ]);
         if (transcript) enrichedPayload.transcript = transcript;
+        if (aiSummary?.summary_url) enrichedPayload.zoom_ai_summary_url = aiSummary.summary_url;
+        if (aiSummary?.summary) enrichedPayload.zoom_ai_summary = aiSummary.summary;
       }
     }
 
@@ -203,30 +208,65 @@ zoomRouter.post("/", async (req: Request, res: Response) => {
 });
 
 /**
- * Determine the external (non-you) phone number from a call.
- * For outbound calls, it's the callee. For inbound, it's the caller.
+ * Determine the external (non-you) phone number and name from a call.
+ * Uses extension_type to distinguish internal users from external PSTN callers.
+ * Zoom payload structure: object.caller = { phone_number, name, extension_type }
  */
 function getExternalPhoneNumber(
   callDetails: Record<string, unknown> | null | undefined,
   payload: Record<string, unknown>
 ): string | null {
-  const details = callDetails || {};
   const obj = (payload.payload as Record<string, unknown>)?.object as Record<string, unknown> | undefined;
+  const caller = obj?.caller as Record<string, unknown> | undefined;
+  const callee = obj?.callee as Record<string, unknown> | undefined;
 
-  const direction = (details.direction || obj?.direction || "") as string;
-  const callerNumber = (details.caller_number || obj?.caller_number || "") as string;
-  const calleeNumber = (details.callee_number || obj?.callee_number || "") as string;
-
-  if (direction === "outbound") {
-    return calleeNumber || null;
-  } else if (direction === "inbound") {
-    return callerNumber || null;
+  // First try call details from Zoom API (flat structure)
+  if (callDetails) {
+    const direction = (callDetails.direction || "") as string;
+    const callerNumber = (callDetails.caller_number || "") as string;
+    const calleeNumber = (callDetails.callee_number || "") as string;
+    if (direction === "outbound" && calleeNumber) return calleeNumber;
+    if (direction === "inbound" && callerNumber) return callerNumber;
   }
 
-  // If direction unknown, return whichever number looks like an external number
-  // (not a Zoom extension — extensions are usually short)
-  if (calleeNumber && calleeNumber.length > 6) return calleeNumber;
-  if (callerNumber && callerNumber.length > 6) return callerNumber;
+  // Then use webhook payload (nested structure: caller/callee objects)
+  // External party has extension_type "pstn", internal has "user"
+  if (callee?.extension_type === "pstn" && callee?.phone_number) {
+    return callee.phone_number as string;
+  }
+  if (caller?.extension_type === "pstn" && caller?.phone_number) {
+    return caller.phone_number as string;
+  }
+
+  // Fallback: return whichever has a real phone number (10+ digits)
+  const calleeNum = (callee?.phone_number || "") as string;
+  const callerNum = (caller?.phone_number || "") as string;
+  if (calleeNum.length > 6) return calleeNum;
+  if (callerNum.length > 6) return callerNum;
 
   return null;
+}
+
+/**
+ * Get the external party's name from the call.
+ */
+function getExternalCallerName(
+  callDetails: Record<string, unknown> | null | undefined,
+  payload: Record<string, unknown>
+): string {
+  const obj = (payload.payload as Record<string, unknown>)?.object as Record<string, unknown> | undefined;
+  const caller = obj?.caller as Record<string, unknown> | undefined;
+  const callee = obj?.callee as Record<string, unknown> | undefined;
+
+  if (callDetails) {
+    const direction = (callDetails.direction || "") as string;
+    if (direction === "outbound") return (callDetails.callee_name || "") as string;
+    if (direction === "inbound") return (callDetails.caller_name || "") as string;
+  }
+
+  // External party has extension_type "pstn"
+  if (callee?.extension_type === "pstn" && callee?.name) return callee.name as string;
+  if (caller?.extension_type === "pstn" && caller?.name) return caller.name as string;
+
+  return "";
 }
