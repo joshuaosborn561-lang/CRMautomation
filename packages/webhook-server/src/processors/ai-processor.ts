@@ -290,6 +290,21 @@ CONTACT EXTRACTION FOR MEETINGS:
 - Set email to "unknown" if no participant email is available (do NOT fabricate)
 - This was a real sales meeting — set sentiment to "positive" and stage to at minimum "discovery_completed"`;
 
+  // Add enriched contact data if available (from Apollo)
+  const enrichedContact = (payload.enriched_contact || payload.apollo_contact) as Record<string, unknown> | undefined;
+  if (enrichedContact) {
+    context += `
+
+LEAD IDENTIFIED VIA APOLLO (enriched contact data):
+- Name: ${enrichedContact.first_name || ""} ${enrichedContact.last_name || ""}
+- Email: ${enrichedContact.email || "unknown"}
+- Company: ${enrichedContact.company || "unknown"}
+- Title: ${enrichedContact.title || "unknown"}
+- LinkedIn: ${enrichedContact.linkedin_url || "unknown"}
+
+IMPORTANT: Use this enriched contact data for the contact fields in your response. The email from enriched_contact is the ONLY valid email.`;
+  }
+
   // Add Zoom AI Companion summary if available
   const zoomAiSummary = payload.zoom_ai_summary as string | undefined;
   if (zoomAiSummary) {

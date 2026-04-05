@@ -67,6 +67,55 @@ async function processSingleEvent(event: WebhookEvent): Promise<void> {
   logger.info("AI processing event", { eventId: event.id, source: event.source });
   const result = await processEvent(event);
 
+  // Step 1.5: Merge enriched_contact data (from Apollo/LeadMagic) into AI result
+  // The AI doesn't see this data, so we overlay it here
+  const enriched = event.payload?.enriched_contact as Record<string, string> | undefined;
+  if (enriched) {
+    if (enriched.email && enriched.email.includes("@")) {
+      result.contact.email = enriched.email;
+    }
+    if (enriched.first_name) result.contact.first_name = result.contact.first_name || enriched.first_name;
+    if (enriched.last_name) result.contact.last_name = result.contact.last_name || enriched.last_name;
+    if (enriched.company) result.contact.company = result.contact.company || enriched.company;
+    if (enriched.title) result.contact.title = result.contact.title || enriched.title;
+    if (enriched.linkedin_url) result.contact.linkedin_url = result.contact.linkedin_url || enriched.linkedin_url;
+    if (enriched.phone) result.contact.phone = result.contact.phone || enriched.phone;
+    logger.info("Merged enriched_contact into AI result", {
+      email: result.contact.email,
+      name: `${result.contact.first_name} ${result.contact.last_name}`,
+      company: result.contact.company,
+    });
+  }
+
+  // Step 1.6: For zoom events, extract phone/name from raw payload if AI missed them
+  if (event.source === "zoom_phone") {
+    const obj = (event.payload?.payload as Record<string, unknown>)?.object as Record<string, unknown> | undefined;
+    const caller = obj?.caller as Record<string, unknown> | undefined;
+    const callee = obj?.callee as Record<string, unknown> | undefined;
+    const external = callee?.extension_type === "pstn" ? callee : (caller?.extension_type === "pstn" ? caller : null);
+    if (external && !result.contact.phone) {
+      result.contact.phone = (external.phone_number || "") as string;
+    }
+    if (external?.name && (!result.contact.first_name || result.contact.first_name === "unknown")) {
+      const parts = ((external.name as string) || "").split(" ");
+      result.contact.first_name = parts[0] || undefined;
+      result.contact.last_name = parts.slice(1).join(" ") || undefined;
+    }
+  }
+  if (event.source === "zoom_meeting") {
+    const obj = (event.payload?.payload as Record<string, unknown>)?.object as Record<string, unknown> | undefined;
+    const topic = (obj?.topic || "") as string;
+    // Extract prospect name from meeting topic if AI missed it
+    if (!result.contact.first_name || result.contact.first_name === "unknown") {
+      const nameMatch = topic.match(/- (.+?) and Joshua/i) || topic.match(/- (.+?) and Josh/i);
+      if (nameMatch) {
+        const parts = nameMatch[1].trim().split(" ");
+        result.contact.first_name = parts[0];
+        result.contact.last_name = parts.slice(1).join(" ");
+      }
+    }
+  }
+
   // Step 2: Log the interaction in our timeline
   await logInteraction({
     contact_email: result.contact.email || "unknown",
