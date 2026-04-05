@@ -52,6 +52,135 @@ async function attioFetch(
   return response.json();
 }
 
+// --- Field Setup (ensure custom attributes exist before we use them) ---
+
+let _fieldsEnsured = false;
+
+export async function ensureAttioFieldsExist(): Promise<void> {
+  if (_fieldsEnsured) return;
+
+  const config = getConfig();
+  const headers = {
+    Authorization: `Bearer ${config.ATTIO_API_KEY}`,
+    "Content-Type": "application/json",
+  };
+
+  // 1. Create custom attributes on People object
+  const peopleFields = [
+    { title: "Company", api_slug: "company", type: "text" },
+    { title: "Job Title", api_slug: "job_title", type: "text" },
+    { title: "LinkedIn URL", api_slug: "linkedin_url", type: "text" },
+    { title: "Lead Source", api_slug: "lead_source", type: "text" },
+    { title: "Industry", api_slug: "industry", type: "text" },
+  ];
+
+  for (const field of peopleFields) {
+    try {
+      const resp = await fetch(`${ATTIO_BASE_URL}/objects/people/attributes`, {
+        method: "POST",
+        headers,
+        body: JSON.stringify({
+          data: {
+            title: field.title,
+            api_slug: field.api_slug,
+            type: field.type,
+            is_required: false,
+            is_unique: false,
+            is_multiselect: false,
+          },
+        }),
+      });
+      if (resp.ok) {
+        logger.info(`Created Attio People field: ${field.api_slug}`);
+      } else {
+        const body = await resp.text();
+        if (resp.status === 409 || body.includes("already") || body.includes("exists")) {
+          // Already exists — fine
+        } else {
+          logger.warn(`Failed to create People field ${field.api_slug}: ${resp.status} ${body}`);
+        }
+      }
+    } catch (err) {
+      logger.warn(`Error creating People field ${field.api_slug}`, { error: String(err) });
+    }
+  }
+
+  // 2. Create pipeline attributes (deal fields)
+  const pipelineId = config.ATTIO_PIPELINE_ID;
+  if (pipelineId) {
+    const pipelineFields = [
+      { title: "Deal Name", api_slug: "deal_name", type: "text" },
+      { title: "Deal Value", api_slug: "deal_value", type: "number" },
+      { title: "Term Length", api_slug: "term_length", type: "number" },
+    ];
+
+    for (const field of pipelineFields) {
+      try {
+        const resp = await fetch(`${ATTIO_BASE_URL}/lists/${pipelineId}/attributes`, {
+          method: "POST",
+          headers,
+          body: JSON.stringify({
+            data: {
+              title: field.title,
+              api_slug: field.api_slug,
+              type: field.type,
+              is_required: false,
+              is_unique: false,
+              is_multiselect: false,
+            },
+          }),
+        });
+        if (resp.ok) {
+          logger.info(`Created Attio pipeline field: ${field.api_slug}`);
+        } else {
+          const body = await resp.text();
+          if (resp.status === 409 || body.includes("already") || body.includes("exists")) {
+            // Already exists
+          } else {
+            logger.warn(`Failed to create pipeline field ${field.api_slug}: ${resp.status} ${body}`);
+          }
+        }
+      } catch (err) {
+        logger.warn(`Error creating pipeline field ${field.api_slug}`, { error: String(err) });
+      }
+    }
+
+    // 3. Create pipeline stages
+    const stages = [
+      "Replied / Showed Interest",
+      "Call or Meeting Booked",
+      "Discovery Completed",
+      "Proposal Sent",
+      "Negotiating",
+      "Closed Won",
+      "Closed Lost",
+      "Nurture",
+    ];
+
+    // Get existing statuses first
+    try {
+      const listResp = await fetch(`${ATTIO_BASE_URL}/lists/${pipelineId}`, {
+        headers: { Authorization: `Bearer ${config.ATTIO_API_KEY}` },
+      });
+      if (listResp.ok) {
+        const listData = await listResp.json() as { data?: { statuses?: Array<{ title: string }> } };
+        const existingStages = (listData.data?.statuses || []).map(s => s.title);
+        const missingStages = stages.filter(s => !existingStages.includes(s));
+        if (missingStages.length > 0) {
+          logger.info(`Missing pipeline stages: ${missingStages.join(", ")}. You may need to create these manually in Attio.`);
+        } else {
+          logger.info("All pipeline stages exist");
+        }
+      }
+    } catch (err) {
+      logger.warn("Could not check pipeline stages", { error: String(err) });
+    }
+  }
+
+  _fieldsEnsured = true;
+  logger.info("Attio field setup complete");
+}
+
 // --- Contacts ---
 
 export async function findContact(email: string): Promise<{ id: string } | null> {
@@ -71,31 +200,45 @@ export async function findContact(email: string): Promise<{ id: string } | null>
 }
 
 export async function createContact(contact: AttioContact & { title?: string; lead_source?: string; industry?: string }): Promise<string> {
-  const values: Record<string, unknown> = {};
-  // Only add email if it's a real email
+  // Build core values (built-in Attio fields that always exist)
+  const coreValues: Record<string, unknown> = {};
   if (contact.email && contact.email !== "unknown" && contact.email.includes("@")) {
-    values.email_addresses = [{ email_address: contact.email }];
+    coreValues.email_addresses = [{ email_address: contact.email }];
   }
-  // Attio uses a single "name" attribute with first_name/last_name subfields
   if (contact.first_name || contact.last_name) {
-    values.name = [{
+    coreValues.name = [{
       first_name: contact.first_name || "",
       last_name: contact.last_name || "",
       full_name: `${contact.first_name || ""} ${contact.last_name || ""}`.trim(),
     }];
   }
-  if (contact.phone) values.phone_numbers = [{ original_phone_number: contact.phone }];
-  // Custom fields on People object
-  if (contact.company) values.company = contact.company;
-  if (contact.linkedin_url) values.linkedin_url = contact.linkedin_url;
-  if (contact.title) values.job_title = contact.title;
-  if (contact.lead_source) values.lead_source = contact.lead_source;
-  if (contact.industry) values.industry = contact.industry;
+  if (contact.phone) coreValues.phone_numbers = [{ original_phone_number: contact.phone }];
 
-  const result = (await attioFetch("/objects/people/records", {
-    method: "POST",
-    body: JSON.stringify({ data: { values } }),
-  })) as { data: { id: { record_id: string } } };
+  // Try with custom fields first, fall back to core-only if custom fields don't exist yet
+  const customValues: Record<string, unknown> = {};
+  if (contact.company) customValues.company = contact.company;
+  if (contact.linkedin_url) customValues.linkedin_url = contact.linkedin_url;
+  if (contact.title) customValues.job_title = contact.title;
+  if (contact.lead_source) customValues.lead_source = contact.lead_source;
+  if (contact.industry) customValues.industry = contact.industry;
+
+  let result: { data: { id: { record_id: string } } };
+  try {
+    result = (await attioFetch("/objects/people/records", {
+      method: "POST",
+      body: JSON.stringify({ data: { values: { ...coreValues, ...customValues } } }),
+    })) as { data: { id: { record_id: string } } };
+  } catch (err) {
+    // Custom fields might not exist — retry with core fields only
+    logger.warn("Contact creation failed with custom fields, retrying core-only", {
+      error: String(err),
+      email: contact.email,
+    });
+    result = (await attioFetch("/objects/people/records", {
+      method: "POST",
+      body: JSON.stringify({ data: { values: coreValues } }),
+    })) as { data: { id: { record_id: string } } };
+  }
 
   logger.info("Created Attio contact", { email: contact.email, id: result.data.id.record_id });
   return result.data.id.record_id;
@@ -221,7 +364,7 @@ export async function createDeal(deal: AttioDeal & { value?: number; term_months
     entryValues.term_length = [{ value: deal.term_months }];
   }
 
-  // Try with stage first, fall back to no stage if it fails
+  // Try with stage + custom fields, progressively fall back
   let result: { data: { entry_id: string } };
   try {
     result = (await attioFetch(`/lists/${pipelineId}/entries`, {
@@ -236,21 +379,38 @@ export async function createDeal(deal: AttioDeal & { value?: number; term_months
       }),
     })) as { data: { entry_id: string } };
   } catch (err) {
-    // Stage name might not exist — retry without it
-    logger.warn("Deal creation failed with stage, retrying without", {
+    // Try without custom entry_values (they might not exist as pipeline attributes)
+    logger.warn("Deal creation failed, retrying without custom values", {
       stage: stageName,
       error: String(err),
     });
-    result = (await attioFetch(`/lists/${pipelineId}/entries`, {
-      method: "POST",
-      body: JSON.stringify({
-        data: {
-          parent_object: "people",
-          parent_record_id: deal.contact_id,
-          entry_values: Object.keys(entryValues).length > 0 ? entryValues : undefined,
-        },
-      }),
-    })) as { data: { entry_id: string } };
+    try {
+      result = (await attioFetch(`/lists/${pipelineId}/entries`, {
+        method: "POST",
+        body: JSON.stringify({
+          data: {
+            parent_object: "people",
+            parent_record_id: deal.contact_id,
+            current_status_title: stageName,
+          },
+        }),
+      })) as { data: { entry_id: string } };
+    } catch (err2) {
+      // Stage name might not exist either — bare minimum
+      logger.warn("Deal creation failed with stage too, retrying bare minimum", {
+        stage: stageName,
+        error: String(err2),
+      });
+      result = (await attioFetch(`/lists/${pipelineId}/entries`, {
+        method: "POST",
+        body: JSON.stringify({
+          data: {
+            parent_object: "people",
+            parent_record_id: deal.contact_id,
+          },
+        }),
+      })) as { data: { entry_id: string } };
+    }
   }
 
   logger.info("Created Attio deal", {

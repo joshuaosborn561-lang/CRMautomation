@@ -20,6 +20,7 @@ import { processEventQueue } from "./processors/event-pipeline";
 import { runNurtureCheck } from "./jobs/nurture-engine";
 import { setupGmailWatch } from "./services/gmail";
 import { runStartupBackfill } from "./jobs/startup-backfill";
+import { ensureAttioFieldsExist } from "./services/attio";
 
 const app = express();
 
@@ -1121,20 +1122,10 @@ app.post("/api/full-rebuild", async (_req, res) => {
       const { getSupabase } = await import("./utils/supabase");
       const supabase = getSupabase();
 
-      // Step 0: Ensure custom People fields exist
-      const peopleFieldsToCreate = ["company", "job_title", "linkedin_url", "lead_source", "industry"];
-      for (const slug of peopleFieldsToCreate) {
-        try {
-          await fetch("https://api.attio.com/v2/objects/people/attributes", {
-            method: "POST",
-            headers: { Authorization: `Bearer ${config.ATTIO_API_KEY}`, "Content-Type": "application/json" },
-            body: JSON.stringify({
-              data: { title: slug.replace("_", " ").replace(/\b\w/g, c => c.toUpperCase()), api_slug: slug, type: "text", is_required: false, is_unique: false, is_multiselect: false },
-            }),
-          });
-        } catch { /* already exists */ }
-      }
-      rebuildStatus.steps.push({ step: "setup_people_fields", status: "done" });
+      // Step 0: Ensure all Attio custom fields + pipeline stages exist
+      const { ensureAttioFieldsExist: ensureFields } = await import("./services/attio");
+      await ensureFields();
+      rebuildStatus.steps.push({ step: "setup_attio_fields", status: "done" });
 
       // Step 1: Nuke Attio
       let peopleDeleted = 0;
@@ -1293,18 +1284,11 @@ const port = parseInt(config.PORT, 10);
 app.listen(port, () => {
   logger.info(`CRM Autopilot webhook server running on port ${port}`);
   logger.info(`Review mode: ${config.REVIEW_MODE ? "ON" : "OFF"}`);
-  logger.info("Webhook endpoints:");
-  logger.info("  POST /webhooks/smartlead");
-  logger.info("  POST /webhooks/heyreach");
-  logger.info("  POST /webhooks/zoom");
-  logger.info("  POST /webhooks/gmail");
-  logger.info("API endpoints:");
-  logger.info("  GET  /api/review");
-  logger.info("  POST /api/review/:id/approve");
-  logger.info("  POST /api/review/:id/reject");
-  logger.info("  POST /api/review/approve-all");
-  logger.info("  POST /api/query");
-  logger.info("  GET  /api/status");
+
+  // Ensure Attio custom fields exist on startup
+  ensureAttioFieldsExist().catch((err) =>
+    logger.warn("Attio field setup failed on startup (will retry on first use)", { error: String(err) })
+  );
 });
 
 // --- Gmail Watch Setup ---
