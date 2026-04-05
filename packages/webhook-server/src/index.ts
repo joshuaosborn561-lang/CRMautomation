@@ -758,11 +758,14 @@ app.post("/api/re-enrich-meetings", async (_req, res) => {
     let aiSummaryFound = 0;
     let noData = 0;
     let alreadyHad = 0;
-    const results: Array<{ id: string; topic: string; transcript: boolean; ai_summary: boolean; status: string }> = [];
+    const results: Array<{ id: string; topic: string; transcript: boolean; ai_summary: boolean; ids_tried?: unknown; status: string }> = [];
 
     for (const event of events || []) {
       const obj = (event.payload?.payload as Record<string, unknown>)?.object as Record<string, unknown> | undefined;
-      const meetingId = obj?.id || obj?.uuid;
+      // Prefer UUID over numeric ID — Zoom recordings API needs UUID for past meetings
+      const meetingUuid = obj?.uuid as string | undefined;
+      const meetingNumericId = obj?.id as string | number | undefined;
+      const meetingId = meetingUuid || meetingNumericId;
       const topic = (obj?.topic || "unknown") as string;
 
       if (!meetingId) {
@@ -778,11 +781,45 @@ app.post("/api/re-enrich-meetings", async (_req, res) => {
       }
 
       try {
-        // Fetch transcript and AI summary in parallel
-        const [transcript, aiSummary] = await Promise.all([
-          zoomService.getMeetingTranscript(String(meetingId)),
-          zoomService.getMeetingSummary(String(meetingId)),
-        ]);
+        // First check if recording_files are already in the payload (from recording.completed webhook)
+        let transcript: string | null = null;
+        const recordingFiles = obj?.recording_files as Array<Record<string, unknown>> | undefined;
+        if (recordingFiles && recordingFiles.length > 0) {
+          const transcriptFile = recordingFiles.find(
+            (f) =>
+              f.file_type === "TRANSCRIPT" ||
+              f.recording_type === "audio_transcript" ||
+              f.file_type === "VTT"
+          );
+          if (transcriptFile?.download_url) {
+            try {
+              const token = await (await import("./services/zoom")).getZoomAccessToken();
+              const resp = await fetch(`${transcriptFile.download_url}?access_token=${token}`);
+              if (resp.ok) transcript = await resp.text();
+            } catch { /* fall through to API fetch */ }
+          }
+        }
+
+        // If no transcript from payload, try Zoom API (try UUID first, then numeric ID)
+        let aiSummary: { summary_url?: string; summary?: string } | null = null;
+        if (!transcript) {
+          const idsToTry = meetingUuid
+            ? [String(meetingUuid), ...(meetingNumericId ? [String(meetingNumericId)] : [])]
+            : [String(meetingId)];
+
+          for (const id of idsToTry) {
+            if (transcript) break;
+            try {
+              transcript = await zoomService.getMeetingTranscript(id);
+            } catch { /* try next ID */ }
+          }
+        }
+
+        // Fetch AI summary
+        const summaryId = meetingUuid ? String(meetingUuid) : String(meetingId);
+        try {
+          aiSummary = await zoomService.getMeetingSummary(summaryId);
+        } catch { /* not critical */ }
 
         const updates: Record<string, unknown> = {};
         let hasUpdate = false;
@@ -814,6 +851,7 @@ app.post("/api/re-enrich-meetings", async (_req, res) => {
           topic,
           transcript: !!transcript,
           ai_summary: !!aiSummary?.summary_url,
+          ids_tried: { uuid: meetingUuid, numeric: meetingNumericId },
           status: hasUpdate ? "updated" : "no_transcript_found",
         });
 
@@ -1018,6 +1056,208 @@ app.post("/api/process-now", async (_req, res) => {
     res.json({ message: "Event queue processed" });
   } catch (err) {
     res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+  }
+});
+
+// Full rebuild: nuke Attio, re-enrich everything, reprocess all events
+app.post("/api/full-rebuild", async (req, res) => {
+  const steps: Array<{ step: string; status: string; details?: unknown }> = [];
+
+  try {
+    const config = getConfig();
+    const { getSupabase } = await import("./utils/supabase");
+    const supabase = getSupabase();
+
+    // Step 1: Nuke Attio
+    let peopleDeleted = 0;
+    let dealsDeleted = 0;
+
+    const pipelineId = config.ATTIO_PIPELINE_ID;
+    if (pipelineId) {
+      while (true) {
+        const dealsResp = await fetch(`https://api.attio.com/v2/lists/${pipelineId}/entries/query`, {
+          method: "POST",
+          headers: { Authorization: `Bearer ${config.ATTIO_API_KEY}`, "Content-Type": "application/json" },
+          body: JSON.stringify({ limit: 50 }),
+        });
+        if (!dealsResp.ok) break;
+        const dealsData = await dealsResp.json() as { data: Array<Record<string, unknown>> };
+        if (!dealsData.data || dealsData.data.length === 0) break;
+        for (const deal of dealsData.data) {
+          try {
+            await fetch(`https://api.attio.com/v2/lists/${pipelineId}/entries/${deal.entry_id}`, {
+              method: "DELETE", headers: { Authorization: `Bearer ${config.ATTIO_API_KEY}` },
+            });
+            dealsDeleted++;
+          } catch { /* continue */ }
+        }
+      }
+    }
+    while (true) {
+      const resp = await fetch("https://api.attio.com/v2/objects/people/records/query", {
+        method: "POST",
+        headers: { Authorization: `Bearer ${config.ATTIO_API_KEY}`, "Content-Type": "application/json" },
+        body: JSON.stringify({ limit: 50 }),
+      });
+      if (!resp.ok) break;
+      const data = await resp.json() as { data: Array<Record<string, unknown>> };
+      if (!data.data || data.data.length === 0) break;
+      for (const person of data.data) {
+        const id = (person.id as Record<string, string>)?.record_id;
+        try {
+          await fetch(`https://api.attio.com/v2/objects/people/records/${id}`, {
+            method: "DELETE", headers: { Authorization: `Bearer ${config.ATTIO_API_KEY}` },
+          });
+          peopleDeleted++;
+        } catch { /* continue */ }
+      }
+    }
+    steps.push({ step: "cleanup_attio", status: "done", details: { peopleDeleted, dealsDeleted } });
+
+    // Step 2: Clear interaction log (stale data from previous runs)
+    await supabase.from("interaction_log").delete().neq("id", "00000000-0000-0000-0000-000000000000");
+    steps.push({ step: "clear_interaction_log", status: "done" });
+
+    // Step 3: Re-enrich meetings with Zoom transcripts
+    const zoomService = await import("./services/zoom");
+    const { data: meetingEvents } = await supabase
+      .from("webhook_events")
+      .select("id, payload, event_type")
+      .eq("source", "zoom_meeting")
+      .neq("event_type", "unknown");
+
+    let transcriptsFound = 0;
+    let meetingsSkipped = 0;
+    for (const event of meetingEvents || []) {
+      if (event.payload?.transcript) { meetingsSkipped++; continue; }
+      const obj = (event.payload?.payload as Record<string, unknown>)?.object as Record<string, unknown> | undefined;
+      const meetingUuid = obj?.uuid as string | undefined;
+      const meetingNumId = obj?.id as string | number | undefined;
+      if (!meetingUuid && !meetingNumId) continue;
+
+      let transcript: string | null = null;
+
+      // Try from recording_files in payload first
+      const recFiles = obj?.recording_files as Array<Record<string, unknown>> | undefined;
+      if (recFiles?.length) {
+        const tf = recFiles.find((f) => f.file_type === "TRANSCRIPT" || f.recording_type === "audio_transcript" || f.file_type === "VTT");
+        if (tf?.download_url) {
+          try {
+            const token = await zoomService.getZoomAccessToken();
+            const r = await fetch(`${tf.download_url}?access_token=${token}`);
+            if (r.ok) transcript = await r.text();
+          } catch { /* fallthrough */ }
+        }
+      }
+
+      // Try API with UUID then numeric ID
+      if (!transcript) {
+        for (const id of [meetingUuid, meetingNumId].filter(Boolean)) {
+          try { transcript = await zoomService.getMeetingTranscript(String(id)); } catch { /* next */ }
+          if (transcript) break;
+        }
+      }
+
+      if (transcript) {
+        const aiSummary = await zoomService.getMeetingSummary(String(meetingUuid || meetingNumId)).catch(() => null);
+        await supabase.from("webhook_events").update({
+          payload: {
+            ...event.payload,
+            transcript,
+            ...(aiSummary?.summary_url ? { zoom_ai_summary_url: aiSummary.summary_url } : {}),
+            ...(aiSummary?.summary ? { zoom_ai_summary: aiSummary.summary } : {}),
+          },
+        }).eq("id", event.id);
+        transcriptsFound++;
+      }
+    }
+    steps.push({ step: "enrich_meeting_transcripts", status: "done", details: { transcriptsFound, alreadyHad: meetingsSkipped, total: meetingEvents?.length || 0 } });
+
+    // Step 4: Re-enrich with Apollo (meetings by name)
+    let apolloEnriched = 0;
+    try {
+      const { searchContactByName } = await import("./services/apollo");
+      for (const event of meetingEvents || []) {
+        if (event.payload?.enriched_contact?.email) continue;
+        const obj = (event.payload?.payload as Record<string, unknown>)?.object as Record<string, unknown> | undefined;
+        const topic = (obj?.topic || "") as string;
+        const nameMatch = topic.match(/- (.+?) and Joshua/i) || topic.match(/- (.+?) and Josh/i);
+        if (!nameMatch) continue;
+        const prospectName = nameMatch[1].trim();
+        if (!prospectName) continue;
+        const [firstName, ...lastParts] = prospectName.split(" ");
+        const lastName = lastParts.join(" ");
+        const contact = await searchContactByName(firstName, lastName);
+        if (contact?.email) {
+          await supabase.from("webhook_events").update({
+            payload: {
+              ...event.payload,
+              enriched_contact: {
+                email: contact.email,
+                first_name: contact.first_name || firstName,
+                last_name: contact.last_name || lastName,
+                company: contact.company,
+                title: contact.title,
+                linkedin_url: contact.linkedin_url,
+              },
+            },
+          }).eq("id", event.id);
+          apolloEnriched++;
+        }
+      }
+    } catch (err) {
+      steps.push({ step: "apollo_enrich", status: "error", details: String(err) });
+    }
+    steps.push({ step: "apollo_enrich_meetings", status: "done", details: { apolloEnriched } });
+
+    // Step 5: Reset ALL events to unprocessed
+    await supabase.from("webhook_events").update({ processed: false, processed_at: null }).eq("processed", true);
+    steps.push({ step: "reset_events", status: "done" });
+
+    // Step 6: Process the queue immediately
+    await processEventQueue();
+    steps.push({ step: "process_queue_pass_1", status: "done" });
+
+    // Step 7: Check results
+    const peopleResp = await fetch("https://api.attio.com/v2/objects/people/records/query", {
+      method: "POST",
+      headers: { Authorization: `Bearer ${config.ATTIO_API_KEY}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ limit: 5 }),
+    });
+    let attioResults: Record<string, unknown> = {};
+    if (peopleResp.ok) {
+      const people = await peopleResp.json() as { data: unknown[] };
+      attioResults.people_count = people.data?.length || 0;
+    }
+    if (pipelineId) {
+      const dealsResp = await fetch(`https://api.attio.com/v2/lists/${pipelineId}/entries/query`, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${config.ATTIO_API_KEY}`, "Content-Type": "application/json" },
+        body: JSON.stringify({ limit: 5 }),
+      });
+      if (dealsResp.ok) {
+        const deals = await dealsResp.json() as { data: unknown[] };
+        attioResults.deals_count = deals.data?.length || 0;
+      }
+    }
+
+    const { count: processedCount } = await supabase.from("webhook_events").select("*", { count: "exact", head: true }).eq("processed", true);
+    const { count: unprocessedCount } = await supabase.from("webhook_events").select("*", { count: "exact", head: true }).eq("processed", false);
+
+    steps.push({ step: "verify", status: "done", details: { attio: attioResults, events: { processed: processedCount, remaining: unprocessedCount } } });
+
+    res.json({
+      message: "Full rebuild complete. Check Attio for contacts and deals.",
+      steps,
+      note: unprocessedCount && unprocessedCount > 0
+        ? `${unprocessedCount} events still unprocessed — the cron job will pick them up in the next 30 seconds, or call POST /api/process-now`
+        : "All events processed!",
+    });
+  } catch (err) {
+    res.status(500).json({
+      error: err instanceof Error ? err.message : String(err),
+      steps_completed: steps,
+    });
   }
 });
 

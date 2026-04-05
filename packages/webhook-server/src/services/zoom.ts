@@ -4,7 +4,7 @@ import { logger } from "../utils/logger";
 let _accessToken: string | null = null;
 let _tokenExpiry: number = 0;
 
-async function getZoomAccessToken(): Promise<string> {
+export async function getZoomAccessToken(): Promise<string> {
   if (_accessToken && Date.now() < _tokenExpiry) {
     return _accessToken;
   }
@@ -130,22 +130,55 @@ export async function getMeetingRecordings(meetingId: string): Promise<{
 export async function getMeetingTranscript(meetingId: string): Promise<string | null> {
   try {
     const recordings = await getMeetingRecordings(meetingId);
+    // Zoom transcript files can have different type combinations
     const transcript = recordings.recording_files?.find(
-      (f) => f.file_type === "TRANSCRIPT" || f.recording_type === "audio_transcript"
+      (f) =>
+        f.file_type === "TRANSCRIPT" ||
+        f.recording_type === "audio_transcript" ||
+        (f.file_type === "JSON" && f.recording_type === "audio_transcript") ||
+        f.file_type === "VTT"
     );
 
-    if (!transcript) return null;
+    if (!transcript?.download_url) {
+      logger.info("No transcript file found in recordings", {
+        meetingId,
+        fileCount: recordings.recording_files?.length || 0,
+        fileTypes: recordings.recording_files?.map(f => `${f.file_type}/${f.recording_type}`) || [],
+      });
+      return null;
+    }
 
     const token = await getZoomAccessToken();
     const response = await fetch(
       `${transcript.download_url}?access_token=${token}`
     );
 
-    if (!response.ok) return null;
+    if (!response.ok) {
+      logger.warn("Transcript download failed", { meetingId, status: response.status });
+      return null;
+    }
     return await response.text();
   } catch (err) {
     logger.warn("Could not fetch meeting transcript", { meetingId, error: String(err) });
     return null;
+  }
+}
+
+/**
+ * Get all recording file metadata for a meeting.
+ * Useful for debugging what files are available.
+ */
+export async function getMeetingRecordingFiles(meetingId: string): Promise<Array<{
+  file_type: string;
+  recording_type: string;
+  download_url: string;
+  status: string;
+}>> {
+  try {
+    const recordings = await getMeetingRecordings(meetingId);
+    return recordings.recording_files || [];
+  } catch {
+    return [];
   }
 }
 
