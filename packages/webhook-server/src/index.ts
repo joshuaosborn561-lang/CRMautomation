@@ -415,21 +415,14 @@ app.get("/api/debug/sample-events", async (_req, res) => {
         id: e.id,
         event_type: e.event_type,
         received_at: e.received_at,
-        has_enriched_contact: !!e.payload?.enriched_contact,
+        // Show the full zoom object so we can see field names
+        zoom_object: e.payload?.payload?.object || null,
+        // Show full payload for non-zoom events (smartlead, heyreach)
+        full_payload: source === "smartlead" || source === "heyreach" ? e.payload : undefined,
+        enriched_contact: e.payload?.enriched_contact || null,
         has_transcript: !!e.payload?.transcript,
         has_call_details: !!e.payload?.call_details,
-        enriched_contact: e.payload?.enriched_contact || null,
-        // For zoom_phone: extract phone numbers
-        caller_number: e.payload?.call_details?.caller_number || e.payload?.payload?.object?.caller_number,
-        callee_number: e.payload?.call_details?.callee_number || e.payload?.payload?.object?.callee_number,
-        direction: e.payload?.call_details?.direction || e.payload?.payload?.object?.direction,
-        // For zoom_meeting: extract participants
-        host_email: e.payload?.payload?.object?.host_email,
-        participants: e.payload?.payload?.object?.participant_count || e.payload?.payload?.object?.participants,
-        topic: e.payload?.payload?.object?.topic,
-        // Payload keys for debugging
         payload_keys: Object.keys(e.payload || {}),
-        payload_nested_keys: e.payload?.payload ? Object.keys(e.payload.payload) : null,
       }));
     }
 
