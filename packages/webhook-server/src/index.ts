@@ -360,7 +360,8 @@ app.get("/api/debug/test-attio-write", async (_req, res) => {
       }
 
       // Try deal creation with the correct parent_object from pipeline config
-      const parentObj = pipelineParentObject || "people";
+      const rawParent = pipelineParentObject;
+      const parentObj = Array.isArray(rawParent) ? rawParent[0] : (rawParent || "people");
       try {
         const resp = await fetch(`https://api.attio.com/v2/lists/${config.ATTIO_PIPELINE_ID}/entries`, {
           method: "POST", headers,

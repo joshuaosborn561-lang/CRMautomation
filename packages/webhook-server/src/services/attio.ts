@@ -377,8 +377,10 @@ async function getPipelineParentObject(): Promise<string> {
       headers: { Authorization: `Bearer ${config.ATTIO_API_KEY}` },
     });
     if (resp.ok) {
-      const data = await resp.json() as { data?: { parent_object?: string } };
-      _pipelineParentObject = data.data?.parent_object || "people";
+      const data = await resp.json() as { data?: { parent_object?: string | string[] } };
+      const raw = data.data?.parent_object;
+      // Attio returns parent_object as array like ["deals"] — extract the string
+      _pipelineParentObject = Array.isArray(raw) ? raw[0] : (raw || "people");
       logger.info("Pipeline parent_object", { parent: _pipelineParentObject });
       return _pipelineParentObject;
     }
@@ -407,8 +409,12 @@ export async function createDeal(deal: AttioDeal & { value?: number; term_months
     entryValues.term_length = [{ value: deal.term_months }];
   }
 
-  // entry_values MUST be an object (not undefined) — Attio requires it
+  // Pipeline parent_object is "deals" — entries are deal records.
+  // We create the entry and link it to the person via parent_record_id.
+  // Try multiple approaches since Attio's API varies by pipeline config.
   let result: { data: { entry_id: string } };
+
+  // Approach 1: Standard — parent_object as string + entry_values + stage
   try {
     result = (await attioFetch(`/lists/${pipelineId}/entries`, {
       method: "POST",
@@ -422,39 +428,38 @@ export async function createDeal(deal: AttioDeal & { value?: number; term_months
       }),
     })) as { data: { entry_id: string } };
   } catch (err) {
-    // Custom entry_values or stage might not exist — try with just empty values + stage
-    logger.warn("Deal creation failed, retrying with empty values", {
-      stage: stageName,
-      error: String(err),
-    });
+    logger.warn("Deal creation approach 1 failed", { error: String(err) });
+    // Approach 2: Without parent_object/parent_record_id (pipeline may not need them)
     try {
       result = (await attioFetch(`/lists/${pipelineId}/entries`, {
         method: "POST",
         body: JSON.stringify({
           data: {
-            parent_object: parentObject,
-            parent_record_id: deal.contact_id,
-            entry_values: {},
+            entry_values: entryValues,
             current_status_title: stageName,
           },
         }),
       })) as { data: { entry_id: string } };
     } catch (err2) {
-      // Stage name might not exist either — bare minimum with empty entry_values
-      logger.warn("Deal creation failed with stage too, retrying bare minimum", {
-        stage: stageName,
-        error: String(err2),
-      });
-      result = (await attioFetch(`/lists/${pipelineId}/entries`, {
-        method: "POST",
-        body: JSON.stringify({
-          data: {
-            parent_object: parentObject,
-            parent_record_id: deal.contact_id,
-            entry_values: {},
-          },
-        }),
-      })) as { data: { entry_id: string } };
+      logger.warn("Deal creation approach 2 failed", { error: String(err2) });
+      // Approach 3: Bare minimum
+      try {
+        result = (await attioFetch(`/lists/${pipelineId}/entries`, {
+          method: "POST",
+          body: JSON.stringify({
+            data: {
+              entry_values: {},
+            },
+          }),
+        })) as { data: { entry_id: string } };
+      } catch (err3) {
+        logger.error("All deal creation approaches failed", {
+          err1: String(err),
+          err2: String(err2),
+          err3: String(err3),
+        });
+        throw err3;
+      }
     }
   }
 
