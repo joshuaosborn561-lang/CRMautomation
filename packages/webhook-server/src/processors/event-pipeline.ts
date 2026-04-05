@@ -113,20 +113,32 @@ export async function applyToAttio(
   const contact = result.contact;
 
   if (!isValidEmail(contact.email)) {
-    // For phone calls, allow phone-only contacts
+    // Must have at least a name to create a contact — no more unnamed records
+    const hasName = contact.first_name && contact.first_name !== "unknown";
+    if (!hasName) {
+      logger.warn("No valid email or name — skipping Attio update (prevents unnamed contacts)", {
+        eventId: result.event_id,
+        email: contact.email,
+        phone: contact.phone,
+        source,
+      });
+      return;
+    }
+
+    // Has a name but no email — allow for phone calls and meetings
     if (contact.phone && source === "zoom_phone") {
-      logger.info("No valid email but have phone number, creating phone-based contact", {
+      logger.info("No email but have name+phone, creating contact", {
+        name: `${contact.first_name} ${contact.last_name}`,
         phone: contact.phone,
         eventId: result.event_id,
       });
-    // For zoom meetings, allow name-only contacts (these are real sales meetings)
-    } else if (source === "zoom_meeting" && (contact.first_name || contact.last_name)) {
-      logger.info("No valid email but have name from meeting, creating name-based contact", {
+    } else if (source === "zoom_meeting") {
+      logger.info("No email but have name from meeting, creating contact", {
         name: `${contact.first_name} ${contact.last_name}`,
         eventId: result.event_id,
       });
     } else {
-      logger.warn("No valid email, phone, or name found — skipping Attio update", {
+      logger.warn("No valid email — skipping Attio update", {
         eventId: result.event_id,
         email: contact.email,
         source,
