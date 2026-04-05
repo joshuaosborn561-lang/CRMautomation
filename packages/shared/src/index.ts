@@ -63,6 +63,7 @@ export interface AIProcessingResult {
     company?: string;
     linkedin_url?: string;
     phone?: string;
+    title?: string;
   };
   deal: {
     title: string;
@@ -138,6 +139,7 @@ export interface AttioContact {
   company?: string;
   phone?: string;
   linkedin_url?: string;
+  title?: string;
 }
 
 export interface AttioDeal {

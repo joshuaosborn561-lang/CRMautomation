@@ -263,6 +263,8 @@ export async function applyToAttio(
     company: contact.company,
     phone: contact.phone,
     linkedin_url: contact.linkedin_url,
+    title: contact.title,
+    lead_source: source,
   });
 
   // 2. Find or create the deal

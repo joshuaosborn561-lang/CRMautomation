@@ -70,7 +70,7 @@ export async function findContact(email: string): Promise<{ id: string } | null>
   return null;
 }
 
-export async function createContact(contact: AttioContact): Promise<string> {
+export async function createContact(contact: AttioContact & { title?: string; lead_source?: string; industry?: string }): Promise<string> {
   const values: Record<string, unknown> = {};
   // Only add email if it's a real email
   if (contact.email && contact.email !== "unknown" && contact.email.includes("@")) {
@@ -85,6 +85,12 @@ export async function createContact(contact: AttioContact): Promise<string> {
     }];
   }
   if (contact.phone) values.phone_numbers = [{ original_phone_number: contact.phone }];
+  // Custom fields on People object
+  if (contact.company) values.company = contact.company;
+  if (contact.linkedin_url) values.linkedin_url = contact.linkedin_url;
+  if (contact.title) values.job_title = contact.title;
+  if (contact.lead_source) values.lead_source = contact.lead_source;
+  if (contact.industry) values.industry = contact.industry;
 
   const result = (await attioFetch("/objects/people/records", {
     method: "POST",
@@ -115,7 +121,7 @@ export async function findContactByName(firstName: string, lastName: string): Pr
   return null;
 }
 
-export async function findOrCreateContact(contact: AttioContact): Promise<string> {
+export async function findOrCreateContact(contact: AttioContact & { title?: string; lead_source?: string; industry?: string }): Promise<string> {
   // Try finding by email first
   if (contact.email && contact.email !== "unknown") {
     const existing = await findContact(contact.email);

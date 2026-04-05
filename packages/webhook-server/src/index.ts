@@ -876,12 +876,55 @@ app.post("/api/re-enrich-meetings", async (_req, res) => {
   }
 });
 
-// One-time setup: create custom Attio pipeline attributes if they don't exist
+// One-time setup: create custom attributes on People object + pipeline
 app.get("/api/setup-attio-fields", async (_req, res) => {
   try {
     const config = getConfig();
     const pipelineId = config.ATTIO_PIPELINE_ID;
     const results: Record<string, unknown> = {};
+
+    // --- People object custom fields ---
+    const peopleFields = [
+      { title: "Company", api_slug: "company", type: "text" },
+      { title: "Job Title", api_slug: "job_title", type: "text" },
+      { title: "LinkedIn URL", api_slug: "linkedin_url", type: "text" },
+      { title: "Lead Source", api_slug: "lead_source", type: "text" },
+      { title: "Industry", api_slug: "industry", type: "text" },
+    ];
+
+    for (const field of peopleFields) {
+      try {
+        const resp = await fetch("https://api.attio.com/v2/objects/people/attributes", {
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${config.ATTIO_API_KEY}`,
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+            data: {
+              title: field.title,
+              api_slug: field.api_slug,
+              type: field.type,
+              is_required: false,
+              is_unique: false,
+              is_multiselect: false,
+            },
+          }),
+        });
+        const body = await resp.text();
+        if (resp.ok) {
+          results[`people.${field.api_slug}`] = { status: "CREATED" };
+        } else if (resp.status === 409 || body.includes("already exists")) {
+          results[`people.${field.api_slug}`] = { status: "ALREADY_EXISTS" };
+        } else {
+          results[`people.${field.api_slug}`] = { status: "FAIL", http: resp.status, body };
+        }
+      } catch (err) {
+        results[`people.${field.api_slug}`] = { status: "FAIL", error: String(err) };
+      }
+    }
+
+    // --- Pipeline (deals) custom fields ---
 
     const fieldsToCreate = [
       {
@@ -1067,6 +1110,21 @@ app.post("/api/full-rebuild", async (req, res) => {
     const config = getConfig();
     const { getSupabase } = await import("./utils/supabase");
     const supabase = getSupabase();
+
+    // Step 0: Ensure custom People fields exist
+    const peopleFieldsToCreate = ["company", "job_title", "linkedin_url", "lead_source", "industry"];
+    for (const slug of peopleFieldsToCreate) {
+      try {
+        await fetch("https://api.attio.com/v2/objects/people/attributes", {
+          method: "POST",
+          headers: { Authorization: `Bearer ${config.ATTIO_API_KEY}`, "Content-Type": "application/json" },
+          body: JSON.stringify({
+            data: { title: slug.replace("_", " ").replace(/\b\w/g, c => c.toUpperCase()), api_slug: slug, type: "text", is_required: false, is_unique: false, is_multiselect: false },
+          }),
+        });
+      } catch { /* already exists or error — continue */ }
+    }
+    steps.push({ step: "setup_people_fields", status: "done", details: { fields: peopleFieldsToCreate } });
 
     // Step 1: Nuke Attio
     let peopleDeleted = 0;
