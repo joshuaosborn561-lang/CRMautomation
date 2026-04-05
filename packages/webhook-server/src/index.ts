@@ -440,20 +440,22 @@ app.get("/api/debug/test-attio-write", async (_req, res) => {
     }
   }
 
-  // Step 6: List People object attributes to see what fields exist
-  try {
-    const resp = await fetch("https://api.attio.com/v2/objects/people/attributes", {
-      method: "GET", headers: { Authorization: `Bearer ${config.ATTIO_API_KEY}` },
-    });
-    if (resp.ok) {
-      const data = await resp.json() as { data: Array<{ api_slug: string; title: string; type: string }> };
-      const slugs = data.data?.map(a => `${a.api_slug} (${a.type})`).join(", ");
-      steps.push({ step: "list_people_attributes", status: "OK", details: slugs });
-    } else {
-      steps.push({ step: "list_people_attributes", status: "FAIL", details: { http: resp.status } });
+  // Step 6: List People + Deals object attributes
+  for (const obj of ["people", "deals"]) {
+    try {
+      const resp = await fetch(`https://api.attio.com/v2/objects/${obj}/attributes`, {
+        method: "GET", headers: { Authorization: `Bearer ${config.ATTIO_API_KEY}` },
+      });
+      if (resp.ok) {
+        const data = await resp.json() as { data: Array<{ api_slug: string; title: string; type: string; id: string; is_required: boolean }> };
+        const attrs = data.data?.map(a => `${a.api_slug} (${a.type}${a.is_required ? ", REQUIRED" : ""}) [${a.id?.substring(0,8)}]`).join(", ");
+        steps.push({ step: `list_${obj}_attributes`, status: "OK", details: attrs });
+      } else {
+        steps.push({ step: `list_${obj}_attributes`, status: "FAIL", details: { http: resp.status } });
+      }
+    } catch (err) {
+      steps.push({ step: `list_${obj}_attributes`, status: "ERROR", details: String(err) });
     }
-  } catch (err) {
-    steps.push({ step: "list_people_attributes", status: "ERROR", details: String(err) });
   }
 
   res.json({ steps });
