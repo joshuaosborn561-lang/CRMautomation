@@ -306,42 +306,37 @@ app.get("/api/debug/test-attio-write", async (_req, res) => {
 
   // Step 3: Test custom field write
   if (testContactId) {
+    // Test job_title (built-in text field)
     try {
       const resp = await fetch(`https://api.attio.com/v2/objects/people/records/${testContactId}`, {
         method: "PATCH", headers,
         body: JSON.stringify({
-          data: {
-            values: {
-              company: [{ value: "Test Company" }],
-            },
-          },
+          data: { values: { job_title: "Test CEO" } },
         }),
       });
       const body = await resp.text();
-      steps.push({ step: "update_custom_field_wrapped", status: resp.ok ? "OK" : "FAIL", details: { http: resp.status, body: body.substring(0, 300) } });
+      steps.push({ step: "update_job_title", status: resp.ok ? "OK" : "FAIL", details: { http: resp.status, body: body.substring(0, 200) } });
     } catch (err) {
-      steps.push({ step: "update_custom_field_wrapped", status: "ERROR", details: String(err) });
+      steps.push({ step: "update_job_title", status: "ERROR", details: String(err) });
     }
 
-    // Try with bare string too
+    // Test company as record-reference (create company first, then link)
     try {
+      const { findOrCreateCompany } = await import("./services/attio");
+      const companyId = await findOrCreateCompany("Test Debug Company");
       const resp = await fetch(`https://api.attio.com/v2/objects/people/records/${testContactId}`, {
         method: "PATCH", headers,
         body: JSON.stringify({
-          data: {
-            values: {
-              lead_source: "test_source",
-            },
-          },
+          data: { values: { company: [{ target_object: "companies", target_record_id: companyId }] } },
         }),
       });
       const body = await resp.text();
-      steps.push({ step: "update_custom_field_bare", status: resp.ok ? "OK" : "FAIL", details: { http: resp.status, body: body.substring(0, 300) } });
+      steps.push({ step: "update_company_ref", status: resp.ok ? "OK" : "FAIL", details: { http: resp.status, companyId, body: body.substring(0, 200) } });
     } catch (err) {
-      steps.push({ step: "update_custom_field_bare", status: "ERROR", details: String(err) });
+      steps.push({ step: "update_company_ref", status: "ERROR", details: String(err) });
     }
 
-    // Step 4: Test deal creation
+    // Step 4: Test deal creation (with entry_values as empty object)
     if (config.ATTIO_PIPELINE_ID) {
       try {
         const resp = await fetch(`https://api.attio.com/v2/lists/${config.ATTIO_PIPELINE_ID}/entries`, {
@@ -350,6 +345,7 @@ app.get("/api/debug/test-attio-write", async (_req, res) => {
             data: {
               parent_object: "people",
               parent_record_id: testContactId,
+              entry_values: {},
             },
           }),
         });

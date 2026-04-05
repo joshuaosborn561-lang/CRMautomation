@@ -66,10 +66,9 @@ export async function ensureAttioFieldsExist(): Promise<void> {
   };
 
   // 1. Create custom attributes on People object
+  // NOTE: company (record-reference), job_title (text), linkedin (text) are BUILT-IN — do NOT recreate
+  // Only create truly custom fields that don't exist yet
   const peopleFields = [
-    { title: "Company", api_slug: "company", type: "text" },
-    { title: "Job Title", api_slug: "job_title", type: "text" },
-    { title: "LinkedIn URL", api_slug: "linkedin_url", type: "text" },
     { title: "Lead Source", api_slug: "lead_source", type: "text" },
     { title: "Industry", api_slug: "industry", type: "text" },
   ];
@@ -200,47 +199,51 @@ export async function findContact(email: string): Promise<{ id: string } | null>
 }
 
 export async function createContact(contact: AttioContact & { title?: string; lead_source?: string; industry?: string }): Promise<string> {
-  // Build core values (built-in Attio fields that always exist)
-  const coreValues: Record<string, unknown> = {};
+  // Build values using correct Attio field formats
+  // (from /api/debug/test-attio-write: company=record-reference, job_title=text, linkedin=text)
+  const values: Record<string, unknown> = {};
+
   if (contact.email && contact.email !== "unknown" && contact.email.includes("@")) {
-    coreValues.email_addresses = [{ email_address: contact.email }];
+    values.email_addresses = [{ email_address: contact.email }];
   }
   if (contact.first_name || contact.last_name) {
-    coreValues.name = [{
+    values.name = [{
       first_name: contact.first_name || "",
       last_name: contact.last_name || "",
       full_name: `${contact.first_name || ""} ${contact.last_name || ""}`.trim(),
     }];
   }
-  if (contact.phone) coreValues.phone_numbers = [{ original_phone_number: contact.phone }];
+  if (contact.phone) values.phone_numbers = [{ original_phone_number: contact.phone }];
 
-  // Custom fields use Attio's value format: [{ value: "..." }]
-  const customValues: Record<string, unknown> = {};
-  if (contact.company) customValues.company = [{ value: contact.company }];
-  if (contact.linkedin_url) customValues.linkedin_url = [{ value: contact.linkedin_url }];
-  if (contact.title) customValues.job_title = [{ value: contact.title }];
-  if (contact.lead_source) customValues.lead_source = [{ value: contact.lead_source }];
-  if (contact.industry) customValues.industry = [{ value: contact.industry }];
+  // Built-in text fields (these already exist on People object)
+  if (contact.title) values.job_title = contact.title;
+  if (contact.linkedin_url) values.linkedin = contact.linkedin_url;
 
-  let result: { data: { id: { record_id: string } } };
-  try {
-    result = (await attioFetch("/objects/people/records", {
-      method: "POST",
-      body: JSON.stringify({ data: { values: { ...coreValues, ...customValues } } }),
-    })) as { data: { id: { record_id: string } } };
-  } catch (err) {
-    // Custom fields might not exist — retry with core fields only
-    logger.warn("Contact creation failed with custom fields, retrying core-only", {
-      error: String(err),
-      email: contact.email,
-    });
-    result = (await attioFetch("/objects/people/records", {
-      method: "POST",
-      body: JSON.stringify({ data: { values: coreValues } }),
-    })) as { data: { id: { record_id: string } } };
+  // "company" is a record-reference — must create/find company record first
+  let companyId: string | null = null;
+  if (contact.company) {
+    try {
+      companyId = await findOrCreateCompany(contact.company);
+      values.company = [{ target_object: "companies", target_record_id: companyId }];
+    } catch (err) {
+      logger.warn("Could not create/find company, skipping company field", {
+        company: contact.company,
+        error: String(err),
+      });
+    }
   }
 
-  logger.info("Created Attio contact", { email: contact.email, id: result.data.id.record_id });
+  const result = (await attioFetch("/objects/people/records", {
+    method: "POST",
+    body: JSON.stringify({ data: { values } }),
+  })) as { data: { id: { record_id: string } } };
+
+  logger.info("Created Attio contact", {
+    email: contact.email,
+    name: `${contact.first_name} ${contact.last_name}`,
+    company: contact.company,
+    id: result.data.id.record_id,
+  });
   return result.data.id.record_id;
 }
 
@@ -364,7 +367,7 @@ export async function createDeal(deal: AttioDeal & { value?: number; term_months
     entryValues.term_length = [{ value: deal.term_months }];
   }
 
-  // Try with stage + custom fields, progressively fall back
+  // entry_values MUST be an object (not undefined) — Attio requires it
   let result: { data: { entry_id: string } };
   try {
     result = (await attioFetch(`/lists/${pipelineId}/entries`, {
@@ -373,14 +376,14 @@ export async function createDeal(deal: AttioDeal & { value?: number; term_months
         data: {
           parent_object: "people",
           parent_record_id: deal.contact_id,
-          entry_values: Object.keys(entryValues).length > 0 ? entryValues : undefined,
+          entry_values: entryValues,
           current_status_title: stageName,
         },
       }),
     })) as { data: { entry_id: string } };
   } catch (err) {
-    // Try without custom entry_values (they might not exist as pipeline attributes)
-    logger.warn("Deal creation failed, retrying without custom values", {
+    // Custom entry_values or stage might not exist — try with just empty values + stage
+    logger.warn("Deal creation failed, retrying with empty values", {
       stage: stageName,
       error: String(err),
     });
@@ -391,12 +394,13 @@ export async function createDeal(deal: AttioDeal & { value?: number; term_months
           data: {
             parent_object: "people",
             parent_record_id: deal.contact_id,
+            entry_values: {},
             current_status_title: stageName,
           },
         }),
       })) as { data: { entry_id: string } };
     } catch (err2) {
-      // Stage name might not exist either — bare minimum
+      // Stage name might not exist either — bare minimum with empty entry_values
       logger.warn("Deal creation failed with stage too, retrying bare minimum", {
         stage: stageName,
         error: String(err2),
@@ -407,6 +411,7 @@ export async function createDeal(deal: AttioDeal & { value?: number; term_months
           data: {
             parent_object: "people",
             parent_record_id: deal.contact_id,
+            entry_values: {},
           },
         }),
       })) as { data: { entry_id: string } };
