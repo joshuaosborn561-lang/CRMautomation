@@ -535,6 +535,103 @@ app.post("/api/re-enrich", async (_req, res) => {
   }
 });
 
+// Re-enrich zoom_meeting events: fetch transcripts and AI summaries from Zoom API
+app.post("/api/re-enrich-meetings", async (_req, res) => {
+  try {
+    const { getSupabase } = await import("./utils/supabase");
+    const zoomService = await import("./services/zoom");
+    const supabase = getSupabase();
+
+    const { data: events } = await supabase
+      .from("webhook_events")
+      .select("id, payload, event_type")
+      .eq("source", "zoom_meeting")
+      .neq("event_type", "unknown");
+
+    let transcriptFound = 0;
+    let aiSummaryFound = 0;
+    let noData = 0;
+    let alreadyHad = 0;
+    const results: Array<{ id: string; topic: string; transcript: boolean; ai_summary: boolean; status: string }> = [];
+
+    for (const event of events || []) {
+      const obj = (event.payload?.payload as Record<string, unknown>)?.object as Record<string, unknown> | undefined;
+      const meetingId = obj?.id || obj?.uuid;
+      const topic = (obj?.topic || "unknown") as string;
+
+      if (!meetingId) {
+        results.push({ id: event.id, topic, transcript: false, ai_summary: false, status: "no_meeting_id" });
+        noData++;
+        continue;
+      }
+
+      // Skip if already has transcript
+      if (event.payload?.transcript) {
+        alreadyHad++;
+        continue;
+      }
+
+      try {
+        // Fetch transcript and AI summary in parallel
+        const [transcript, aiSummary] = await Promise.all([
+          zoomService.getMeetingTranscript(String(meetingId)),
+          zoomService.getMeetingSummary(String(meetingId)),
+        ]);
+
+        const updates: Record<string, unknown> = {};
+        let hasUpdate = false;
+
+        if (transcript) {
+          updates.transcript = transcript;
+          transcriptFound++;
+          hasUpdate = true;
+        }
+        if (aiSummary?.summary_url) {
+          updates.zoom_ai_summary_url = aiSummary.summary_url;
+          aiSummaryFound++;
+          hasUpdate = true;
+        }
+        if (aiSummary?.summary) {
+          updates.zoom_ai_summary = aiSummary.summary;
+          hasUpdate = true;
+        }
+
+        if (hasUpdate) {
+          await supabase
+            .from("webhook_events")
+            .update({ payload: { ...event.payload, ...updates }, processed: false, processed_at: null })
+            .eq("id", event.id);
+        }
+
+        results.push({
+          id: event.id,
+          topic,
+          transcript: !!transcript,
+          ai_summary: !!aiSummary?.summary_url,
+          status: hasUpdate ? "updated" : "no_transcript_found",
+        });
+
+        if (!hasUpdate) noData++;
+      } catch (err) {
+        results.push({ id: event.id, topic, transcript: false, ai_summary: false, status: `error: ${String(err)}` });
+        noData++;
+      }
+    }
+
+    res.json({
+      message: `Meeting re-enrichment complete. ${transcriptFound} transcripts, ${aiSummaryFound} AI summaries found.`,
+      transcriptFound,
+      aiSummaryFound,
+      alreadyHad,
+      noData,
+      total: events?.length || 0,
+      sample_results: results.slice(0, 20),
+    });
+  } catch (err) {
+    res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+  }
+});
+
 // One-time setup: create custom Attio pipeline attributes if they don't exist
 app.get("/api/setup-attio-fields", async (_req, res) => {
   try {
