@@ -448,7 +448,7 @@ app.get("/api/debug/test-attio-write", async (_req, res) => {
       });
       if (resp.ok) {
         const data = await resp.json() as { data: Array<{ api_slug: string; title: string; type: string; id: string; is_required: boolean }> };
-        const attrs = data.data?.map(a => `${a.api_slug} (${a.type}${a.is_required ? ", REQUIRED" : ""}) [${a.id?.substring(0,8)}]`).join(", ");
+        const attrs = data.data?.map(a => `${a.api_slug} (${a.type}${a.is_required ? ", REQUIRED" : ""}) [${typeof a.id === 'string' ? a.id.substring(0,8) : JSON.stringify(a.id).substring(0,30)}]`).join(", ");
         steps.push({ step: `list_${obj}_attributes`, status: "OK", details: attrs });
       } else {
         steps.push({ step: `list_${obj}_attributes`, status: "FAIL", details: { http: resp.status } });
