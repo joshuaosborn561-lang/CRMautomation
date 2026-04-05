@@ -290,11 +290,14 @@ export async function createContact(contact: AttioContact & { title?: string; le
   if (contact.title) values.job_title = contact.title;
   if (contact.linkedin_url) values.linkedin = contact.linkedin_url;
 
+  // Custom text fields (created by ensureAttioFieldsExist)
+  if (contact.lead_source) values.lead_source = contact.lead_source;
+  if (contact.industry) values.industry = contact.industry;
+
   // "company" is a record-reference — must create/find company record first
-  let companyId: string | null = null;
   if (contact.company) {
     try {
-      companyId = await findOrCreateCompany(contact.company);
+      const companyId = await findOrCreateCompany(contact.company);
       values.company = [{ target_object: "companies", target_record_id: companyId }];
     } catch (err) {
       logger.warn("Could not create/find company, skipping company field", {
@@ -312,6 +315,19 @@ export async function createContact(contact: AttioContact & { title?: string; le
     data.matching_attribute = "email_addresses";
   }
 
+  logger.info("Creating/upserting Attio contact with values", {
+    email: contact.email,
+    name: `${contact.first_name} ${contact.last_name}`,
+    company: contact.company,
+    title: contact.title,
+    linkedin: contact.linkedin_url,
+    phone: contact.phone,
+    lead_source: contact.lead_source,
+    hasEmail: !!values.email_addresses,
+    hasCompany: !!values.company,
+    fieldCount: Object.keys(values).length,
+  });
+
   const result = (await attioFetch("/objects/people/records", {
     method: "POST",
     body: JSON.stringify({ data }),
@@ -320,7 +336,6 @@ export async function createContact(contact: AttioContact & { title?: string; le
   logger.info("Upserted Attio contact", {
     email: contact.email,
     name: `${contact.first_name} ${contact.last_name}`,
-    company: contact.company,
     id: result.data.id.record_id,
   });
   return result.data.id.record_id;
@@ -351,7 +366,8 @@ export async function findOrCreateContact(contact: AttioContact & { title?: stri
   if (contact.email && contact.email !== "unknown") {
     const existing = await findContact(contact.email);
     if (existing) {
-      logger.info("Found existing Attio contact by email", { email: contact.email, id: existing.id });
+      logger.info("Found existing Attio contact by email — updating with enrichment data", { email: contact.email, id: existing.id });
+      await updateExistingContact(existing.id, contact);
       return existing.id;
     }
   }
@@ -360,15 +376,59 @@ export async function findOrCreateContact(contact: AttioContact & { title?: stri
   if (contact.first_name && contact.last_name) {
     const existing = await findContactByName(contact.first_name, contact.last_name);
     if (existing) {
-      logger.info("Found existing Attio contact by name", {
+      logger.info("Found existing Attio contact by name — updating with enrichment data", {
         name: `${contact.first_name} ${contact.last_name}`,
         id: existing.id,
       });
+      await updateExistingContact(existing.id, contact);
       return existing.id;
     }
   }
 
   return createContact(contact);
+}
+
+// Update an existing contact with any new data we have (fill blanks, don't overwrite)
+async function updateExistingContact(
+  recordId: string,
+  contact: AttioContact & { title?: string; lead_source?: string; industry?: string }
+): Promise<void> {
+  const values: Record<string, unknown> = {};
+
+  // Add email if we have one (existing contact might not have had it)
+  if (contact.email && contact.email !== "unknown" && contact.email.includes("@")) {
+    values.email_addresses = [{ email_address: contact.email }];
+  }
+  if (contact.phone) values.phone_numbers = [{ original_phone_number: contact.phone }];
+  if (contact.title) values.job_title = contact.title;
+  if (contact.linkedin_url) values.linkedin = contact.linkedin_url;
+  if (contact.lead_source) values.lead_source = contact.lead_source;
+  if (contact.industry) values.industry = contact.industry;
+
+  // Company as record-reference
+  if (contact.company) {
+    try {
+      const companyId = await findOrCreateCompany(contact.company);
+      values.company = [{ target_object: "companies", target_record_id: companyId }];
+    } catch (err) {
+      logger.warn("Could not set company on update", { error: String(err) });
+    }
+  }
+
+  if (Object.keys(values).length === 0) return;
+
+  try {
+    await attioFetch(`/objects/people/records/${recordId}`, {
+      method: "PATCH",
+      body: JSON.stringify({ data: { values } }),
+    });
+    logger.info("Updated existing contact with enrichment data", {
+      recordId,
+      updatedFields: Object.keys(values),
+    });
+  } catch (err) {
+    logger.warn("Failed to update existing contact", { recordId, error: String(err) });
+  }
 }
 
 // --- Companies ---

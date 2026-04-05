@@ -1408,7 +1408,49 @@ app.post("/api/full-rebuild", async (_req, res) => {
           } catch { /* continue */ }
         }
       }
-      rebuildStatus.steps.push({ step: "cleanup_attio", status: "done", details: { peopleDeleted, dealsDeleted } });
+      // Also delete deal records (not just pipeline entries)
+      let dealRecordsDeleted = 0;
+      while (true) {
+        const resp = await fetch("https://api.attio.com/v2/objects/deals/records/query", {
+          method: "POST",
+          headers: { Authorization: `Bearer ${config.ATTIO_API_KEY}`, "Content-Type": "application/json" },
+          body: JSON.stringify({ limit: 50 }),
+        });
+        if (!resp.ok) break;
+        const data = await resp.json() as { data: Array<Record<string, unknown>> };
+        if (!data.data || data.data.length === 0) break;
+        for (const deal of data.data) {
+          const id = (deal.id as Record<string, string>)?.record_id;
+          try {
+            await fetch(`https://api.attio.com/v2/objects/deals/records/${id}`, {
+              method: "DELETE", headers: { Authorization: `Bearer ${config.ATTIO_API_KEY}` },
+            });
+            dealRecordsDeleted++;
+          } catch { /* continue */ }
+        }
+      }
+      // Also delete companies to start fresh
+      let companiesDeleted = 0;
+      while (true) {
+        const resp = await fetch("https://api.attio.com/v2/objects/companies/records/query", {
+          method: "POST",
+          headers: { Authorization: `Bearer ${config.ATTIO_API_KEY}`, "Content-Type": "application/json" },
+          body: JSON.stringify({ limit: 50 }),
+        });
+        if (!resp.ok) break;
+        const data = await resp.json() as { data: Array<Record<string, unknown>> };
+        if (!data.data || data.data.length === 0) break;
+        for (const company of data.data) {
+          const id = (company.id as Record<string, string>)?.record_id;
+          try {
+            await fetch(`https://api.attio.com/v2/objects/companies/records/${id}`, {
+              method: "DELETE", headers: { Authorization: `Bearer ${config.ATTIO_API_KEY}` },
+            });
+            companiesDeleted++;
+          } catch { /* continue */ }
+        }
+      }
+      rebuildStatus.steps.push({ step: "cleanup_attio", status: "done", details: { peopleDeleted, dealsDeleted, dealRecordsDeleted, companiesDeleted } });
 
       // Step 2: Clear interaction log
       await supabase.from("interaction_log").delete().neq("id", "00000000-0000-0000-0000-000000000000");
@@ -1489,7 +1531,7 @@ app.get("/api/rebuild-status", async (_req, res) => {
     const peopleResp = await fetch("https://api.attio.com/v2/objects/people/records/query", {
       method: "POST",
       headers: { Authorization: `Bearer ${config.ATTIO_API_KEY}`, "Content-Type": "application/json" },
-      body: JSON.stringify({ limit: 1 }),
+      body: JSON.stringify({ limit: 500 }),
     });
     if (peopleResp.ok) {
       const p = await peopleResp.json() as { data: unknown[] };
