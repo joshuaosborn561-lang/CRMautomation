@@ -195,6 +195,28 @@ zoomRouter.post("/", async (req: Request, res: Response) => {
         if (transcript) enrichedPayload.transcript = transcript;
         if (aiSummary?.summary_url) enrichedPayload.zoom_ai_summary_url = aiSummary.summary_url;
         if (aiSummary?.summary) enrichedPayload.zoom_ai_summary = aiSummary.summary;
+
+        // Extract external attendee emails from the meeting payload
+        // (topic, agenda, participants, invitees) — skip any that match our own workspace
+        const obj = (payload.payload as Record<string, unknown>)?.object as Record<string, unknown> | undefined;
+        const ownDomain = (process.env.OWN_EMAIL_DOMAIN || "").toLowerCase();
+        const blob = JSON.stringify({
+          topic: obj?.topic,
+          agenda: obj?.agenda,
+          participants: obj?.participant || obj?.participants,
+          invitees: obj?.invitees,
+          host_email: obj?.host_email,
+          transcript,
+          summary: aiSummary?.summary,
+        });
+        const emailRe = /[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/g;
+        const found = Array.from(new Set((blob.match(emailRe) || []).map(e => e.toLowerCase())))
+          .filter(e => !ownDomain || !e.endsWith(`@${ownDomain}`))
+          .filter(e => !e.includes("@zoom.us"));
+        if (found.length > 0) {
+          enrichedPayload.extracted_emails = found;
+          logger.info("Extracted attendee emails from Zoom meeting", { meetingId, emails: found });
+        }
       }
     }
 

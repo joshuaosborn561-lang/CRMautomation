@@ -16,6 +16,8 @@ import {
   updateDealStage,
   createNote,
   createTask,
+  setPersonDescription,
+  setDealDescription,
 } from "../services/attio";
 import { enrichContact } from "../services/leadmagic";
 import type { AIProcessingResult, WebhookEvent, EventSource } from "@crm-autopilot/shared";
@@ -103,6 +105,13 @@ async function processSingleEvent(event: WebhookEvent): Promise<void> {
       result.contact.last_name = parts.slice(1).join(" ") || undefined;
     }
   }
+  // Use any emails we extracted from the Zoom meeting payload (attendees/description/transcript)
+  const extractedEmails = event.payload?.extracted_emails as string[] | undefined;
+  if (extractedEmails && extractedEmails.length > 0 && (!result.contact.email || result.contact.email === "unknown")) {
+    result.contact.email = extractedEmails[0];
+    logger.info("Using extracted email from Zoom payload", { email: extractedEmails[0] });
+  }
+
   if (event.source === "zoom_meeting") {
     const obj = (event.payload?.payload as Record<string, unknown>)?.object as Record<string, unknown> | undefined;
     const topic = (obj?.topic || "") as string;
@@ -246,7 +255,7 @@ export async function applyToAttio(
     if (existingDeal) {
       await updateDealStage(existingDeal.id, result.deal.stage);
       const t = `[${result.note.sentiment.toUpperCase()}] ${result.deal.stage_reason}`;
-      const b = buildNoteContent(result);
+      const b = buildNoteContent(result, rawPayload);
       await createNote({
         parent_object: "deals",
         parent_id: existingDeal.id,
@@ -258,6 +267,9 @@ export async function applyToAttio(
       } catch (err) {
         logger.warn("Person note creation failed", { contactId, error: String(err) });
       }
+      const descText = `${t}\n\n${b}`.slice(0, 4000);
+      await setPersonDescription(contactId, descText);
+      await setDealDescription(existingDeal.id, descText);
       if (result.task) {
         await createTask({
           title: result.task.title,
@@ -281,19 +293,50 @@ export async function applyToAttio(
 
   // --- LEAD SOURCE: Create new contacts and deals ---
 
-  // Apollo enrichment: fill in missing email/phone/linkedin/title before creating the contact.
+  // Apollo enrichment: try multiple strategies to find the person and backfill all fields.
   if (!contact.email || !contact.phone || !contact.linkedin_url || !contact.title) {
     try {
-      const domain = contact.email?.split("@")[1];
-      const apolloResult = await apolloEnrich({
-        email: contact.email,
-        first_name: contact.first_name,
-        last_name: contact.last_name,
-        name: contact.first_name && contact.last_name ? `${contact.first_name} ${contact.last_name}` : undefined,
-        domain,
-        organization_name: contact.company,
-        linkedin_url: contact.linkedin_url,
-      });
+      let apolloResult = null;
+      // Strategy 1: email (most precise)
+      if (contact.email) {
+        apolloResult = await apolloEnrich({ email: contact.email });
+      }
+      // Strategy 2: name + company domain
+      if (!apolloResult && contact.first_name && contact.last_name) {
+        const domain = contact.email?.split("@")[1];
+        apolloResult = await apolloEnrich({
+          first_name: contact.first_name,
+          last_name: contact.last_name,
+          name: `${contact.first_name} ${contact.last_name}`,
+          domain,
+          organization_name: contact.company,
+          linkedin_url: contact.linkedin_url,
+        });
+      }
+      // Strategy 3: phone-based search → take first result's id → match
+      if (!apolloResult && contact.phone) {
+        const { searchContactByPhone } = await import("../services/apollo");
+        const found = await searchContactByPhone(contact.phone);
+        if (found) {
+          apolloResult = await apolloEnrich({
+            email: found.email,
+            first_name: found.first_name,
+            last_name: found.last_name,
+            organization_name: found.company,
+            linkedin_url: found.linkedin_url,
+          });
+          // If /people/match returns nothing, at least use the search hit
+          if (!apolloResult) apolloResult = found;
+        }
+      }
+      // Strategy 4: company-only fallback (useful when we only know the company from a meeting topic)
+      if (!apolloResult && contact.company && contact.first_name) {
+        apolloResult = await apolloEnrich({
+          first_name: contact.first_name,
+          last_name: contact.last_name || "",
+          organization_name: contact.company,
+        });
+      }
       if (apolloResult) {
         contact.email = contact.email || apolloResult.email;
         contact.phone = contact.phone || apolloResult.phone;
@@ -305,6 +348,14 @@ export async function applyToAttio(
           gotEmail: !!apolloResult.email,
           gotPhone: !!apolloResult.phone,
           gotLinkedin: !!apolloResult.linkedin_url,
+          gotTitle: !!apolloResult.title,
+        });
+      } else {
+        logger.warn("Apollo found nothing for contact", {
+          name: `${contact.first_name} ${contact.last_name}`,
+          email: contact.email,
+          phone: contact.phone,
+          company: contact.company,
         });
       }
     } catch (err) {
@@ -374,6 +425,11 @@ export async function applyToAttio(
     logger.warn("Person note creation failed", { contactId, error: String(err) });
   }
 
+  // Also mirror the note into the Description field so it shows up in list/table views.
+  const descriptionText = `${noteTitle}\n\n${noteBody}`.slice(0, 4000);
+  await setPersonDescription(contactId, descriptionText);
+  if (dealId) await setDealDescription(dealId, descriptionText);
+
   // 4. Create a follow-up task if warranted (non-fatal)
   if (result.task && dealId) {
     try {
@@ -397,17 +453,22 @@ export async function applyToAttio(
 }
 
 function buildNoteContent(result: AIProcessingResult, rawPayload?: Record<string, unknown>): string {
-  let content = result.note.summary;
+  let content = result.note.summary || "";
 
-  // Add Zoom AI companion doc link if available
+  // Always append the Zoom meeting join URL when we can derive one
+  const zoomObj = (rawPayload?.payload as Record<string, unknown>)?.object as Record<string, unknown> | undefined;
+  if (zoomObj?.id) {
+    content += `\n\nZoom Meeting: https://zoom.us/j/${zoomObj.id}`;
+  }
+
+  // Append Zoom AI Companion summary URL (clickable link to the AI recap)
   if (rawPayload?.zoom_ai_summary_url) {
-    content += `\n\nZoom AI Summary: ${rawPayload.zoom_ai_summary_url}`;
-  } else {
-    // Fallback: construct URL from meeting ID
-    const zoomObj = (rawPayload?.payload as Record<string, unknown>)?.object as Record<string, unknown> | undefined;
-    if (zoomObj?.id) {
-      content += `\n\nZoom Meeting: https://zoom.us/j/${zoomObj.id}`;
-    }
+    content += `\n\nZoom AI Companion Summary: ${rawPayload.zoom_ai_summary_url}`;
+  }
+
+  // Append the Zoom AI summary text itself if provided
+  if (rawPayload?.zoom_ai_summary) {
+    content += `\n\n--- Zoom AI Summary ---\n${rawPayload.zoom_ai_summary}`;
   }
 
   if (result.note.pricing_discussed) {

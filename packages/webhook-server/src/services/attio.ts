@@ -801,6 +801,30 @@ export async function updateDealStage(dealRecordId: string, stage: DealStage): P
   }
 }
 
+// --- Description helpers (writes to the built-in Description field so it's visible in table view) ---
+
+export async function setPersonDescription(recordId: string, description: string): Promise<void> {
+  try {
+    await attioFetch(`/objects/people/records/${recordId}`, {
+      method: "PATCH",
+      body: JSON.stringify({ data: { values: { description } } }),
+    });
+  } catch (err) {
+    logger.warn("Failed to set person description", { recordId, error: String(err) });
+  }
+}
+
+export async function setDealDescription(recordId: string, description: string): Promise<void> {
+  try {
+    await attioFetch(`/objects/deals/records/${recordId}`, {
+      method: "PATCH",
+      body: JSON.stringify({ data: { values: { description } } }),
+    });
+  } catch (err) {
+    logger.warn("Failed to set deal description", { recordId, error: String(err) });
+  }
+}
+
 // --- Notes ---
 export async function createNote(note: AttioNote): Promise<void> {
     const parentObject = note.parent_object === "contacts" ? "people" : note.parent_object;
