@@ -153,7 +153,7 @@ export interface AttioDeal {
 }
 
 export interface AttioNote {
-  parent_object: "deals" | "contacts";
+  parent_object: "deals" | "contacts" | "people";
   parent_id: string;
   title: string;
   content: string;

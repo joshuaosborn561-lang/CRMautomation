@@ -369,13 +369,12 @@ function normalizeName(name: string): string {
     return name.trim().toLowerCase().replace(/\b\w/g, c => c.toUpperCase());
 }
 
-export async function findContactByName(firstName: string, lastName: string): Promise<{ id: string } | null> {
+export async function findContactByName(firstName: string, lastName: string): Promise<{ id: string; hasEmail: boolean } | null> {
     const searchName = normalizeName(`${firstName} ${lastName}`.trim());
     if (!searchName) return null;
 
   try {
-        // Fetch all and match in code — avoids Attio's name filter syntax issues
-      const result = (await attioFetch("/objects/people/records/query", {
+        const result = (await attioFetch("/objects/people/records/query", {
               method: "POST",
               body: JSON.stringify({ limit: 500 }),
       })) as { data: Array<{ id: { record_id: string }; values: Record<string, unknown> }> };
@@ -387,7 +386,8 @@ export async function findContactByName(firstName: string, lastName: string): Pr
                           for (const nv of nameValues) {
                                       const fullName = (nv.full_name || `${nv.first_name || ""} ${nv.last_name || ""}`).trim().toLowerCase();
                                       if (fullName === searchLower) {
-                                                    return { id: person.id.record_id };
+                                                    const emails = person.values?.email_addresses as Array<unknown> | undefined;
+                                                    return { id: person.id.record_id, hasEmail: !!(emails && emails.length > 0) };
                                       }
                           }
                 }
@@ -403,19 +403,37 @@ const _contactCacheByEmail = new Map<string, string>();
 const _contactCacheByName = new Map<string, string>();
 
 export async function findOrCreateContact(contact: AttioContact & { title?: string; lead_source?: string; industry?: string }): Promise<string> {
-    const email = contact.email && contact.email !== "unknown" ? contact.email.toLowerCase() : null;
+    const email = contact.email && contact.email !== "unknown" && contact.email.includes("@") ? contact.email.toLowerCase() : null;
     const fullName = contact.first_name && contact.last_name
       ? normalizeName(`${contact.first_name} ${contact.last_name}`)
           : null;
 
-  // Check in-memory cache first
-  if (email && _contactCacheByEmail.has(email)) {
-        const cachedId = _contactCacheByEmail.get(email)!;
-        logger.info("Contact found in cache by email", { email, id: cachedId });
-        await updateExistingContact(cachedId, contact);
-        return cachedId;
+  // RULE: email is ground truth. If we have an email, ONLY match by email.
+  // Two records with different emails are ALWAYS different people, even if names match.
+  if (email) {
+        if (_contactCacheByEmail.has(email)) {
+              const cachedId = _contactCacheByEmail.get(email)!;
+              logger.info("Contact found in cache by email", { email, id: cachedId });
+              await updateExistingContact(cachedId, contact);
+              return cachedId;
+        }
+        const existing = await findContact(email);
+        if (existing) {
+              logger.info("Found existing Attio contact by email — updating", { email, id: existing.id });
+              _contactCacheByEmail.set(email, existing.id);
+              if (fullName) _contactCacheByName.set(fullName, existing.id);
+              await updateExistingContact(existing.id, contact);
+              return existing.id;
+        }
+        // Email provided but not found anywhere → create new. Do NOT name-match.
+        const newId = await createContact(contact);
+        _contactCacheByEmail.set(email, newId);
+        if (fullName) _contactCacheByName.set(fullName, newId);
+        return newId;
   }
 
+  // No email → fall back to name matching, but only to records that ALSO have no email
+  // (so we don't silently merge a no-email new contact onto someone with a different email).
   if (fullName && _contactCacheByName.has(fullName)) {
         const cachedId = _contactCacheByName.get(fullName)!;
         logger.info("Contact found in cache by name", { name: fullName, id: cachedId });
@@ -423,33 +441,21 @@ export async function findOrCreateContact(contact: AttioContact & { title?: stri
         return cachedId;
   }
 
-  // Try finding by email in Attio
-  if (email) {
-        const existing = await findContact(email);
-        if (existing) {
-                logger.info("Found existing Attio contact by email — updating", { email, id: existing.id });
-                _contactCacheByEmail.set(email, existing.id);
-                if (fullName) _contactCacheByName.set(fullName, existing.id);
-                await updateExistingContact(existing.id, contact);
-                return existing.id;
-        }
-  }
-
-  // Try finding by name in Attio
   if (contact.first_name && contact.last_name) {
         const existing = await findContactByName(contact.first_name, contact.last_name);
-        if (existing) {
-                logger.info("Found existing Attio contact by name — updating", { name: fullName, id: existing.id });
-                if (email) _contactCacheByEmail.set(email, existing.id);
-                if (fullName) _contactCacheByName.set(fullName, existing.id);
-                await updateExistingContact(existing.id, contact);
-                        return existing.id;
+        if (existing && !existing.hasEmail) {
+              logger.info("Found existing Attio contact by name (no email conflict) — updating", { name: fullName, id: existing.id });
+              if (fullName) _contactCacheByName.set(fullName, existing.id);
+              await updateExistingContact(existing.id, contact);
+              return existing.id;
+        }
+        if (existing && existing.hasEmail) {
+              logger.info("Name match found but existing record has email — creating new record to avoid merging different people", { name: fullName });
         }
   }
 
   // Create new contact
   const newId = await createContact(contact);
-    if (email) _contactCacheByEmail.set(email, newId);
     if (fullName) _contactCacheByName.set(fullName, newId);
     return newId;
 }

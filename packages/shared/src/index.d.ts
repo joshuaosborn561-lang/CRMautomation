@@ -94,9 +94,10 @@ export interface AttioDeal {
     contact_id: string;
     company?: string;
     value?: number;
+    term_months?: number;
 }
 export interface AttioNote {
-    parent_object: "deals" | "contacts";
+    parent_object: "deals" | "contacts" | "people";
     parent_id: string;
     title: string;
     content: string;

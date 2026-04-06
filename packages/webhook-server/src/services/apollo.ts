@@ -98,6 +98,52 @@ export async function searchContactByPhone(phone: string): Promise<ApolloContact
 }
 
 /**
+ * Enrich a person via Apollo People Match (the real enrichment endpoint).
+ * Uses reveal flags to return personal email and phone numbers.
+ * Accepts any combination of: email, name+domain, name+company, linkedin_url.
+ */
+export async function enrichPerson(input: {
+  email?: string;
+  first_name?: string;
+  last_name?: string;
+  name?: string;
+  domain?: string;
+  organization_name?: string;
+  linkedin_url?: string;
+}): Promise<ApolloContact | null> {
+  const body: Record<string, unknown> = {
+    reveal_personal_emails: true,
+    reveal_phone_number: true,
+  };
+  if (input.email) body.email = input.email;
+  if (input.first_name) body.first_name = input.first_name;
+  if (input.last_name) body.last_name = input.last_name;
+  if (input.name) body.name = input.name;
+  if (input.domain) body.domain = input.domain;
+  if (input.organization_name) body.organization_name = input.organization_name;
+  if (input.linkedin_url) body.linkedin_url = input.linkedin_url;
+
+  const result = (await apolloFetch("/people/match", body)) as { person?: Record<string, unknown> } | null;
+  const p = result?.person;
+  if (!p) return null;
+
+  const org = p.organization as Record<string, unknown> | undefined;
+  const phones = p.phone_numbers as Array<{ sanitized_number?: string; raw_number?: string }> | undefined;
+  const phone = phones && phones.length > 0 ? (phones[0].sanitized_number || phones[0].raw_number) : undefined;
+
+  return {
+    email: (p.email || p.personal_email) as string | undefined,
+    first_name: p.first_name as string | undefined,
+    last_name: p.last_name as string | undefined,
+    name: p.name as string | undefined,
+    title: p.title as string | undefined,
+    company: (org?.name || p.organization_name) as string | undefined,
+    linkedin_url: p.linkedin_url as string | undefined,
+    phone: phone as string | undefined,
+  };
+}
+
+/**
  * Search for a person by name in Apollo's database.
  */
 export async function searchContactByName(

@@ -1,6 +1,7 @@
 import { getConfig } from "../config";
 import { logger } from "../utils/logger";
 import { processEvent } from "./ai-processor";
+import { enrichPerson as apolloEnrich } from "../services/apollo";
 import {
   getUnprocessedEvents,
   markEventProcessed,
@@ -244,12 +245,19 @@ export async function applyToAttio(
     const existingDeal = await findDealByContact(contactId);
     if (existingDeal) {
       await updateDealStage(existingDeal.id, result.deal.stage);
+      const t = `[${result.note.sentiment.toUpperCase()}] ${result.deal.stage_reason}`;
+      const b = buildNoteContent(result);
       await createNote({
         parent_object: "deals",
         parent_id: existingDeal.id,
-        title: `[${result.note.sentiment.toUpperCase()}] ${result.deal.stage_reason}`,
-        content: buildNoteContent(result),
+        title: t,
+        content: b,
       });
+      try {
+        await createNote({ parent_object: "people", parent_id: contactId, title: t, content: b });
+      } catch (err) {
+        logger.warn("Person note creation failed", { contactId, error: String(err) });
+      }
       if (result.task) {
         await createTask({
           title: result.task.title,
@@ -273,8 +281,36 @@ export async function applyToAttio(
 
   // --- LEAD SOURCE: Create new contacts and deals ---
 
-  // LeadMagic enrichment DISABLED to save credits.
-  // Apollo enrichment happens in /api/re-enrich-apollo or /api/full-rebuild instead.
+  // Apollo enrichment: fill in missing email/phone/linkedin/title before creating the contact.
+  if (!contact.email || !contact.phone || !contact.linkedin_url || !contact.title) {
+    try {
+      const domain = contact.email?.split("@")[1];
+      const apolloResult = await apolloEnrich({
+        email: contact.email,
+        first_name: contact.first_name,
+        last_name: contact.last_name,
+        name: contact.first_name && contact.last_name ? `${contact.first_name} ${contact.last_name}` : undefined,
+        domain,
+        organization_name: contact.company,
+        linkedin_url: contact.linkedin_url,
+      });
+      if (apolloResult) {
+        contact.email = contact.email || apolloResult.email;
+        contact.phone = contact.phone || apolloResult.phone;
+        contact.linkedin_url = contact.linkedin_url || apolloResult.linkedin_url;
+        contact.title = contact.title || apolloResult.title;
+        contact.company = contact.company || apolloResult.company;
+        logger.info("Apollo enrichment applied", {
+          name: `${contact.first_name} ${contact.last_name}`,
+          gotEmail: !!apolloResult.email,
+          gotPhone: !!apolloResult.phone,
+          gotLinkedin: !!apolloResult.linkedin_url,
+        });
+      }
+    } catch (err) {
+      logger.warn("Apollo enrichment failed", { error: String(err) });
+    }
+  }
 
   // 1. Find or create the contact in Attio
   const contactId = await findOrCreateContact({
@@ -312,18 +348,30 @@ export async function applyToAttio(
     });
   }
 
-  // 3. Log a note on the deal (non-fatal)
+  // 3. Log a note on BOTH the deal and the person (non-fatal)
+  const noteTitle = `[${result.note.sentiment.toUpperCase()}] ${result.deal.stage_reason}`;
+  const noteBody = buildNoteContent(result, rawPayload);
   if (dealId) {
     try {
       await createNote({
         parent_object: "deals",
         parent_id: dealId,
-        title: `[${result.note.sentiment.toUpperCase()}] ${result.deal.stage_reason}`,
-        content: buildNoteContent(result, rawPayload),
+        title: noteTitle,
+        content: noteBody,
       });
     } catch (err) {
-      logger.warn("Note creation failed", { dealId, error: String(err) });
+      logger.warn("Deal note creation failed", { dealId, error: String(err) });
     }
+  }
+  try {
+    await createNote({
+      parent_object: "people",
+      parent_id: contactId,
+      title: noteTitle,
+      content: noteBody,
+    });
+  } catch (err) {
+    logger.warn("Person note creation failed", { contactId, error: String(err) });
   }
 
   // 4. Create a follow-up task if warranted (non-fatal)
