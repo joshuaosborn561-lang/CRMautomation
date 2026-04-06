@@ -74,41 +74,58 @@ export async function processEvent(event: WebhookEvent): Promise<AIProcessingRes
 
   const userPrompt = buildPrompt(event);
 
-  const result = await model.generateContent({
-    contents: [{ role: "user", parts: [{ text: userPrompt }] }],
-    systemInstruction: { role: "model", parts: [{ text: SYSTEM_PROMPT }] },
-    generationConfig: {
-      maxOutputTokens: 1024,
-      temperature: 0.1,
-      responseMimeType: "application/json",
-    },
-  });
+  const callGemini = async (prompt: string, tokens: number): Promise<string> => {
+    const r = await model.generateContent({
+      contents: [{ role: "user", parts: [{ text: prompt }] }],
+      systemInstruction: { role: "model", parts: [{ text: SYSTEM_PROMPT }] },
+      generationConfig: {
+        maxOutputTokens: tokens,
+        temperature: 0.1,
+        responseMimeType: "application/json",
+      },
+    });
+    return r.response.text();
+  };
 
-  const text = result.response.text();
+  const tryParse = (text: string): AIProcessingResult | null => {
+    let jsonStr: string | null = null;
+    const codeBlockMatch = text.match(/```(?:json)?\s*([\s\S]*?)\s*```/);
+    if (codeBlockMatch) jsonStr = codeBlockMatch[1];
+    if (!jsonStr) {
+      const objectMatch = text.match(/\{[\s\S]*\}/);
+      if (objectMatch) jsonStr = objectMatch[0];
+    }
+    if (!jsonStr) return null;
+    try {
+      return JSON.parse(jsonStr) as AIProcessingResult;
+    } catch {
+      return null;
+    }
+  };
+
+  // Attempt 1: normal call with 8192 token budget
+  let text = await callGemini(userPrompt, 8192);
   logger.info("Raw Gemini response", { text: text.substring(0, 500) });
+  let parsed = tryParse(text);
 
-  // Extract JSON from response — try multiple patterns
-  let jsonStr: string | null = null;
-
-  // Try markdown code block first
-  const codeBlockMatch = text.match(/```(?:json)?\s*([\s\S]*?)\s*```/);
-  if (codeBlockMatch) {
-    jsonStr = codeBlockMatch[1];
-  }
-
-  // Try raw JSON object
-  if (!jsonStr) {
-    const objectMatch = text.match(/\{[\s\S]*\}/);
-    if (objectMatch) {
-      jsonStr = objectMatch[0];
+  // Attempt 2: JSON-repair pass
+  if (!parsed) {
+    logger.warn("Gemini returned unparseable JSON, attempting repair", { textHead: text.substring(0, 200) });
+    const repairPrompt = `The following text should be a single JSON object matching the AIProcessingResult schema but is malformed or truncated. Return ONLY valid JSON with no commentary, no markdown fences. Fill any missing required fields with sensible defaults.\n\nBAD TEXT:\n${text}`;
+    try {
+      const repaired = await callGemini(repairPrompt, 8192);
+      parsed = tryParse(repaired);
+      if (parsed) logger.info("Gemini JSON repair succeeded", { eventId: event.id });
+    } catch (err) {
+      logger.warn("Gemini repair call failed", { error: String(err) });
     }
   }
 
-  if (!jsonStr) {
-    logger.error("Failed to parse AI response as JSON", { text });
+  if (!parsed) {
+    logger.error("Failed to parse AI response as JSON after repair", { eventId: event.id, text: text.substring(0, 1000) });
     throw new Error("AI response was not valid JSON");
   }
-  const parsed = JSON.parse(jsonStr) as AIProcessingResult;
+
   parsed.event_id = event.id;
 
   logger.info("AI processed event", {
