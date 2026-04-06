@@ -1368,90 +1368,134 @@ app.post("/api/full-rebuild", async (_req, res) => {
       rebuildStatus.steps.push({ step: "setup_attio_fields", status: "done" });
 
       // Step 1: Nuke Attio
+      // Helper: fetch with 25s timeout to prevent infinite hangs
+      const fetchT = (url: string, opts: RequestInit = {}) =>
+        fetch(url, { ...opts, signal: AbortSignal.timeout(25000) });
+      const attioHeaders = { Authorization: `Bearer ${config.ATTIO_API_KEY}`, "Content-Type": "application/json" };
+
+      logger.info("Rebuild: starting Attio cleanup");
       let peopleDeleted = 0;
       let dealsDeleted = 0;
       const pipelineId = config.ATTIO_PIPELINE_ID;
       if (pipelineId) {
-        while (true) {
-          const dealsResp = await fetch(`https://api.attio.com/v2/lists/${pipelineId}/entries/query`, {
-            method: "POST",
-            headers: { Authorization: `Bearer ${config.ATTIO_API_KEY}`, "Content-Type": "application/json" },
-            body: JSON.stringify({ limit: 50 }),
-          });
-          if (!dealsResp.ok) break;
-          const dealsData = await dealsResp.json() as { data: Array<Record<string, unknown>> };
-          if (!dealsData.data || dealsData.data.length === 0) break;
-          for (const deal of dealsData.data) {
-            try {
-              await fetch(`https://api.attio.com/v2/lists/${pipelineId}/entries/${deal.entry_id}`, {
-                method: "DELETE", headers: { Authorization: `Bearer ${config.ATTIO_API_KEY}` },
-              });
-              dealsDeleted++;
-            } catch { /* continue */ }
+        let safety = 0;
+        while (safety++ < 100) {
+          try {
+            const dealsResp = await fetchT(`https://api.attio.com/v2/lists/${pipelineId}/entries/query`, {
+              method: "POST", headers: attioHeaders, body: JSON.stringify({ limit: 50 }),
+            });
+            if (!dealsResp.ok) { logger.warn("Pipeline query failed", { status: dealsResp.status }); break; }
+            const dealsData = await dealsResp.json() as { data: Array<Record<string, unknown>> };
+            if (!dealsData.data || dealsData.data.length === 0) break;
+            let deletedThisBatch = 0;
+            for (const deal of dealsData.data) {
+              // Attio returns id as { entry_id } object, NOT flat entry_id
+              const entryId = (deal.id as Record<string, string>)?.entry_id || (deal.entry_id as string);
+              if (!entryId) continue;
+              try {
+                const delResp = await fetchT(`https://api.attio.com/v2/lists/${pipelineId}/entries/${entryId}`, {
+                  method: "DELETE", headers: { Authorization: `Bearer ${config.ATTIO_API_KEY}` },
+                });
+                if (delResp.ok) { dealsDeleted++; deletedThisBatch++; }
+              } catch (err) { logger.warn("Failed to delete pipeline entry", { entryId, error: String(err) }); }
+            }
+            if (deletedThisBatch === 0) break; // safety: nothing deleted, avoid infinite loop
+          } catch (err) {
+            logger.error("Pipeline cleanup loop error", { error: String(err) });
+            break;
           }
         }
       }
-      while (true) {
-        const resp = await fetch("https://api.attio.com/v2/objects/people/records/query", {
-          method: "POST",
-          headers: { Authorization: `Bearer ${config.ATTIO_API_KEY}`, "Content-Type": "application/json" },
-          body: JSON.stringify({ limit: 50 }),
-        });
-        if (!resp.ok) break;
-        const data = await resp.json() as { data: Array<Record<string, unknown>> };
-        if (!data.data || data.data.length === 0) break;
-        for (const person of data.data) {
-          const id = (person.id as Record<string, string>)?.record_id;
-          try {
-            await fetch(`https://api.attio.com/v2/objects/people/records/${id}`, {
-              method: "DELETE", headers: { Authorization: `Bearer ${config.ATTIO_API_KEY}` },
-            });
-            peopleDeleted++;
-          } catch { /* continue */ }
+      logger.info("Rebuild: pipeline entries deleted", { dealsDeleted });
+
+      // Delete people
+      let safetyP = 0;
+      while (safetyP++ < 200) {
+        try {
+          const resp = await fetchT("https://api.attio.com/v2/objects/people/records/query", {
+            method: "POST", headers: attioHeaders, body: JSON.stringify({ limit: 50 }),
+          });
+          if (!resp.ok) { logger.warn("People query failed", { status: resp.status }); break; }
+          const data = await resp.json() as { data: Array<Record<string, unknown>> };
+          if (!data.data || data.data.length === 0) break;
+          let deletedThisBatch = 0;
+          for (const person of data.data) {
+            const id = (person.id as Record<string, string>)?.record_id;
+            if (!id) continue;
+            try {
+              const delResp = await fetchT(`https://api.attio.com/v2/objects/people/records/${id}`, {
+                method: "DELETE", headers: { Authorization: `Bearer ${config.ATTIO_API_KEY}` },
+              });
+              if (delResp.ok) { peopleDeleted++; deletedThisBatch++; }
+            } catch (err) { logger.warn("Failed to delete person", { id, error: String(err) }); }
+          }
+          if (deletedThisBatch === 0) break;
+        } catch (err) {
+          logger.error("People cleanup loop error", { error: String(err) });
+          break;
         }
       }
-      // Also delete deal records (not just pipeline entries)
+      logger.info("Rebuild: people deleted", { peopleDeleted });
+
+      // Delete deal records (separate from pipeline entries)
       let dealRecordsDeleted = 0;
-      while (true) {
-        const resp = await fetch("https://api.attio.com/v2/objects/deals/records/query", {
-          method: "POST",
-          headers: { Authorization: `Bearer ${config.ATTIO_API_KEY}`, "Content-Type": "application/json" },
-          body: JSON.stringify({ limit: 50 }),
-        });
-        if (!resp.ok) break;
-        const data = await resp.json() as { data: Array<Record<string, unknown>> };
-        if (!data.data || data.data.length === 0) break;
-        for (const deal of data.data) {
-          const id = (deal.id as Record<string, string>)?.record_id;
-          try {
-            await fetch(`https://api.attio.com/v2/objects/deals/records/${id}`, {
-              method: "DELETE", headers: { Authorization: `Bearer ${config.ATTIO_API_KEY}` },
-            });
-            dealRecordsDeleted++;
-          } catch { /* continue */ }
+      let safetyD = 0;
+      while (safetyD++ < 100) {
+        try {
+          const resp = await fetchT("https://api.attio.com/v2/objects/deals/records/query", {
+            method: "POST", headers: attioHeaders, body: JSON.stringify({ limit: 50 }),
+          });
+          if (!resp.ok) { logger.warn("Deals query failed", { status: resp.status }); break; }
+          const data = await resp.json() as { data: Array<Record<string, unknown>> };
+          if (!data.data || data.data.length === 0) break;
+          let deletedThisBatch = 0;
+          for (const deal of data.data) {
+            const id = (deal.id as Record<string, string>)?.record_id;
+            if (!id) continue;
+            try {
+              const delResp = await fetchT(`https://api.attio.com/v2/objects/deals/records/${id}`, {
+                method: "DELETE", headers: { Authorization: `Bearer ${config.ATTIO_API_KEY}` },
+              });
+              if (delResp.ok) { dealRecordsDeleted++; deletedThisBatch++; }
+            } catch (err) { logger.warn("Failed to delete deal record", { id, error: String(err) }); }
+          }
+          if (deletedThisBatch === 0) break;
+        } catch (err) {
+          logger.error("Deal records cleanup loop error", { error: String(err) });
+          break;
         }
       }
-      // Also delete companies to start fresh
+      logger.info("Rebuild: deal records deleted", { dealRecordsDeleted });
+
+      // Delete companies
       let companiesDeleted = 0;
-      while (true) {
-        const resp = await fetch("https://api.attio.com/v2/objects/companies/records/query", {
-          method: "POST",
-          headers: { Authorization: `Bearer ${config.ATTIO_API_KEY}`, "Content-Type": "application/json" },
-          body: JSON.stringify({ limit: 50 }),
-        });
-        if (!resp.ok) break;
-        const data = await resp.json() as { data: Array<Record<string, unknown>> };
-        if (!data.data || data.data.length === 0) break;
-        for (const company of data.data) {
-          const id = (company.id as Record<string, string>)?.record_id;
-          try {
-            await fetch(`https://api.attio.com/v2/objects/companies/records/${id}`, {
-              method: "DELETE", headers: { Authorization: `Bearer ${config.ATTIO_API_KEY}` },
-            });
-            companiesDeleted++;
-          } catch { /* continue */ }
+      let safetyC = 0;
+      while (safetyC++ < 100) {
+        try {
+          const resp = await fetchT("https://api.attio.com/v2/objects/companies/records/query", {
+            method: "POST", headers: attioHeaders, body: JSON.stringify({ limit: 50 }),
+          });
+          if (!resp.ok) { logger.warn("Companies query failed", { status: resp.status }); break; }
+          const data = await resp.json() as { data: Array<Record<string, unknown>> };
+          if (!data.data || data.data.length === 0) break;
+          let deletedThisBatch = 0;
+          for (const company of data.data) {
+            const id = (company.id as Record<string, string>)?.record_id;
+            if (!id) continue;
+            try {
+              const delResp = await fetchT(`https://api.attio.com/v2/objects/companies/records/${id}`, {
+                method: "DELETE", headers: { Authorization: `Bearer ${config.ATTIO_API_KEY}` },
+              });
+              if (delResp.ok) { companiesDeleted++; deletedThisBatch++; }
+            } catch (err) { logger.warn("Failed to delete company", { id, error: String(err) }); }
+          }
+          if (deletedThisBatch === 0) break;
+        } catch (err) {
+          logger.error("Companies cleanup loop error", { error: String(err) });
+          break;
         }
       }
+      logger.info("Rebuild: companies deleted", { companiesDeleted });
       rebuildStatus.steps.push({ step: "cleanup_attio", status: "done", details: { peopleDeleted, dealsDeleted, dealRecordsDeleted, companiesDeleted } });
 
       // Step 2: Clear interaction log
