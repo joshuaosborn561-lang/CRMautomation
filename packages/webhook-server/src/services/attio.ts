@@ -799,27 +799,20 @@ export async function updateDealStage(dealRecordId: string, stage: DealStage): P
 export async function createNote(note: AttioNote): Promise<void> {
     const parentObject = note.parent_object === "contacts" ? "people" : note.parent_object;
 
-  const paragraphs = note.content.split("\n\n").filter(p => p.trim());
-    const contentBlocks = paragraphs.map(p => ({
-          type: "paragraph" as const,
-          children: [{ text: p.trim() }],
-    }));
-
   try {
-        await attioFetch("/notes", {
-                method: "POST",
-                body: JSON.stringify({
-                          data: {
-                                      parent_object: parentObject,
-                                      parent_record_id: note.parent_id,
-                                      title: note.title,
-                                      content: contentBlocks.length > 0
-                                        ? contentBlocks
-                                                    : [{ type: "paragraph", children: [{ text: note.content }] }],
-                          },
-                }),
-        });
-        logger.info("Created Attio note", { parentObject, parentId: note.parent_id, title: note.title });
+    await attioFetch("/notes", {
+      method: "POST",
+      body: JSON.stringify({
+        data: {
+          parent_object: parentObject,
+          parent_record_id: note.parent_id,
+          title: note.title,
+          format: "plaintext",
+          content: note.content,
+        },
+      }),
+    });
+    logger.info("Created Attio note", { parentObject, parentId: note.parent_id, title: note.title });
   } catch (err) {
         logger.warn("Note creation failed", { parentObject, parentId: note.parent_id, error: String(err) });
   }
@@ -827,20 +820,41 @@ export async function createNote(note: AttioNote): Promise<void> {
 
 // --- Tasks ---
 export async function createTask(task: AttioTask): Promise<void> {
+  let deadlineAt: string | null = null;
+  if (task.due_date) {
+    const d = new Date(task.due_date);
+    if (!isNaN(d.getTime())) deadlineAt = d.toISOString();
+  }
+
+  let assigneeId: string | null = null;
+  try {
+    assigneeId = await getWorkspaceMemberId();
+  } catch (err) {
+    logger.warn("Could not fetch workspace member for task assignee", { error: String(err) });
+  }
+
+  try {
     await attioFetch("/tasks", {
-          method: "POST",
-          body: JSON.stringify({
-                  data: {
-                            content: task.title,
-                            deadline: task.due_date || null,
-                            is_completed: false,
-                            linked_records: task.linked_deal_id
-                              ? [{ target_record_id: task.linked_deal_id }]
-                                        : [],
-                  },
-          }),
+      method: "POST",
+      body: JSON.stringify({
+        data: {
+          content: `${task.title}\n\n${task.description || ""}`.trim(),
+          format: "plaintext",
+          deadline_at: deadlineAt,
+          is_completed: false,
+          linked_records: task.linked_deal_id
+            ? [{ target_object: "deals", target_record_id: task.linked_deal_id }]
+            : [],
+          assignees: assigneeId
+            ? [{ referenced_actor_type: "workspace-member", referenced_actor_id: assigneeId }]
+            : [],
+        },
+      }),
     });
     logger.info("Created Attio task", { title: task.title });
+  } catch (err) {
+    logger.warn("Task creation failed", { title: task.title, error: String(err) });
+  }
 }
 
 // --- Query helpers ---
