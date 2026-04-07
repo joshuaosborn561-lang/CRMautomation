@@ -473,20 +473,30 @@ function buildNoteContent(result: AIProcessingResult, rawPayload?: Record<string
     parts.push(`Zoom AI Summary: ${rawPayload.zoom_ai_summary_url}`);
   }
 
-  let content = parts.join("\n\n");
-
-  if (result.note.pricing_discussed) {
-    content += "\n\n💰 Pricing was discussed in this interaction.";
-    if (result.deal.value) {
-      content += ` Deal value: $${result.deal.value.toLocaleString()}/mo`;
-      if (result.deal.term_months) {
-        content += ` × ${result.deal.term_months} months ($${(result.deal.value * result.deal.term_months).toLocaleString()} total)`;
-      }
-    }
+  // If Zoom AI Companion provided a summary, use IT verbatim (it already has next steps + pricing).
+  // Skip the Gemini-extracted next_steps/pricing for Zoom events so we don't double-dip.
+  const hasZoomSummary = !!rawPayload?.zoom_ai_summary;
+  if (hasZoomSummary) {
+    parts.push(String(rawPayload!.zoom_ai_summary));
   }
 
-  if (result.note.next_steps) {
-    content += `\n\nNext Steps: ${result.note.next_steps}`;
+  let content = parts.join("\n\n");
+
+  // For non-Zoom events (or Zoom events where Companion summary wasn't available), fall back to Gemini extraction
+  if (!hasZoomSummary) {
+    if (result.note.pricing_discussed) {
+      content += "\n\n💰 Pricing was discussed in this interaction.";
+      if (result.deal.value) {
+        content += ` Deal value: $${result.deal.value.toLocaleString()}/mo`;
+        if (result.deal.term_months) {
+          content += ` × ${result.deal.term_months} months ($${(result.deal.value * result.deal.term_months).toLocaleString()} total)`;
+        }
+      }
+    }
+
+    if (result.note.next_steps) {
+      content += `\n\nNext Steps: ${result.note.next_steps}`;
+    }
   }
 
   if (result.nurture_context) {
