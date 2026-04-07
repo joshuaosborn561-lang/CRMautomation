@@ -1,7 +1,7 @@
 import { getConfig } from "../config";
 import { logger } from "../utils/logger";
 import { processEvent } from "./ai-processor";
-import { enrichPerson as apolloEnrich, searchUserContacts, searchContactByPhone } from "../services/apollo";
+import { enrichPerson as apolloEnrich, searchPeopleGlobal, searchContactByPhone } from "../services/apollo";
 import {
   getUnprocessedEvents,
   markEventProcessed,
@@ -306,51 +306,49 @@ export async function applyToAttio(
     try {
       let apolloResult = null;
       const fullName = [contact.first_name, contact.last_name].filter(Boolean).join(" ").trim();
+      const domain = validEmail?.split("@")[1];
 
-      // Strategy 1: user's own saved Apollo contacts — by email (most accurate, returns phones)
-      if (!apolloResult && validEmail) {
-        apolloResult = await searchUserContacts(validEmail);
-      }
-      // Strategy 2: user's saved contacts by name
-      if (!apolloResult && fullName) {
-        apolloResult = await searchUserContacts(fullName);
-      }
-      // Strategy 3: user's saved contacts by phone
-      if (!apolloResult && contact.phone) {
-        apolloResult = await searchUserContacts(contact.phone);
-      }
-      // Strategy 4: user's saved contacts by "name company"
-      if (!apolloResult && fullName && contact.company) {
-        apolloResult = await searchUserContacts(`${fullName} ${contact.company}`);
-      }
-      // Strategy 5: global Apollo DB via /people/match — email
+      // Strategy 1: /people/match by email — highest match rate when we have one
       if (!apolloResult && validEmail) {
         apolloResult = await apolloEnrich({ email: validEmail });
       }
-      // Strategy 6: /people/match with name + domain/org
-      if (!apolloResult && contact.first_name && contact.last_name) {
-        const domain = validEmail?.split("@")[1];
+      // Strategy 2: /people/match by name + domain
+      if (!apolloResult && contact.first_name && contact.last_name && domain) {
         apolloResult = await apolloEnrich({
           first_name: contact.first_name,
           last_name: contact.last_name,
-          name: fullName,
           domain,
-          organization_name: contact.company,
-          linkedin_url: contact.linkedin_url,
         });
       }
-      // Strategy 7: phone-based global search → match
+      // Strategy 3: /people/match by name + organization_name
+      if (!apolloResult && contact.first_name && contact.last_name && contact.company) {
+        apolloResult = await apolloEnrich({
+          first_name: contact.first_name,
+          last_name: contact.last_name,
+          organization_name: contact.company,
+        });
+      }
+      // Strategy 4: /people/match by linkedin_url
+      if (!apolloResult && contact.linkedin_url) {
+        apolloResult = await apolloEnrich({ linkedin_url: contact.linkedin_url });
+      }
+      // Strategy 5: /mixed_people/api_search with name + company (Apollo remembers unlocks against your account)
+      if (!apolloResult && contact.first_name && contact.last_name) {
+        apolloResult = await searchPeopleGlobal({
+          first_name: contact.first_name,
+          last_name: contact.last_name,
+          organization_name: contact.company,
+          organization_domain: domain,
+        });
+      }
+      // Strategy 6: /mixed_people/api_search by email keyword
+      if (!apolloResult && validEmail) {
+        apolloResult = await searchPeopleGlobal({ email: validEmail });
+      }
+      // Strategy 7: phone-based global search
       if (!apolloResult && contact.phone) {
         const found = await searchContactByPhone(contact.phone);
         if (found) apolloResult = found;
-      }
-      // Strategy 8: company + first name only
-      if (!apolloResult && contact.company && contact.first_name) {
-        apolloResult = await apolloEnrich({
-          first_name: contact.first_name,
-          last_name: contact.last_name || "",
-          organization_name: contact.company,
-        });
       }
       if (apolloResult) {
         contact.email = contact.email || apolloResult.email;

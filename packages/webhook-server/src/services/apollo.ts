@@ -75,6 +75,44 @@ function mapApolloContact(c: Record<string, unknown>): ApolloContact {
   };
 }
 
+/**
+ * Search Apollo's global people database. This is the non-deprecated replacement for /mixed_people/search.
+ * For people the user has already unlocked/revealed, Apollo returns the full phone and email data.
+ * Accepts structured filters (names, org, titles) — NOT q_keywords.
+ */
+export async function searchPeopleGlobal(filters: {
+  first_name?: string;
+  last_name?: string;
+  organization_name?: string;
+  organization_domain?: string;
+  email?: string;
+}): Promise<ApolloContact | null> {
+  const body: Record<string, unknown> = { per_page: 5 };
+  if (filters.first_name) body.person_titles = undefined; // no-op, just shaping
+  if (filters.first_name || filters.last_name) {
+    body.q_person_name = [filters.first_name, filters.last_name].filter(Boolean).join(" ");
+  }
+  if (filters.organization_name) body.q_organization_name = filters.organization_name;
+  if (filters.organization_domain) body.q_organization_domains = [filters.organization_domain];
+  if (filters.email) body.q_keywords = filters.email;
+
+  const result = (await apolloFetch("/mixed_people/api_search", body)) as { people?: Array<Record<string, unknown>>; contacts?: Array<Record<string, unknown>> } | null;
+  const hits = result?.people || result?.contacts || [];
+  if (hits.length === 0) {
+    logger.info("Apollo /mixed_people/api_search no hits", { filters });
+    return null;
+  }
+  const first = hits[0];
+  logger.info("Apollo /mixed_people/api_search hit", {
+    filters,
+    name: first.name,
+    hasEmail: !!(first.email || first.personal_email),
+    hasPhone: !!(first.phone_numbers as Array<unknown> | undefined)?.length || !!first.sanitized_phone,
+    hasLinkedin: !!first.linkedin_url,
+  });
+  return mapApolloContact(first);
+}
+
 export async function searchUserContacts(query: string): Promise<ApolloContact | null> {
   if (!query) return null;
   const result = (await apolloFetch("/contacts/search", {
@@ -170,7 +208,10 @@ export async function enrichPerson(input: {
   const result = (await apolloFetch("/people/match", body)) as { person?: Record<string, unknown> } | null;
   const p = result?.person;
   if (!p) {
-    logger.info("Apollo /people/match returned no person", { input: Object.keys(body).filter(k => k !== "reveal_personal_emails" && k !== "reveal_phone_number") });
+    logger.info("Apollo /people/match returned no person", {
+      sent: { email: input.email, name: input.name, domain: input.domain, org: input.organization_name, linkedin: input.linkedin_url },
+      responseKeys: result ? Object.keys(result) : null,
+    });
     return null;
   }
   logger.info("Apollo /people/match hit", {
