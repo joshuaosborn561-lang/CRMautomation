@@ -1,7 +1,7 @@
 import { getConfig } from "../config";
 import { logger } from "../utils/logger";
 import { processEvent } from "./ai-processor";
-import { enrichPerson as apolloEnrich } from "../services/apollo";
+import { enrichPerson as apolloEnrich, searchUserContacts, searchContactByPhone } from "../services/apollo";
 import {
   getUnprocessedEvents,
   markEventProcessed,
@@ -305,39 +305,46 @@ export async function applyToAttio(
   if (!validEmail || !contact.phone || !contact.linkedin_url || !contact.title) {
     try {
       let apolloResult = null;
-      // Strategy 1: email (most precise)
-      if (validEmail) {
+      const fullName = [contact.first_name, contact.last_name].filter(Boolean).join(" ").trim();
+
+      // Strategy 1: user's own saved Apollo contacts — by email (most accurate, returns phones)
+      if (!apolloResult && validEmail) {
+        apolloResult = await searchUserContacts(validEmail);
+      }
+      // Strategy 2: user's saved contacts by name
+      if (!apolloResult && fullName) {
+        apolloResult = await searchUserContacts(fullName);
+      }
+      // Strategy 3: user's saved contacts by phone
+      if (!apolloResult && contact.phone) {
+        apolloResult = await searchUserContacts(contact.phone);
+      }
+      // Strategy 4: user's saved contacts by "name company"
+      if (!apolloResult && fullName && contact.company) {
+        apolloResult = await searchUserContacts(`${fullName} ${contact.company}`);
+      }
+      // Strategy 5: global Apollo DB via /people/match — email
+      if (!apolloResult && validEmail) {
         apolloResult = await apolloEnrich({ email: validEmail });
       }
-      // Strategy 2: name + company domain
+      // Strategy 6: /people/match with name + domain/org
       if (!apolloResult && contact.first_name && contact.last_name) {
         const domain = validEmail?.split("@")[1];
         apolloResult = await apolloEnrich({
           first_name: contact.first_name,
           last_name: contact.last_name,
-          name: `${contact.first_name} ${contact.last_name}`,
+          name: fullName,
           domain,
           organization_name: contact.company,
           linkedin_url: contact.linkedin_url,
         });
       }
-      // Strategy 3: phone-based search → take first result's id → match
+      // Strategy 7: phone-based global search → match
       if (!apolloResult && contact.phone) {
-        const { searchContactByPhone } = await import("../services/apollo");
         const found = await searchContactByPhone(contact.phone);
-        if (found) {
-          apolloResult = await apolloEnrich({
-            email: found.email,
-            first_name: found.first_name,
-            last_name: found.last_name,
-            organization_name: found.company,
-            linkedin_url: found.linkedin_url,
-          });
-          // If /people/match returns nothing, at least use the search hit
-          if (!apolloResult) apolloResult = found;
-        }
+        if (found) apolloResult = found;
       }
-      // Strategy 4: company-only fallback (useful when we only know the company from a meeting topic)
+      // Strategy 8: company + first name only
       if (!apolloResult && contact.company && contact.first_name) {
         apolloResult = await apolloEnrich({
           first_name: contact.first_name,
@@ -461,23 +468,14 @@ export async function applyToAttio(
 }
 
 function buildNoteContent(result: AIProcessingResult, rawPayload?: Record<string, unknown>): string {
-  let content = result.note.summary || "";
+  const parts: string[] = [];
 
-  // Always append the Zoom meeting join URL when we can derive one
-  const zoomObj = (rawPayload?.payload as Record<string, unknown>)?.object as Record<string, unknown> | undefined;
-  if (zoomObj?.id) {
-    content += `\n\nZoom Meeting: https://zoom.us/j/${zoomObj.id}`;
-  }
-
-  // Append Zoom AI Companion summary URL (clickable link to the AI recap)
+  // Zoom AI Companion doc URL — the only Zoom link we want (not the meeting recording, not the join URL)
   if (rawPayload?.zoom_ai_summary_url) {
-    content += `\n\nZoom AI Companion Summary: ${rawPayload.zoom_ai_summary_url}`;
+    parts.push(`Zoom AI Summary: ${rawPayload.zoom_ai_summary_url}`);
   }
 
-  // Append the Zoom AI summary text itself if provided
-  if (rawPayload?.zoom_ai_summary) {
-    content += `\n\n--- Zoom AI Summary ---\n${rawPayload.zoom_ai_summary}`;
-  }
+  let content = parts.join("\n\n");
 
   if (result.note.pricing_discussed) {
     content += "\n\n💰 Pricing was discussed in this interaction.";
