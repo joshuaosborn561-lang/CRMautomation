@@ -294,16 +294,24 @@ export async function applyToAttio(
   // --- LEAD SOURCE: Create new contacts and deals ---
 
   // Apollo enrichment: try multiple strategies to find the person and backfill all fields.
-  if (!contact.email || !contact.phone || !contact.linkedin_url || !contact.title) {
+  // Sanitize: don't let "unknown" or our own email leak into Apollo
+  const ownDomain = (process.env.OWN_EMAIL_DOMAIN || "").toLowerCase();
+  const validEmail = contact.email
+    && contact.email !== "unknown"
+    && contact.email.includes("@")
+    && !(ownDomain && contact.email.toLowerCase().endsWith(`@${ownDomain}`))
+    ? contact.email
+    : undefined;
+  if (!validEmail || !contact.phone || !contact.linkedin_url || !contact.title) {
     try {
       let apolloResult = null;
       // Strategy 1: email (most precise)
-      if (contact.email) {
-        apolloResult = await apolloEnrich({ email: contact.email });
+      if (validEmail) {
+        apolloResult = await apolloEnrich({ email: validEmail });
       }
       // Strategy 2: name + company domain
       if (!apolloResult && contact.first_name && contact.last_name) {
-        const domain = contact.email?.split("@")[1];
+        const domain = validEmail?.split("@")[1];
         apolloResult = await apolloEnrich({
           first_name: contact.first_name,
           last_name: contact.last_name,

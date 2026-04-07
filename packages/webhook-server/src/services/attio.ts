@@ -648,7 +648,7 @@ export async function createDeal(deal: AttioDeal & { value?: number; term_months
     const pipelineId = config.ATTIO_PIPELINE_ID;
     if (!pipelineId) throw new Error("ATTIO_PIPELINE_ID not configured");
 
-  const stageName = STAGE_MAP[deal.stage];
+  const stageName = STAGE_MAP[deal.stage] || STAGE_MAP.replied_showed_interest || "Replied / Showed Interest";
 
   const [ownerId, stageOptions] = await Promise.all([
         getWorkspaceMemberId(),
@@ -685,7 +685,8 @@ export async function createDeal(deal: AttioDeal & { value?: number; term_months
   }
 
   if (deal.value) {
-        dealValues.value = [{ currency_value: deal.value, currency_code: "USD" }];
+        // Attio's deal value attribute is a plain number (currency is set on the attribute definition, not per-record)
+        dealValues.value = deal.value;
   }
 
   logger.info("Creating deal record", {

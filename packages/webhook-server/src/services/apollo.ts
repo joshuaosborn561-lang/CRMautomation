@@ -74,7 +74,7 @@ export async function searchContactByPhone(phone: string): Promise<ApolloContact
   }
 
   // Fallback: try people search with phone as keyword
-  const peopleResult = (await apolloFetch("/mixed_people/search", {
+  const peopleResult = (await apolloFetch("/mixed_people/api_search", {
     q_keywords: phone,
     per_page: 1,
   })) as { people?: Array<Record<string, unknown>> } | null;
@@ -150,7 +150,7 @@ export async function searchContactByName(
   firstName: string,
   lastName: string
 ): Promise<ApolloContact | null> {
-  const result = (await apolloFetch("/mixed_people/search", {
+  const result = (await apolloFetch("/mixed_people/api_search", {
     q_keywords: `${firstName} ${lastName}`,
     per_page: 1,
   })) as { people?: Array<Record<string, unknown>> } | null;
