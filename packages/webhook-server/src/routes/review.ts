@@ -1,92 +1,92 @@
 import { Router, Request, Response } from "express";
-import {
-    getPendingReviews,
-    approveReview,
-    rejectReview,
-} from "../services/event-store";
-import { applyToAttio } from "../processors/event-pipeline";
+import { getSupabase } from "../utils/supabase";
 import { logger } from "../utils/logger";
 
 export const reviewRouter = Router();
 
-// GET /api/review - List all pending reviews
+// GET /api/review-queue — list unresolved identity-resolution failures.
 reviewRouter.get("/", async (_req: Request, res: Response) => {
-    try {
-          const pending = await getPendingReviews();
-          res.json({
-                  count: pending.length,
-                  reviews: pending.map((r) => ({
-                            id: r.id,
-                            event_id: r.event_id,
-                            source: r.source,
-                            created_at: r.created_at,
-                            contact: r.proposed_action.contact,
-                            deal: r.proposed_action.deal,
-                            note: r.proposed_action.note,
-                            task: r.proposed_action.task,
-                  })),
-          });
-    } catch (err) {
-          logger.error("Failed to get pending reviews", { error: String(err) });
-          res.status(500).json({ error: "Failed to get reviews" });
-    }
+  try {
+    const supabase = getSupabase();
+    const { data, error } = await supabase
+      .from("review_queue")
+      .select("id, event_id, reason, identity_hint, assigned_identity_key, created_at")
+      .eq("resolved", false)
+      .order("created_at", { ascending: false })
+      .limit(200);
+    if (error) throw error;
+    res.json({ count: (data || []).length, reviews: data || [] });
+  } catch (err) {
+    logger.error("Failed to list review queue", { error: String(err) });
+    res.status(500).json({ error: "Failed to list reviews" });
+  }
 });
 
-// POST /api/review/:id/approve - Approve and apply to Attio
-reviewRouter.post("/:id/approve", async (req: Request, res: Response) => {
-    try {
-          const id = String(req.params.id);
-          const review = await approveReview(id);
-
-      // Apply the approved action to Attio
-      await applyToAttio(review.proposed_action);
-
-      logger.info("Review approved and applied", { reviewId: id });
-          res.json({ status: "approved", applied: true });
-    } catch (err) {
-          logger.error("Failed to approve review", { error: String(err) });
-          res.status(500).json({ error: "Failed to approve review" });
+// POST /api/review-queue/:id/assign — assign an identity_key and re-queue the event.
+// Body: { identity_key: "email:foo@bar.com" }
+reviewRouter.post("/:id/assign", async (req: Request, res: Response) => {
+  try {
+    const id = String(req.params.id);
+    const identityKey = String(req.body?.identity_key || "").trim();
+    if (!identityKey || !/^(email|phone|linkedin):/.test(identityKey)) {
+      return res.status(400).json({
+        error: "identity_key must start with email:, phone:, or linkedin:",
+      });
     }
+
+    const supabase = getSupabase();
+
+    const { data: row, error: rowErr } = await supabase
+      .from("review_queue")
+      .select("id, event_id")
+      .eq("id", id)
+      .single();
+    if (rowErr || !row) return res.status(404).json({ error: "review row not found" });
+
+    // Tag the webhook_event so the pipeline re-processes it.
+    await supabase
+      .from("webhook_events")
+      .update({
+        identity_key: identityKey,
+        identity_resolved_at: new Date().toISOString(),
+        processed: false,
+      })
+      .eq("id", row.event_id);
+
+    await supabase
+      .from("review_queue")
+      .update({
+        assigned_identity_key: identityKey,
+        resolved: true,
+        resolved_at: new Date().toISOString(),
+        status: "approved",
+      })
+      .eq("id", id);
+
+    logger.info("Review queue row assigned identity", { id, eventId: row.event_id, identityKey });
+    res.json({ status: "assigned", identity_key: identityKey });
+  } catch (err) {
+    logger.error("Failed to assign review row", { error: String(err) });
+    res.status(500).json({ error: "Failed to assign identity" });
+  }
 });
 
-// POST /api/review/:id/reject - Reject a proposed action
+// POST /api/review-queue/:id/reject — drop a row without assigning.
 reviewRouter.post("/:id/reject", async (req: Request, res: Response) => {
-    try {
-          const id = String(req.params.id);
-          const notes = req.body.notes || undefined;
-          await rejectReview(id, notes);
-
-      logger.info("Review rejected", { reviewId: id, notes });
-          res.json({ status: "rejected" });
-    } catch (err) {
-          logger.error("Failed to reject review", { error: String(err) });
-          res.status(500).json({ error: "Failed to reject review" });
-    }
-});
-
-// POST /api/review/approve-all - Approve all pending reviews
-reviewRouter.post("/approve-all", async (_req: Request, res: Response) => {
-    try {
-          const pending = await getPendingReviews();
-          let applied = 0;
-          let failed = 0;
-
-      for (const review of pending) {
-              try {
-                        const approved = await approveReview(review.id);
-                        await applyToAttio(approved.proposed_action);
-                        applied++;
-              } catch (err) {
-                        logger.error("Failed to approve review item", {
-                                    reviewId: review.id,
-                                    error: String(err),
-                        });
-                        failed++;
-              }
-      }
-
-      res.json({ status: "done", applied, failed, total: pending.length });
-    } catch (err) {
-          res.status(500).json({ error: "Failed to approve all reviews" });
-    }
+  try {
+    const id = String(req.params.id);
+    const supabase = getSupabase();
+    await supabase
+      .from("review_queue")
+      .update({
+        resolved: true,
+        resolved_at: new Date().toISOString(),
+        status: "rejected",
+      })
+      .eq("id", id);
+    res.json({ status: "rejected" });
+  } catch (err) {
+    logger.error("Failed to reject review row", { error: String(err) });
+    res.status(500).json({ error: "Failed to reject" });
+  }
 });

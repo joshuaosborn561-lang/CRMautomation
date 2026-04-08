@@ -1,13 +1,12 @@
 import { Router, Request, Response } from "express";
-import { storeWebhookEvent } from "../services/event-store";
+import { storeWebhookEvent, addIdentityReviewRow } from "../services/event-store";
+import { computeIdentityKey, buildIdentityHint } from "../services/identity";
 import { logger } from "../utils/logger";
 
 export const heyreachRouter = Router();
 
 // HeyReach sends webhooks for LinkedIn events:
-// - connection_accepted: prospect accepted connection request
-// - message_received: prospect sent a LinkedIn message
-// - reply_received: prospect replied to a message
+// - connection_accepted, message_received, reply_received
 heyreachRouter.post("/", async (req: Request, res: Response) => {
   try {
     const payload = req.body;
@@ -16,7 +15,24 @@ heyreachRouter.post("/", async (req: Request, res: Response) => {
 
     logger.info("Received HeyReach webhook", { eventType });
 
-    const eventId = await storeWebhookEvent("heyreach", eventType, payload);
+    const identityKey = computeIdentityKey("heyreach", payload);
+    const eventId = await storeWebhookEvent("heyreach", eventType, payload, identityKey);
+
+    if (!identityKey) {
+      await addIdentityReviewRow(
+        eventId,
+        "heyreach_no_linkedin_or_email",
+        buildIdentityHint({
+          id: eventId,
+          source: "heyreach",
+          event_type: eventType,
+          payload,
+          received_at: new Date().toISOString(),
+          processed: false,
+        })
+      );
+      return res.status(200).json({ received: true, queued_for_review: true });
+    }
 
     res.status(200).json({ received: true, event_id: eventId });
   } catch (err) {

@@ -1,7 +1,13 @@
 import { Router, Request, Response } from "express";
 import Anthropic from "@anthropic-ai/sdk";
-import { storeWebhookEvent } from "../services/event-store";
+import { storeWebhookEvent, addIdentityReviewRow } from "../services/event-store";
 import * as gmailService from "../services/gmail";
+import {
+  computeIdentityKey,
+  extractZoomMeetingIds,
+  upsertMeetingLink,
+  extractEmailAddress,
+} from "../services/identity";
 import { getConfig } from "../config";
 import { getSupabase } from "../utils/supabase";
 import { logger } from "../utils/logger";
@@ -112,6 +118,38 @@ gmailRouter.post("/", async (req: Request, res: Response) => {
         // Fetch the full message
         const message = await gmailService.getMessage(change.messageId);
 
+        // --- Opportunistically populate meeting_links cache ---
+        // If the body contains a zoom.us/j/{id} URL, record the
+        // meeting id → attendee email mapping for future Zoom webhooks.
+        try {
+          const zoomIds = extractZoomMeetingIds(
+            `${message.body || ""} ${message.subject || ""}`
+          );
+          if (zoomIds.length > 0) {
+            const ownDomain = (process.env.OWN_EMAIL_DOMAIN || "salesglidergrowth.com").toLowerCase();
+            const fromAddr = extractEmailAddress(message.from)?.toLowerCase() || "";
+            const toAddr = extractEmailAddress(message.to)?.toLowerCase() || "";
+            const fromIsOwn = fromAddr.endsWith(`@${ownDomain}`);
+            const attendee = fromIsOwn ? toAddr : fromAddr;
+            if (attendee && !attendee.endsWith(`@${ownDomain}`)) {
+              for (const zid of zoomIds) {
+                await upsertMeetingLink({
+                  zoom_meeting_id: zid,
+                  attendee_email: attendee,
+                  gmail_message_id: message.id,
+                  meeting_topic: message.subject,
+                });
+              }
+              logger.info("Gmail: cached meeting_links from body", {
+                zoomIds,
+                attendee,
+              });
+            }
+          }
+        } catch (err) {
+          logger.warn("meeting_links cache population failed", { error: String(err) });
+        }
+
         // --- FILTER LAYER 1: Skip known automated senders ---
         const fromLower = (message.from || "").toLowerCase();
         if (isAutomatedSender(fromLower)) {
@@ -144,7 +182,7 @@ gmailRouter.post("/", async (req: Request, res: Response) => {
         }
 
         // --- Only store sales-relevant emails ---
-        await storeWebhookEvent("gmail", "email_received", {
+        const gmailPayload: Record<string, unknown> = {
           message_id: message.id,
           thread_id: message.threadId,
           from: message.from,
@@ -153,7 +191,19 @@ gmailRouter.post("/", async (req: Request, res: Response) => {
           date: message.date,
           body: message.body?.substring(0, 5000) || "",
           snippet: message.snippet,
-        });
+        };
+        const identityKey = computeIdentityKey("gmail", gmailPayload);
+        const eventId = await storeWebhookEvent(
+          "gmail",
+          "email_received",
+          gmailPayload,
+          identityKey
+        );
+        if (!identityKey) {
+          await addIdentityReviewRow(eventId, "gmail_no_counterparty_email", {
+            email: message.from,
+          });
+        }
         stored++;
       }
     }

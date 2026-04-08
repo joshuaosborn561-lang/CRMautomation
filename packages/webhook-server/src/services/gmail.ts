@@ -202,6 +202,52 @@ export async function setupGmailWatch(): Promise<{
   return result;
 }
 
+// --- Search ---
+// Gmail search query syntax: https://support.google.com/mail/answer/7190
+// Searches ALL mail (sent + received + archives), not just the INBOX watch.
+
+export async function searchMessages(
+  q: string,
+  maxResults = 5
+): Promise<Array<{ id: string; threadId: string }>> {
+  try {
+    const params = new URLSearchParams({ q, maxResults: String(maxResults) });
+    const data = (await gmailFetch(`/messages?${params}`)) as {
+      messages?: Array<{ id: string; threadId: string }>;
+    };
+    return data.messages || [];
+  } catch (err) {
+    logger.warn("Gmail searchMessages failed", { q, error: String(err) });
+    return [];
+  }
+}
+
+/**
+ * Convenience: given a message id, fetch and return the `To:` header email
+ * (stripped of display name and own-domain addresses).
+ */
+export async function extractAttendeeEmailFromMessage(messageId: string): Promise<string | null> {
+  try {
+    const msg = await getMessage(messageId);
+    const ownDomain = (process.env.OWN_EMAIL_DOMAIN || "salesglidergrowth.com").toLowerCase();
+    const toHeader = msg.to || "";
+    // Split on commas for multi-recipient invites
+    const candidates = toHeader.split(/,\s*/);
+    for (const raw of candidates) {
+      const m = raw.match(/[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}/);
+      if (!m) continue;
+      const addr = m[0].toLowerCase();
+      if (addr.endsWith(`@${ownDomain}`)) continue;
+      if (addr.endsWith("@zoom.us")) continue;
+      if (addr.includes("calendar-notification@google.com")) continue;
+      return addr;
+    }
+  } catch (err) {
+    logger.warn("extractAttendeeEmailFromMessage failed", { messageId, error: String(err) });
+  }
+  return null;
+}
+
 // --- History Sync ---
 // When we receive a Pub/Sub push, it includes a historyId.
 // We use history.list to get what changed since our last known historyId.

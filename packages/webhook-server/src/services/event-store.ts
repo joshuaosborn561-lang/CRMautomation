@@ -7,13 +7,15 @@ import type {
   AIProcessingResult,
   InteractionLog,
 } from "@crm-autopilot/shared";
+import type { IdentityHint } from "./identity";
 
 // --- Webhook Events ---
 
 export async function storeWebhookEvent(
   source: EventSource,
   eventType: string,
-  payload: Record<string, unknown>
+  payload: Record<string, unknown>,
+  identityKey: string | null = null
 ): Promise<string> {
   const supabase = getSupabase();
   const { data, error } = await supabase
@@ -24,6 +26,8 @@ export async function storeWebhookEvent(
       payload,
       received_at: new Date().toISOString(),
       processed: false,
+      identity_key: identityKey,
+      identity_resolved_at: identityKey ? new Date().toISOString() : null,
     })
     .select("id")
     .single();
@@ -33,7 +37,7 @@ export async function storeWebhookEvent(
     throw error;
   }
 
-  logger.info("Stored webhook event", { id: data.id, source, eventType });
+  logger.info("Stored webhook event", { id: data.id, source, eventType, identityKey });
   return data.id;
 }
 
@@ -83,6 +87,38 @@ export async function addToReviewQueue(
 
   if (error) throw error;
   logger.info("Added to review queue", { id: data.id, eventId });
+  return data.id;
+}
+
+/**
+ * Insert an identity-resolution failure into review_queue.
+ * Unlike the legacy `addToReviewQueue`, no AI proposed_action is attached —
+ * the row just carries the reason + identity hint for manual triage.
+ */
+export async function addIdentityReviewRow(
+  eventId: string,
+  reason: string,
+  hint: IdentityHint
+): Promise<string> {
+  const supabase = getSupabase();
+  const { data, error } = await supabase
+    .from("review_queue")
+    .insert({
+      event_id: eventId,
+      reason,
+      identity_hint: hint,
+      status: "pending",
+      resolved: false,
+      created_at: new Date().toISOString(),
+    })
+    .select("id")
+    .single();
+
+  if (error) {
+    logger.error("Failed to add identity review row", { error: error.message, eventId, reason });
+    throw error;
+  }
+  logger.info("Added identity review row", { id: data.id, eventId, reason });
   return data.id;
 }
 

@@ -39,7 +39,7 @@ app.use("/webhooks/zoom", zoomRouter);
 app.use("/webhooks/gmail", gmailRouter);
 
 // API endpoints
-app.use("/api/review", reviewRouter);
+app.use("/api/review-queue", reviewRouter);
 app.use("/api/nurture", nurtureRouter);
 app.use("/api/query", queryRouter);
 app.use("/api/backfill", backfillRouter);
@@ -496,13 +496,12 @@ app.get("/api/debug/test-attio-write", async (_req, res) => {
   res.json({ steps });
 });
 
-// Test processing a single event end-to-end (dry run with full error details)
+// Test processing: classifies a single event via the rule engine (no Attio mutation).
 app.get("/api/debug/test-one", async (_req, res) => {
   try {
     const { getSupabase } = await import("./utils/supabase");
     const supabase = getSupabase();
 
-    // Get one unprocessed non-gmail event that has actual payload data
     const { data: events } = await supabase
       .from("webhook_events")
       .select("*")
@@ -518,44 +517,17 @@ app.get("/api/debug/test-one", async (_req, res) => {
       return;
     }
 
-    // Pick first event with actual content
     const event = events.find((e: any) => e.payload && Object.keys(e.payload).length > 0) || events[0];
-    const result: Record<string, unknown> = {
+    const { classifyEvent, extractContactFromEvent, buildNoteBody } = await import("./services/rules");
+    res.json({
       event_id: event.id,
       source: event.source,
       event_type: event.event_type,
-      payload_keys: Object.keys(event.payload || {}),
-    };
-
-    // Try AI processing
-    try {
-      const { processEvent } = await import("./processors/ai-processor");
-      const aiResult = await processEvent(event);
-      result.ai_result = aiResult;
-
-      // Try applying to Attio
-      try {
-        const { applyToAttio } = await import("./processors/event-pipeline");
-        await applyToAttio(aiResult, event.source);
-        // Check if it was actually applied or silently skipped
-        const email = aiResult.contact?.email;
-        const phone = aiResult.contact?.phone;
-        const hasValidEmail = email && email !== "unknown" && !email.includes("unknown") && email.includes("@");
-        if (!hasValidEmail && !(phone && event.source === "zoom_phone")) {
-          result.attio_result = "SKIPPED — no valid email, nothing created in Attio";
-          result.skip_reason = { email, phone, source: event.source };
-        } else {
-          result.attio_result = "SUCCESS — created in Attio!";
-        }
-      } catch (attioErr) {
-        result.attio_error = attioErr instanceof Error ? attioErr.message : String(attioErr);
-        result.attio_stack = attioErr instanceof Error ? attioErr.stack : undefined;
-      }
-    } catch (aiErr) {
-      result.ai_error = aiErr instanceof Error ? aiErr.message : String(aiErr);
-    }
-
-    res.json(result);
+      identity_key: event.identity_key,
+      classification: classifyEvent(event),
+      contact: extractContactFromEvent(event),
+      note_body_preview: buildNoteBody(event).slice(0, 500),
+    });
   } catch (err) {
     res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
   }
@@ -840,141 +812,6 @@ app.post("/api/re-enrich", async (_req, res) => {
       total: events?.length || 0,
       sample_results: results.slice(0, 20),
     });
-  } catch (err) {
-    res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
-  }
-});
-
-// Re-enrich ALL zoom events using Apollo (phone→contact for calls, name→contact for meetings)
-app.post("/api/re-enrich-apollo", async (_req, res) => {
-  try {
-    const { getSupabase } = await import("./utils/supabase");
-    const { searchContactByPhone, searchContactByName } = await import("./services/apollo");
-    const supabase = getSupabase();
-
-    const results: Record<string, unknown> = {};
-    let phonesEnriched = 0;
-    let meetingsEnriched = 0;
-    let noMatch = 0;
-    const sampleResults: Array<Record<string, unknown>> = [];
-
-    // 1. Enrich zoom_phone events by phone number
-    const { data: phoneEvents } = await supabase
-      .from("webhook_events")
-      .select("id, payload")
-      .eq("source", "zoom_phone");
-
-    for (const event of phoneEvents || []) {
-      if (event.payload?.enriched_contact?.email) continue; // already enriched
-
-      const obj = (event.payload?.payload as Record<string, unknown>)?.object as Record<string, unknown> | undefined;
-      const caller = obj?.caller as Record<string, unknown> | undefined;
-      const callee = obj?.callee as Record<string, unknown> | undefined;
-      const externalParty = callee?.extension_type === "pstn" ? callee : (caller?.extension_type === "pstn" ? caller : null);
-      const phone = (externalParty?.phone_number || "") as string;
-
-      if (!phone) { noMatch++; continue; }
-
-      const contact = await searchContactByPhone(phone);
-      if (contact?.email) {
-        await supabase
-          .from("webhook_events")
-          .update({
-            payload: {
-              ...event.payload,
-              enriched_contact: {
-                email: contact.email,
-                first_name: contact.first_name,
-                last_name: contact.last_name,
-                company: contact.company,
-                title: contact.title,
-                linkedin_url: contact.linkedin_url,
-                phone,
-              },
-            },
-            processed: false,
-            processed_at: null,
-          })
-          .eq("id", event.id);
-        phonesEnriched++;
-        if (sampleResults.length < 10) {
-          sampleResults.push({ id: event.id, type: "phone", phone, email: contact.email, name: contact.name });
-        }
-      } else {
-        noMatch++;
-        if (sampleResults.length < 10) {
-          sampleResults.push({ id: event.id, type: "phone", phone, email: null, status: "no_match" });
-        }
-      }
-    }
-
-    // 2. Enrich zoom_meeting events by prospect name from topic
-    const { data: meetingEvents } = await supabase
-      .from("webhook_events")
-      .select("id, payload")
-      .eq("source", "zoom_meeting")
-      .neq("event_type", "unknown");
-
-    for (const event of meetingEvents || []) {
-      if (event.payload?.enriched_contact?.email) continue;
-
-      const obj = (event.payload?.payload as Record<string, unknown>)?.object as Record<string, unknown> | undefined;
-      const topic = (obj?.topic || "") as string;
-
-      // Extract prospect name from topic like "SalesGlider Followup - Ramon Guitard and Joshua Osborn"
-      const nameMatch = topic.match(/- (.+?) and Joshua/i) || topic.match(/- (.+?) and Josh/i);
-      if (!nameMatch) {
-        // Try other patterns
-        const altMatch = topic.match(/^(.+?)(?:\s*\/\s*|\s+and\s+)/i);
-        if (!altMatch) { noMatch++; continue; }
-      }
-
-      const prospectName = nameMatch ? nameMatch[1].trim() : "";
-      if (!prospectName) { noMatch++; continue; }
-
-      const [firstName, ...lastParts] = prospectName.split(" ");
-      const lastName = lastParts.join(" ");
-
-      const contact = await searchContactByName(firstName, lastName);
-      if (contact?.email) {
-        await supabase
-          .from("webhook_events")
-          .update({
-            payload: {
-              ...event.payload,
-              enriched_contact: {
-                email: contact.email,
-                first_name: contact.first_name || firstName,
-                last_name: contact.last_name || lastName,
-                company: contact.company,
-                title: contact.title,
-                linkedin_url: contact.linkedin_url,
-              },
-            },
-            processed: false,
-            processed_at: null,
-          })
-          .eq("id", event.id);
-        meetingsEnriched++;
-        if (sampleResults.length < 20) {
-          sampleResults.push({ id: event.id, type: "meeting", name: prospectName, email: contact.email, company: contact.company });
-        }
-      } else {
-        noMatch++;
-        if (sampleResults.length < 20) {
-          sampleResults.push({ id: event.id, type: "meeting", name: prospectName, email: null, status: "no_match" });
-        }
-      }
-    }
-
-    results.phones_enriched = phonesEnriched;
-    results.meetings_enriched = meetingsEnriched;
-    results.no_match = noMatch;
-    results.phone_events_total = phoneEvents?.length || 0;
-    results.meeting_events_total = meetingEvents?.length || 0;
-    results.sample_results = sampleResults;
-
-    res.json(results);
   } catch (err) {
     res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
   }
@@ -1341,227 +1178,78 @@ app.post("/api/process-now", async (_req, res) => {
   }
 });
 
-// Full rebuild: nuke Attio, re-enrich everything, reprocess all events
-// Track rebuild progress in memory so we can poll it
-let rebuildStatus: { running: boolean; steps: Array<{ step: string; status: string; details?: unknown }>; error?: string } = { running: false, steps: [] };
+// ============================================================
+// Three-phase rebuild: dry-run → wipe → replay.
+// Each endpoint is independent; wipe requires confirm=true.
+// ============================================================
+let rebuildStatus: {
+  running: boolean;
+  phase?: "dry-run" | "wipe" | "replay";
+  result?: unknown;
+  error?: string;
+} = { running: false };
 
-app.post("/api/full-rebuild", async (_req, res) => {
-  if (rebuildStatus.running) {
-    return res.json({ message: "Rebuild already in progress", steps: rebuildStatus.steps });
+app.get("/api/rebuild/dry-run", async (_req, res) => {
+  try {
+    const { dryRun } = await import("./jobs/full-rebuild");
+    const report = await dryRun();
+    res.json(report);
+  } catch (err) {
+    res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
   }
+});
 
-  rebuildStatus = { running: true, steps: [] };
-  res.json({ message: "Rebuild started. Poll GET /api/rebuild-status to track progress." });
-
-  // Run everything in background (not blocking the HTTP response)
+app.post("/api/rebuild/wipe", async (req, res) => {
+  if (req.query.confirm !== "true") {
+    return res.status(400).json({
+      error: "Destructive operation. Retry with ?confirm=true to proceed.",
+    });
+  }
+  if (rebuildStatus.running) {
+    return res.status(409).json({ error: "A rebuild phase is already running", status: rebuildStatus });
+  }
+  rebuildStatus = { running: true, phase: "wipe" };
+  res.json({ status: "wipe_started", poll: "/api/rebuild/status" });
   (async () => {
     try {
-      const config = getConfig();
-      const { getSupabase } = await import("./utils/supabase");
-      const supabase = getSupabase();
-
-      // Step 0: Clear dedup caches and ensure all Attio custom fields + pipeline stages exist
-      const { ensureAttioFieldsExist: ensureFields, resetFieldsCache: resetFields, resetDedupeCache } = await import("./services/attio");
-      resetFields();
-      resetDedupeCache();
-      await ensureFields();
-      rebuildStatus.steps.push({ step: "setup_attio_fields", status: "done" });
-
-      // Step 1: Nuke Attio
-      // Helper: fetch with 25s timeout to prevent infinite hangs
-      const fetchT = (url: string, opts: RequestInit = {}) =>
-        fetch(url, { ...opts, signal: AbortSignal.timeout(25000) });
-      const attioHeaders = { Authorization: `Bearer ${config.ATTIO_API_KEY}`, "Content-Type": "application/json" };
-
-      logger.info("Rebuild: starting Attio cleanup");
-      let peopleDeleted = 0;
-      let dealsDeleted = 0;
-      const pipelineId = config.ATTIO_PIPELINE_ID;
-      if (pipelineId) {
-        let safety = 0;
-        while (safety++ < 100) {
-          try {
-            const dealsResp = await fetchT(`https://api.attio.com/v2/lists/${pipelineId}/entries/query`, {
-              method: "POST", headers: attioHeaders, body: JSON.stringify({ limit: 50 }),
-            });
-            if (!dealsResp.ok) { logger.warn("Pipeline query failed", { status: dealsResp.status }); break; }
-            const dealsData = await dealsResp.json() as { data: Array<Record<string, unknown>> };
-            if (!dealsData.data || dealsData.data.length === 0) break;
-            let deletedThisBatch = 0;
-            for (const deal of dealsData.data) {
-              // Attio returns id as { entry_id } object, NOT flat entry_id
-              const entryId = (deal.id as Record<string, string>)?.entry_id || (deal.entry_id as string);
-              if (!entryId) continue;
-              try {
-                const delResp = await fetchT(`https://api.attio.com/v2/lists/${pipelineId}/entries/${entryId}`, {
-                  method: "DELETE", headers: { Authorization: `Bearer ${config.ATTIO_API_KEY}` },
-                });
-                if (delResp.ok) { dealsDeleted++; deletedThisBatch++; }
-              } catch (err) { logger.warn("Failed to delete pipeline entry", { entryId, error: String(err) }); }
-            }
-            if (deletedThisBatch === 0) break; // safety: nothing deleted, avoid infinite loop
-          } catch (err) {
-            logger.error("Pipeline cleanup loop error", { error: String(err) });
-            break;
-          }
-        }
-      }
-      logger.info("Rebuild: pipeline entries deleted", { dealsDeleted });
-
-      // Delete people
-      let safetyP = 0;
-      while (safetyP++ < 200) {
-        try {
-          const resp = await fetchT("https://api.attio.com/v2/objects/people/records/query", {
-            method: "POST", headers: attioHeaders, body: JSON.stringify({ limit: 50 }),
-          });
-          if (!resp.ok) { logger.warn("People query failed", { status: resp.status }); break; }
-          const data = await resp.json() as { data: Array<Record<string, unknown>> };
-          if (!data.data || data.data.length === 0) break;
-          let deletedThisBatch = 0;
-          for (const person of data.data) {
-            const id = (person.id as Record<string, string>)?.record_id;
-            if (!id) continue;
-            try {
-              const delResp = await fetchT(`https://api.attio.com/v2/objects/people/records/${id}`, {
-                method: "DELETE", headers: { Authorization: `Bearer ${config.ATTIO_API_KEY}` },
-              });
-              if (delResp.ok) { peopleDeleted++; deletedThisBatch++; }
-            } catch (err) { logger.warn("Failed to delete person", { id, error: String(err) }); }
-          }
-          if (deletedThisBatch === 0) break;
-        } catch (err) {
-          logger.error("People cleanup loop error", { error: String(err) });
-          break;
-        }
-      }
-      logger.info("Rebuild: people deleted", { peopleDeleted });
-
-      // Delete deal records (separate from pipeline entries)
-      let dealRecordsDeleted = 0;
-      let safetyD = 0;
-      while (safetyD++ < 100) {
-        try {
-          const resp = await fetchT("https://api.attio.com/v2/objects/deals/records/query", {
-            method: "POST", headers: attioHeaders, body: JSON.stringify({ limit: 50 }),
-          });
-          if (!resp.ok) { logger.warn("Deals query failed", { status: resp.status }); break; }
-          const data = await resp.json() as { data: Array<Record<string, unknown>> };
-          if (!data.data || data.data.length === 0) break;
-          let deletedThisBatch = 0;
-          for (const deal of data.data) {
-            const id = (deal.id as Record<string, string>)?.record_id;
-            if (!id) continue;
-            try {
-              const delResp = await fetchT(`https://api.attio.com/v2/objects/deals/records/${id}`, {
-                method: "DELETE", headers: { Authorization: `Bearer ${config.ATTIO_API_KEY}` },
-              });
-              if (delResp.ok) { dealRecordsDeleted++; deletedThisBatch++; }
-            } catch (err) { logger.warn("Failed to delete deal record", { id, error: String(err) }); }
-          }
-          if (deletedThisBatch === 0) break;
-        } catch (err) {
-          logger.error("Deal records cleanup loop error", { error: String(err) });
-          break;
-        }
-      }
-      logger.info("Rebuild: deal records deleted", { dealRecordsDeleted });
-
-      // Delete companies
-      let companiesDeleted = 0;
-      let safetyC = 0;
-      while (safetyC++ < 100) {
-        try {
-          const resp = await fetchT("https://api.attio.com/v2/objects/companies/records/query", {
-            method: "POST", headers: attioHeaders, body: JSON.stringify({ limit: 50 }),
-          });
-          if (!resp.ok) { logger.warn("Companies query failed", { status: resp.status }); break; }
-          const data = await resp.json() as { data: Array<Record<string, unknown>> };
-          if (!data.data || data.data.length === 0) break;
-          let deletedThisBatch = 0;
-          for (const company of data.data) {
-            const id = (company.id as Record<string, string>)?.record_id;
-            if (!id) continue;
-            try {
-              const delResp = await fetchT(`https://api.attio.com/v2/objects/companies/records/${id}`, {
-                method: "DELETE", headers: { Authorization: `Bearer ${config.ATTIO_API_KEY}` },
-              });
-              if (delResp.ok) { companiesDeleted++; deletedThisBatch++; }
-            } catch (err) { logger.warn("Failed to delete company", { id, error: String(err) }); }
-          }
-          if (deletedThisBatch === 0) break;
-        } catch (err) {
-          logger.error("Companies cleanup loop error", { error: String(err) });
-          break;
-        }
-      }
-      logger.info("Rebuild: companies deleted", { companiesDeleted });
-      rebuildStatus.steps.push({ step: "cleanup_attio", status: "done", details: { peopleDeleted, dealsDeleted, dealRecordsDeleted, companiesDeleted } });
-
-      // Step 2: Clear interaction log
-      await supabase.from("interaction_log").delete().neq("id", "00000000-0000-0000-0000-000000000000");
-      rebuildStatus.steps.push({ step: "clear_interaction_log", status: "done" });
-
-      // Step 3: Re-enrich with Apollo (meetings by name) — skip already enriched
-      let apolloEnriched = 0;
-      let apolloSkipped = 0;
-      try {
-        const { searchContactByName } = await import("./services/apollo");
-        const { data: meetingEvents } = await supabase
-          .from("webhook_events")
-          .select("id, payload")
-          .eq("source", "zoom_meeting")
-          .neq("event_type", "unknown");
-
-        for (const event of meetingEvents || []) {
-          if (event.payload?.enriched_contact?.email) { apolloSkipped++; continue; }
-          const obj = (event.payload?.payload as Record<string, unknown>)?.object as Record<string, unknown> | undefined;
-          const topic = (obj?.topic || "") as string;
-          const nameMatch = topic.match(/- (.+?) and Joshua/i) || topic.match(/- (.+?) and Josh/i);
-          if (!nameMatch) continue;
-          const prospectName = nameMatch[1].trim();
-          if (!prospectName) continue;
-          const [firstName, ...lastParts] = prospectName.split(" ");
-          const lastName = lastParts.join(" ");
-          const contact = await searchContactByName(firstName, lastName);
-          if (contact?.email) {
-            await supabase.from("webhook_events").update({
-              payload: {
-                ...event.payload,
-                enriched_contact: {
-                  email: contact.email,
-                  first_name: contact.first_name || firstName,
-                  last_name: contact.last_name || lastName,
-                  company: contact.company,
-                  title: contact.title,
-                  linkedin_url: contact.linkedin_url,
-                },
-              },
-            }).eq("id", event.id);
-            apolloEnriched++;
-          }
-        }
-      } catch (err) {
-        rebuildStatus.steps.push({ step: "apollo_enrich", status: "error", details: String(err) });
-      }
-      rebuildStatus.steps.push({ step: "apollo_enrich_meetings", status: "done", details: { apolloEnriched, apolloSkipped } });
-
-      // Step 4: Reset ALL events to unprocessed
-      await supabase.from("webhook_events").update({ processed: false, processed_at: null }).eq("processed", true);
-      rebuildStatus.steps.push({ step: "reset_events", status: "done" });
-
-      // Step 5: Process events — the cron job will handle this in batches
-      // Don't do it inline to avoid timeout. Just let the 30-second cron pick it up.
-      rebuildStatus.steps.push({ step: "waiting_for_cron", status: "done", details: "Events reset. Cron will process in batches every 30s." });
-
-      rebuildStatus.running = false;
-      rebuildStatus.steps.push({ step: "complete", status: "done" });
+      const { wipe } = await import("./jobs/full-rebuild");
+      rebuildStatus.result = await wipe();
     } catch (err) {
-      rebuildStatus.running = false;
       rebuildStatus.error = err instanceof Error ? err.message : String(err);
-      rebuildStatus.steps.push({ step: "failed", status: "error", details: rebuildStatus.error });
+    } finally {
+      rebuildStatus.running = false;
     }
   })();
+});
+
+app.post("/api/rebuild/replay", async (_req, res) => {
+  if (rebuildStatus.running) {
+    return res.status(409).json({ error: "A rebuild phase is already running", status: rebuildStatus });
+  }
+  rebuildStatus = { running: true, phase: "replay" };
+  res.json({ status: "replay_started", poll: "/api/rebuild/status" });
+  (async () => {
+    try {
+      const { replay } = await import("./jobs/full-rebuild");
+      rebuildStatus.result = await replay();
+    } catch (err) {
+      rebuildStatus.error = err instanceof Error ? err.message : String(err);
+    } finally {
+      rebuildStatus.running = false;
+    }
+  })();
+});
+
+app.get("/api/rebuild/status", (_req, res) => {
+  res.json(rebuildStatus);
+});
+
+// Legacy route removed — use /api/rebuild/{dry-run,wipe,replay} instead.
+app.post("/api/full-rebuild", (_req, res) => {
+  res.status(410).json({
+    error: "Deprecated",
+    use: ["/api/rebuild/dry-run", "/api/rebuild/wipe?confirm=true", "/api/rebuild/replay"],
+  });
 });
 
 app.get("/api/rebuild-status", async (_req, res) => {

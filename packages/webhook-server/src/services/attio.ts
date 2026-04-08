@@ -65,8 +65,6 @@ export function resetFieldsCache(): void {
 }
 
 export function resetDedupeCache(): void {
-    _contactCacheByEmail.clear();
-    _contactCacheByName.clear();
     _companyCache.clear();
 }
 
@@ -369,99 +367,27 @@ function normalizeName(name: string): string {
     return name.trim().toLowerCase().replace(/\b\w/g, c => c.toUpperCase());
 }
 
-export async function findContactByName(firstName: string, lastName: string): Promise<{ id: string; hasEmail: boolean } | null> {
-    const searchName = normalizeName(`${firstName} ${lastName}`.trim());
-    if (!searchName) return null;
-
-  try {
-        const result = (await attioFetch("/objects/people/records/query", {
-              method: "POST",
-              body: JSON.stringify({ limit: 500 }),
-      })) as { data: Array<{ id: { record_id: string }; values: Record<string, unknown> }> };
-
-      const searchLower = searchName.toLowerCase();
-        for (const person of result.data) {
-                const nameValues = person.values?.name as Array<{ full_name?: string; first_name?: string; last_name?: string }> | undefined;
-                if (nameValues) {
-                          for (const nv of nameValues) {
-                                      const fullName = (nv.full_name || `${nv.first_name || ""} ${nv.last_name || ""}`).trim().toLowerCase();
-                                      if (fullName === searchLower) {
-                                                    const emails = person.values?.email_addresses as Array<unknown> | undefined;
-                                                    return { id: person.id.record_id, hasEmail: !!(emails && emails.length > 0) };
-                                      }
-                          }
-                }
-        }
-  } catch (err) {
-        logger.warn("findContactByName query failed", { name: searchName, error: String(err) });
-  }
-    return null;
-}
-
-// In-memory contact cache: email → recordId and name → recordId
-const _contactCacheByEmail = new Map<string, string>();
-const _contactCacheByName = new Map<string, string>();
-
-export async function findOrCreateContact(contact: AttioContact & { title?: string; lead_source?: string; industry?: string }): Promise<string> {
-    const email = contact.email && contact.email !== "unknown" && contact.email.includes("@") ? contact.email.toLowerCase() : null;
-    const fullName = contact.first_name && contact.last_name
-      ? normalizeName(`${contact.first_name} ${contact.last_name}`)
-          : null;
-
-  // RULE: email is ground truth. If we have an email, ONLY match by email.
-  // Two records with different emails are ALWAYS different people, even if names match.
+/**
+ * Thin wrapper — identity layer owns dedup, Attio is just storage.
+ * If the email already exists in Attio, update and return its id.
+ * Otherwise create a new record. No name matching, no in-memory caches.
+ */
+export async function findOrCreateContact(
+  contact: AttioContact & { title?: string; lead_source?: string; industry?: string }
+): Promise<string> {
+  const email = contact.email && contact.email.includes("@") ? contact.email.toLowerCase() : null;
   if (email) {
-        if (_contactCacheByEmail.has(email)) {
-              const cachedId = _contactCacheByEmail.get(email)!;
-              logger.info("Contact found in cache by email", { email, id: cachedId });
-              await updateExistingContact(cachedId, contact);
-              return cachedId;
-        }
-        const existing = await findContact(email);
-        if (existing) {
-              logger.info("Found existing Attio contact by email — updating", { email, id: existing.id });
-              _contactCacheByEmail.set(email, existing.id);
-              if (fullName) _contactCacheByName.set(fullName, existing.id);
-              await updateExistingContact(existing.id, contact);
-              return existing.id;
-        }
-        // Email provided but not found anywhere → create new. Do NOT name-match.
-        const newId = await createContact(contact);
-        _contactCacheByEmail.set(email, newId);
-        if (fullName) _contactCacheByName.set(fullName, newId);
-        return newId;
+    const existing = await findContact(email);
+    if (existing) {
+      await updateExistingContact(existing.id, contact);
+      return existing.id;
+    }
   }
-
-  // No email → fall back to name matching, but only to records that ALSO have no email
-  // (so we don't silently merge a no-email new contact onto someone with a different email).
-  if (fullName && _contactCacheByName.has(fullName)) {
-        const cachedId = _contactCacheByName.get(fullName)!;
-        logger.info("Contact found in cache by name", { name: fullName, id: cachedId });
-        await updateExistingContact(cachedId, contact);
-        return cachedId;
-  }
-
-  if (contact.first_name && contact.last_name) {
-        const existing = await findContactByName(contact.first_name, contact.last_name);
-        if (existing && !existing.hasEmail) {
-              logger.info("Found existing Attio contact by name (no email conflict) — updating", { name: fullName, id: existing.id });
-              if (fullName) _contactCacheByName.set(fullName, existing.id);
-              await updateExistingContact(existing.id, contact);
-              return existing.id;
-        }
-        if (existing && existing.hasEmail) {
-              logger.info("Name match found but existing record has email — creating new record to avoid merging different people", { name: fullName });
-        }
-  }
-
-  // Create new contact
-  const newId = await createContact(contact);
-    if (fullName) _contactCacheByName.set(fullName, newId);
-    return newId;
+  return await createContact(contact);
 }
 
 // Update an existing contact with any new data we have
-async function updateExistingContact(
+export async function updateExistingContact(
     recordId: string,
     contact: AttioContact & { title?: string; lead_source?: string; industry?: string }
   ): Promise<void> {
@@ -907,4 +833,69 @@ export async function getAllDeals(): Promise<
   })) as { data: Array<Record<string, unknown>> };
 
   return result.data as ReturnType<typeof getAllDeals> extends Promise<infer T> ? T : never;
+}
+
+// --- Wipe helpers (used by /api/rebuild/wipe) ---
+
+export async function listAllPeople(): Promise<Array<{ id: string }>> {
+  const out: Array<{ id: string }> = [];
+  let offset = 0;
+  const limit = 500;
+  while (true) {
+    const result = (await attioFetch("/objects/people/records/query", {
+      method: "POST",
+      body: JSON.stringify({ limit, offset }),
+    })) as { data: Array<{ id: { record_id: string } }> };
+    const batch = result.data || [];
+    for (const p of batch) out.push({ id: p.id.record_id });
+    if (batch.length < limit) break;
+    offset += limit;
+  }
+  return out;
+}
+
+export async function listAllDealRecords(): Promise<Array<{ id: string }>> {
+  const out: Array<{ id: string }> = [];
+  let offset = 0;
+  const limit = 500;
+  while (true) {
+    const result = (await attioFetch("/objects/deals/records/query", {
+      method: "POST",
+      body: JSON.stringify({ limit, offset }),
+    })) as { data: Array<{ id: { record_id: string } }> };
+    const batch = result.data || [];
+    for (const d of batch) out.push({ id: d.id.record_id });
+    if (batch.length < limit) break;
+    offset += limit;
+  }
+  return out;
+}
+
+export async function listAllCompanies(): Promise<Array<{ id: string }>> {
+  const out: Array<{ id: string }> = [];
+  let offset = 0;
+  const limit = 500;
+  while (true) {
+    const result = (await attioFetch("/objects/companies/records/query", {
+      method: "POST",
+      body: JSON.stringify({ limit, offset }),
+    })) as { data: Array<{ id: { record_id: string } }> };
+    const batch = result.data || [];
+    for (const c of batch) out.push({ id: c.id.record_id });
+    if (batch.length < limit) break;
+    offset += limit;
+  }
+  return out;
+}
+
+export async function deletePerson(recordId: string): Promise<void> {
+  await attioFetch(`/objects/people/records/${recordId}`, { method: "DELETE" });
+}
+
+export async function deleteDeal(recordId: string): Promise<void> {
+  await attioFetch(`/objects/deals/records/${recordId}`, { method: "DELETE" });
+}
+
+export async function deleteCompany(recordId: string): Promise<void> {
+  await attioFetch(`/objects/companies/records/${recordId}`, { method: "DELETE" });
 }

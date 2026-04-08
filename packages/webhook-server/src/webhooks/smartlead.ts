@@ -1,11 +1,11 @@
 import { Router, Request, Response } from "express";
-import { storeWebhookEvent } from "../services/event-store";
+import { storeWebhookEvent, addIdentityReviewRow } from "../services/event-store";
+import { computeIdentityKey, buildIdentityHint } from "../services/identity";
 import { logger } from "../utils/logger";
 
 export const smartleadRouter = Router();
 
 // SmartLead sends webhooks when leads reply, open emails, click links, etc.
-// We care most about replies (positive signals).
 smartleadRouter.post("/", async (req: Request, res: Response) => {
   try {
     const payload = req.body;
@@ -13,8 +13,24 @@ smartleadRouter.post("/", async (req: Request, res: Response) => {
 
     logger.info("Received SmartLead webhook", { eventType });
 
-    // Store raw event for processing
-    const eventId = await storeWebhookEvent("smartlead", eventType, payload);
+    const identityKey = computeIdentityKey("smartlead", payload);
+    const eventId = await storeWebhookEvent("smartlead", eventType, payload, identityKey);
+
+    if (!identityKey) {
+      await addIdentityReviewRow(
+        eventId,
+        "smartlead_no_email",
+        buildIdentityHint({
+          id: eventId,
+          source: "smartlead",
+          event_type: eventType,
+          payload,
+          received_at: new Date().toISOString(),
+          processed: false,
+        })
+      );
+      return res.status(200).json({ received: true, queued_for_review: true });
+    }
 
     res.status(200).json({ received: true, event_id: eventId });
   } catch (err) {

@@ -1,16 +1,15 @@
-import { getConfig } from "../config";
 import { logger } from "../utils/logger";
-import { processEvent } from "./ai-processor";
-import { enrichPerson as apolloEnrich, searchPeopleGlobal, searchContactByPhone } from "../services/apollo";
+import { enrichPerson as apolloEnrich } from "../services/apollo";
+import { enrichContact, enrichByLinkedIn } from "../services/leadmagic";
 import {
   getUnprocessedEvents,
   markEventProcessed,
-  addToReviewQueue,
   logInteraction,
 } from "../services/event-store";
 import {
   findContact,
-  findOrCreateContact,
+  createContact,
+  updateExistingContact,
   findDealByContact,
   createDeal,
   updateDealStage,
@@ -19,16 +18,23 @@ import {
   setPersonDescription,
   setDealDescription,
 } from "../services/attio";
-import { enrichContact } from "../services/leadmagic";
-import type { AIProcessingResult, WebhookEvent, EventSource } from "@crm-autopilot/shared";
+import {
+  resolveOrCreateIdentity,
+  updateIdentityAttioIds,
+} from "../services/identity";
+import {
+  classifyEvent,
+  extractContactFromEvent,
+  buildNoteBody,
+  type ExtractedContact,
+} from "../services/rules";
+import type { WebhookEvent } from "@crm-autopilot/shared";
 
-// Sources that CREATE new contacts (outbound-first channels)
-const LEAD_SOURCES: EventSource[] = ["smartlead", "heyreach", "zoom_phone", "zoom_meeting"];
+// ============================================================
+// Event pipeline — rule-based, identity-first.
+// No Gemini. No Node-level dedup. No Apollo cascade.
+// ============================================================
 
-// Sources that only ENRICH existing contacts (don't create new ones)
-const ENRICHMENT_ONLY_SOURCES: EventSource[] = ["gmail"];
-
-// Process all unprocessed events in the queue
 export async function processEventQueue(): Promise<void> {
   const events = await getUnprocessedEvents();
   if (events.length === 0) return;
@@ -42,17 +48,14 @@ export async function processEventQueue(): Promise<void> {
       const errMsg = err instanceof Error ? err.message : String(err);
       logger.error("Failed to process event", { eventId: event.id, error: errMsg });
 
-      // If AI fails (rate limit, bad response, etc), mark as processed with error
-      // so it doesn't retry forever and burn money
       const retryCount = ((event.payload as any)?._retry_count || 0) + 1;
       if (retryCount >= 3) {
-        logger.warn("Event failed 3 times, marking as processed to stop retries", {
+        logger.warn("Event failed 3 times, marking processed to stop retries", {
           eventId: event.id,
           source: event.source,
         });
         await markEventProcessed(event.id);
       } else {
-        // Increment retry count in payload
         const { getSupabase } = await import("../utils/supabase");
         await getSupabase()
           .from("webhook_events")
@@ -64,174 +67,177 @@ export async function processEventQueue(): Promise<void> {
 }
 
 async function processSingleEvent(event: WebhookEvent): Promise<void> {
-  const config = getConfig();
-
-  // Step 1: AI interprets the event
-  logger.info("AI processing event", { eventId: event.id, source: event.source });
-  const result = await processEvent(event);
-
-  // Step 1.5: Merge enriched_contact data (from Apollo/LeadMagic) into AI result
-  // The AI doesn't see this data, so we overlay it here
-  const enriched = event.payload?.enriched_contact as Record<string, string> | undefined;
-  if (enriched) {
-    if (enriched.email && enriched.email.includes("@")) {
-      result.contact.email = enriched.email;
-    }
-    if (enriched.first_name) result.contact.first_name = result.contact.first_name || enriched.first_name;
-    if (enriched.last_name) result.contact.last_name = result.contact.last_name || enriched.last_name;
-    if (enriched.company) result.contact.company = result.contact.company || enriched.company;
-    if (enriched.title) result.contact.title = result.contact.title || enriched.title;
-    if (enriched.linkedin_url) result.contact.linkedin_url = result.contact.linkedin_url || enriched.linkedin_url;
-    if (enriched.phone) result.contact.phone = result.contact.phone || enriched.phone;
-    logger.info("Merged enriched_contact into AI result", {
-      email: result.contact.email,
-      name: `${result.contact.first_name} ${result.contact.last_name}`,
-      company: result.contact.company,
+  // Events without an identity key are already in review_queue — nothing to do here.
+  const identityKey = (event as unknown as { identity_key?: string | null }).identity_key;
+  if (!identityKey) {
+    logger.info("Skipping event with no identity_key (already in review queue)", {
+      eventId: event.id,
+      source: event.source,
     });
+    await markEventProcessed(event.id);
+    return;
   }
 
-  // Step 1.6: For zoom events, extract phone/name from raw payload if AI missed them
-  if (event.source === "zoom_phone") {
-    const obj = (event.payload?.payload as Record<string, unknown>)?.object as Record<string, unknown> | undefined;
-    const caller = obj?.caller as Record<string, unknown> | undefined;
-    const callee = obj?.callee as Record<string, unknown> | undefined;
-    const external = callee?.extension_type === "pstn" ? callee : (caller?.extension_type === "pstn" ? caller : null);
-    if (external && !result.contact.phone) {
-      result.contact.phone = (external.phone_number || "") as string;
-    }
-    if (external?.name && (!result.contact.first_name || result.contact.first_name === "unknown")) {
-      const parts = ((external.name as string) || "").split(" ");
-      result.contact.first_name = parts[0] || undefined;
-      result.contact.last_name = parts.slice(1).join(" ") || undefined;
-    }
-  }
-  // Use any emails we extracted from the Zoom meeting payload (attendees/description/transcript)
-  const extractedEmails = event.payload?.extracted_emails as string[] | undefined;
-  if (extractedEmails && extractedEmails.length > 0 && (!result.contact.email || result.contact.email === "unknown")) {
-    result.contact.email = extractedEmails[0];
-    logger.info("Using extracted email from Zoom payload", { email: extractedEmails[0] });
-  }
+  // 1. Rule-based classification (no LLM).
+  const classification = classifyEvent(event);
+  const contact = extractContactFromEvent(event);
 
-  if (event.source === "zoom_meeting") {
-    const obj = (event.payload?.payload as Record<string, unknown>)?.object as Record<string, unknown> | undefined;
-    const topic = (obj?.topic || "") as string;
-    // Extract prospect name from meeting topic if AI missed it
-    if (!result.contact.first_name || result.contact.first_name === "unknown") {
-      const nameMatch = topic.match(/- (.+?) and Joshua/i) || topic.match(/- (.+?) and Josh/i);
-      if (nameMatch) {
-        const parts = nameMatch[1].trim().split(" ");
-        result.contact.first_name = parts[0];
-        result.contact.last_name = parts.slice(1).join(" ");
+  // 2. Fill gaps in contact fields via LeadMagic, then Apollo email fallback.
+  await enrichContactFields(contact);
+
+  // 3. Resolve-or-create identity row (atomic, DB-serialized).
+  const identity = await resolveOrCreateIdentity(identityKey, event.source);
+  logger.info("Identity resolved", {
+    identityKey,
+    identityId: identity.id,
+    existingAttioPerson: identity.attio_person_id,
+  });
+
+  // 4. Ensure Attio person exists.
+  let attioPersonId = identity.attio_person_id;
+  if (attioPersonId) {
+    // Refresh with any new fields.
+    await updateExistingContact(attioPersonId, {
+      email: contact.email || "",
+      first_name: contact.first_name,
+      last_name: contact.last_name,
+      company: contact.company,
+      phone: contact.phone,
+      linkedin_url: contact.linkedin_url,
+      title: contact.title,
+      lead_source: event.source,
+    });
+  } else {
+    // Check Attio directly by email in case we wiped identity_map but kept Attio.
+    if (contact.email) {
+      const existing = await findContact(contact.email);
+      if (existing) {
+        attioPersonId = existing.id;
+        await updateExistingContact(existing.id, {
+          email: contact.email,
+          first_name: contact.first_name,
+          last_name: contact.last_name,
+          company: contact.company,
+          phone: contact.phone,
+          linkedin_url: contact.linkedin_url,
+          title: contact.title,
+          lead_source: event.source,
+        });
       }
     }
+    if (!attioPersonId) {
+      attioPersonId = await createContact({
+        email: contact.email || "",
+        first_name: contact.first_name,
+        last_name: contact.last_name,
+        company: contact.company,
+        phone: contact.phone,
+        linkedin_url: contact.linkedin_url,
+        title: contact.title,
+        lead_source: event.source,
+      });
+    }
+    await updateIdentityAttioIds(identity.id, { attio_person_id: attioPersonId });
   }
 
-  // Step 2: Log the interaction in our timeline
+  // 5. Find-or-create deal.
+  let attioDealId = identity.attio_deal_id;
+  if (!attioDealId) {
+    const existingDeal = await findDealByContact(attioPersonId);
+    if (existingDeal) {
+      attioDealId = existingDeal.id;
+      await updateDealStage(attioDealId, classification.deal_stage);
+    } else {
+      try {
+        attioDealId = await createDeal({
+          name: classification.deal_title,
+          stage: classification.deal_stage,
+          contact_id: attioPersonId,
+          company: contact.company,
+          value: classification.deal_value,
+          term_months: classification.term_months,
+        });
+      } catch (err) {
+        logger.error("Deal creation failed", {
+          contactId: attioPersonId,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }
+    if (attioDealId) {
+      await updateIdentityAttioIds(identity.id, { attio_deal_id: attioDealId });
+    }
+  } else {
+    await updateDealStage(attioDealId, classification.deal_stage);
+  }
+
+  // 6. Build verbatim note and write it to both deal and person.
+  const noteTitle = `[${classification.sentiment.toUpperCase()}] ${classification.deal_stage_reason}`;
+  const noteBody = buildNoteBody(event);
+
+  if (attioDealId) {
+    try {
+      await createNote({
+        parent_object: "deals",
+        parent_id: attioDealId,
+        title: noteTitle,
+        content: noteBody,
+      });
+    } catch (err) {
+      logger.warn("Deal note creation failed", { attioDealId, error: String(err) });
+    }
+  }
+  try {
+    await createNote({
+      parent_object: "people",
+      parent_id: attioPersonId,
+      title: noteTitle,
+      content: noteBody,
+    });
+  } catch (err) {
+    logger.warn("Person note creation failed", { attioPersonId, error: String(err) });
+  }
+
+  const descriptionText = `${noteTitle}\n\n${noteBody}`.slice(0, 4000);
+  await setPersonDescription(attioPersonId, descriptionText);
+  if (attioDealId) await setDealDescription(attioDealId, descriptionText);
+
+  // 7. Log interaction for nurture tracking.
   await logInteraction({
-    contact_email: result.contact.email || "unknown",
+    contact_email: contact.email || identityKey,
     source: event.source,
     event_type: event.event_type,
-    summary: result.note.summary,
-    sentiment: result.note.sentiment,
+    summary: noteBody.slice(0, 500),
+    sentiment: classification.sentiment,
     raw_event_id: event.id,
     occurred_at: event.received_at,
   });
 
-  // Step 3: Either queue for review or apply directly
-  if (config.REVIEW_MODE) {
-    await addToReviewQueue(event.id, event.source, result);
-    logger.info("Event queued for review", { eventId: event.id });
-  } else {
-    await applyToAttio(result, event.source, event.payload);
-  }
-
-  // Mark the raw event as processed
   await markEventProcessed(event.id);
+
+  logger.info("Applied event to Attio", {
+    eventId: event.id,
+    identityKey,
+    attioPersonId,
+    attioDealId,
+    stage: classification.deal_stage,
+  });
 }
 
-// Check if an email is valid (not fabricated or placeholder)
-function isValidEmail(email: string): boolean {
-  if (!email || email === "unknown" || email === "none" || email === "n/a") return false;
-  // Skip internal team members
-  if (email === "skip_internal") return false;
-  // Reject fabricated emails with "unknown" in the domain
-  if (email.includes("unknown")) return false;
-  // Reject obviously fake patterns
-  if (email.includes("example.com") || email.includes("test.com")) return false;
-  // Must look like an email
-  if (!email.includes("@") || !email.includes(".")) return false;
-  // Skip anyone from SalesGlider
-  if (email.toLowerCase().includes("salesglidergrowth.com")) return false;
-  return true;
-}
+/**
+ * Fill missing contact fields. Order of preference:
+ *   1. LeadMagic by email
+ *   2. LeadMagic by LinkedIn
+ *   3. Apollo /people/match by email
+ */
+async function enrichContactFields(contact: ExtractedContact): Promise<void> {
+  const missingAny =
+    !contact.phone || !contact.linkedin_url || !contact.title || !contact.company;
+  if (!missingAny) return;
 
-// Apply an AI processing result to Attio CRM
-export async function applyToAttio(
-  result: AIProcessingResult,
-  source?: EventSource,
-  rawPayload?: Record<string, unknown>
-): Promise<void> {
-  const contact = result.contact;
-
-  if (!isValidEmail(contact.email)) {
-    // Must have at least a name to create a contact — no more unnamed records
-    const hasName = contact.first_name && contact.first_name !== "unknown";
-    if (!hasName) {
-      logger.warn("No valid email or name — skipping Attio update (prevents unnamed contacts)", {
-        eventId: result.event_id,
-        email: contact.email,
-        phone: contact.phone,
-        source,
-      });
-      return;
-    }
-
-    // Has a name but no email — allow for phone calls and meetings
-    if (contact.phone && source === "zoom_phone") {
-      logger.info("No email but have name+phone, creating contact", {
-        name: `${contact.first_name} ${contact.last_name}`,
-        phone: contact.phone,
-        eventId: result.event_id,
-      });
-    } else if (source === "zoom_meeting") {
-      logger.info("No email but have name from meeting, creating contact", {
-        name: `${contact.first_name} ${contact.last_name}`,
-        eventId: result.event_id,
-      });
-    } else {
-      logger.warn("No valid email — skipping Attio update", {
-        eventId: result.event_id,
-        email: contact.email,
-        source,
-      });
-      return;
-    }
-  }
-
-  // --- SOURCE-BASED LOGIC ---
-  // Lead sources (SmartLead, HeyReach, Zoom Phone, Zoom Meeting): CREATE new contacts
-  // Gmail: ONLY update existing contacts (pure enrichment)
-  const isEnrichmentOnly = source && ENRICHMENT_ONLY_SOURCES.includes(source);
-
-  if (isEnrichmentOnly) {
-    // Check if contact already exists in Attio
-    const existingContact = contact.email ? await findContact(contact.email) : null;
-
-    if (!existingContact) {
-      logger.info("Skipping enrichment-only event — contact not in CRM", {
-        email: contact.email,
-        source,
-        eventId: result.event_id,
-      });
-      return;
-    }
-
-    // Contact exists — enrich and update their deal
-    const contactId = existingContact.id;
-
-    // Enrich with LeadMagic
-    try {
-      const enriched = await enrichContact({
+  try {
+    if (contact.email) {
+      const lm = await enrichContact({
         email: contact.email,
         first_name: contact.first_name,
         last_name: contact.last_name,
@@ -239,272 +245,41 @@ export async function applyToAttio(
         linkedin_url: contact.linkedin_url,
         phone: contact.phone,
       });
-      if (enriched.enriched) {
-        contact.first_name = contact.first_name || enriched.first_name;
-        contact.last_name = contact.last_name || enriched.last_name;
-        contact.company = contact.company || enriched.company;
-        contact.linkedin_url = contact.linkedin_url || enriched.linkedin_url;
-        contact.phone = contact.phone || enriched.phone;
+      if (lm.enriched) {
+        contact.first_name = contact.first_name || lm.first_name;
+        contact.last_name = contact.last_name || lm.last_name;
+        contact.company = contact.company || lm.company;
+        contact.title = contact.title || lm.title;
+        contact.linkedin_url = contact.linkedin_url || lm.linkedin_url;
+        contact.phone = contact.phone || lm.phone;
       }
-    } catch (err) {
-      logger.warn("LeadMagic enrichment failed", { error: String(err) });
+    } else if (contact.linkedin_url) {
+      const lm = await enrichByLinkedIn(contact.linkedin_url);
+      if (lm) {
+        contact.email = contact.email || lm.email;
+        contact.first_name = contact.first_name || lm.first_name;
+        contact.last_name = contact.last_name || lm.last_name;
+        contact.company = contact.company || lm.company_name;
+        contact.title = contact.title || lm.professional_title;
+        contact.phone = contact.phone || lm.mobile_number;
+      }
     }
-
-    // Find existing deal and update it
-    const existingDeal = await findDealByContact(contactId);
-    if (existingDeal) {
-      await updateDealStage(existingDeal.id, result.deal.stage);
-      const t = `[${result.note.sentiment.toUpperCase()}] ${result.deal.stage_reason}`;
-      const b = buildNoteContent(result, rawPayload);
-      await createNote({
-        parent_object: "deals",
-        parent_id: existingDeal.id,
-        title: t,
-        content: b,
-      });
-      try {
-        await createNote({ parent_object: "people", parent_id: contactId, title: t, content: b });
-      } catch (err) {
-        logger.warn("Person note creation failed", { contactId, error: String(err) });
-      }
-      const descText = `${t}\n\n${b}`.slice(0, 4000);
-      await setPersonDescription(contactId, descText);
-      await setDealDescription(existingDeal.id, descText);
-      if (result.task) {
-        await createTask({
-          title: result.task.title,
-          description: result.task.description,
-          linked_deal_id: existingDeal.id,
-          due_date: result.task.due_date,
-        });
-      }
-      logger.info("Enriched existing contact from " + source, {
-        email: contact.email,
-        dealId: existingDeal.id,
-      });
-    } else {
-      logger.info("Contact exists but no deal — skipping enrichment", {
-        email: contact.email,
-        source,
-      });
-    }
-    return;
+  } catch (err) {
+    logger.warn("LeadMagic enrichment failed", { error: String(err) });
   }
 
-  // --- LEAD SOURCE: Create new contacts and deals ---
-
-  // Apollo enrichment: try multiple strategies to find the person and backfill all fields.
-  // Sanitize: don't let "unknown" or our own email leak into Apollo
-  const ownDomain = (process.env.OWN_EMAIL_DOMAIN || "").toLowerCase();
-  const validEmail = contact.email
-    && contact.email !== "unknown"
-    && contact.email.includes("@")
-    && !(ownDomain && contact.email.toLowerCase().endsWith(`@${ownDomain}`))
-    ? contact.email
-    : undefined;
-  if (!validEmail || !contact.phone || !contact.linkedin_url || !contact.title) {
+  // Apollo fallback — email-only
+  if ((!contact.phone || !contact.linkedin_url || !contact.title) && contact.email) {
     try {
-      let apolloResult = null;
-      const fullName = [contact.first_name, contact.last_name].filter(Boolean).join(" ").trim();
-      const domain = validEmail?.split("@")[1];
-
-      // Strategy 1: /people/match by email — highest match rate when we have one
-      if (!apolloResult && validEmail) {
-        apolloResult = await apolloEnrich({ email: validEmail });
-      }
-      // Strategy 2: /people/match by name + domain
-      if (!apolloResult && contact.first_name && contact.last_name && domain) {
-        apolloResult = await apolloEnrich({
-          first_name: contact.first_name,
-          last_name: contact.last_name,
-          domain,
-        });
-      }
-      // Strategy 3: /people/match by name + organization_name
-      if (!apolloResult && contact.first_name && contact.last_name && contact.company) {
-        apolloResult = await apolloEnrich({
-          first_name: contact.first_name,
-          last_name: contact.last_name,
-          organization_name: contact.company,
-        });
-      }
-      // Strategy 4: /people/match by linkedin_url
-      if (!apolloResult && contact.linkedin_url) {
-        apolloResult = await apolloEnrich({ linkedin_url: contact.linkedin_url });
-      }
-      // Strategy 5: /mixed_people/api_search with name + company (Apollo remembers unlocks against your account)
-      if (!apolloResult && contact.first_name && contact.last_name) {
-        apolloResult = await searchPeopleGlobal({
-          first_name: contact.first_name,
-          last_name: contact.last_name,
-          organization_name: contact.company,
-          organization_domain: domain,
-        });
-      }
-      // Strategy 6: /mixed_people/api_search by email keyword
-      if (!apolloResult && validEmail) {
-        apolloResult = await searchPeopleGlobal({ email: validEmail });
-      }
-      // Strategy 7: phone-based global search
-      if (!apolloResult && contact.phone) {
-        const found = await searchContactByPhone(contact.phone);
-        if (found) apolloResult = found;
-      }
-      if (apolloResult) {
-        contact.email = contact.email || apolloResult.email;
-        contact.phone = contact.phone || apolloResult.phone;
-        contact.linkedin_url = contact.linkedin_url || apolloResult.linkedin_url;
-        contact.title = contact.title || apolloResult.title;
-        contact.company = contact.company || apolloResult.company;
-        logger.info("Apollo enrichment applied", {
-          name: `${contact.first_name} ${contact.last_name}`,
-          gotEmail: !!apolloResult.email,
-          gotPhone: !!apolloResult.phone,
-          gotLinkedin: !!apolloResult.linkedin_url,
-          gotTitle: !!apolloResult.title,
-        });
-      } else {
-        logger.warn("Apollo found nothing for contact", {
-          name: `${contact.first_name} ${contact.last_name}`,
-          email: contact.email,
-          phone: contact.phone,
-          company: contact.company,
-        });
+      const ap = await apolloEnrich({ email: contact.email });
+      if (ap) {
+        contact.phone = contact.phone || ap.phone;
+        contact.linkedin_url = contact.linkedin_url || ap.linkedin_url;
+        contact.title = contact.title || ap.title;
+        contact.company = contact.company || ap.company;
       }
     } catch (err) {
       logger.warn("Apollo enrichment failed", { error: String(err) });
     }
   }
-
-  // 1. Find or create the contact in Attio
-  const contactId = await findOrCreateContact({
-    email: contact.email,
-    first_name: contact.first_name,
-    last_name: contact.last_name,
-    company: contact.company,
-    phone: contact.phone,
-    linkedin_url: contact.linkedin_url,
-    title: contact.title,
-    lead_source: source,
-  });
-
-  // 2. Find or create the deal (non-fatal — contact is more important)
-  let dealId: string | null = null;
-  try {
-    const existingDeal = await findDealByContact(contactId);
-    if (existingDeal) {
-      dealId = existingDeal.id;
-      await updateDealStage(dealId, result.deal.stage);
-    } else {
-      dealId = await createDeal({
-        name: result.deal.title,
-        stage: result.deal.stage,
-        contact_id: contactId,
-        company: contact.company,
-        value: result.deal.value,
-        term_months: result.deal.term_months,
-      });
-    }
-  } catch (err) {
-    logger.error("Deal creation failed — contact was created, deal was not", {
-      contactId,
-      error: err instanceof Error ? err.message : String(err),
-    });
-  }
-
-  // 3. Log a note on BOTH the deal and the person (non-fatal)
-  const noteTitle = `[${result.note.sentiment.toUpperCase()}] ${result.deal.stage_reason}`;
-  const noteBody = buildNoteContent(result, rawPayload);
-  if (dealId) {
-    try {
-      await createNote({
-        parent_object: "deals",
-        parent_id: dealId,
-        title: noteTitle,
-        content: noteBody,
-      });
-    } catch (err) {
-      logger.warn("Deal note creation failed", { dealId, error: String(err) });
-    }
-  }
-  try {
-    await createNote({
-      parent_object: "people",
-      parent_id: contactId,
-      title: noteTitle,
-      content: noteBody,
-    });
-  } catch (err) {
-    logger.warn("Person note creation failed", { contactId, error: String(err) });
-  }
-
-  // Also mirror the note into the Description field so it shows up in list/table views.
-  const descriptionText = `${noteTitle}\n\n${noteBody}`.slice(0, 4000);
-  await setPersonDescription(contactId, descriptionText);
-  if (dealId) await setDealDescription(dealId, descriptionText);
-
-  // 4. Create a follow-up task if warranted (non-fatal)
-  if (result.task && dealId) {
-    try {
-      await createTask({
-        title: result.task.title,
-        description: result.task.description,
-        linked_deal_id: dealId,
-        due_date: result.task.due_date,
-      });
-    } catch (err) {
-      logger.warn("Task creation failed", { dealId, error: String(err) });
-    }
-  }
-
-  logger.info("Applied event to Attio", {
-    eventId: result.event_id,
-    contactEmail: contact.email,
-    dealId,
-    stage: result.deal.stage,
-  });
-}
-
-function buildNoteContent(result: AIProcessingResult, rawPayload?: Record<string, unknown>): string {
-  const parts: string[] = [];
-
-  // Zoom AI Companion doc URL — the only Zoom link we want (not the meeting recording, not the join URL)
-  if (rawPayload?.zoom_ai_summary_url) {
-    parts.push(`Zoom AI Summary: ${rawPayload.zoom_ai_summary_url}`);
-  }
-
-  // If Zoom AI Companion provided a summary, use IT verbatim (it already has next steps + pricing).
-  // Skip the Gemini-extracted next_steps/pricing for Zoom events so we don't double-dip.
-  const hasZoomSummary = !!rawPayload?.zoom_ai_summary;
-  if (hasZoomSummary) {
-    parts.push(String(rawPayload!.zoom_ai_summary));
-  }
-
-  let content = parts.join("\n\n");
-
-  // For non-Zoom events (or Zoom events where Companion summary wasn't available), fall back to Gemini extraction
-  if (!hasZoomSummary) {
-    if (result.note.pricing_discussed) {
-      content += "\n\n💰 Pricing was discussed in this interaction.";
-      if (result.deal.value) {
-        content += ` Deal value: $${result.deal.value.toLocaleString()}/mo`;
-        if (result.deal.term_months) {
-          content += ` × ${result.deal.term_months} months ($${(result.deal.value * result.deal.term_months).toLocaleString()} total)`;
-        }
-      }
-    }
-
-    if (result.note.next_steps) {
-      content += `\n\nNext Steps: ${result.note.next_steps}`;
-    }
-  }
-
-  if (result.nurture_context) {
-    content += `\n\n--- Nurture Context ---`;
-    content += `\nLast positive interaction: ${result.nurture_context.last_positive_interaction}`;
-    content += `\nWhat was said: ${result.nurture_context.what_was_said}`;
-    content += `\nDays since engagement: ${result.nurture_context.days_since_engagement}`;
-  }
-
-  return content;
 }

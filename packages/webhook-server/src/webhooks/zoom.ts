@@ -1,84 +1,22 @@
 import { Router, Request, Response } from "express";
-import { storeWebhookEvent } from "../services/event-store";
+import { storeWebhookEvent, addIdentityReviewRow } from "../services/event-store";
 import { verifyZoomWebhook, handleZoomChallenge } from "../services/zoom";
 import * as zoomService from "../services/zoom";
 import { enrichContact } from "../services/leadmagic";
-import { getSupabase } from "../utils/supabase";
+import * as gmailService from "../services/gmail";
+import {
+  computeIdentityKey,
+  emailKey,
+  phoneKey,
+  lookupMeetingLink,
+  buildIdentityHint,
+} from "../services/identity";
 import { logger } from "../utils/logger";
 
 export const zoomRouter = Router();
 
-// In-memory dedup for Zoom scheduler notifications.
-// Key = meeting ID, value = timestamp of first notification.
-// Entries expire after 5 minutes.
-const recentMeetingEvents = new Map<string, number>();
-const DEDUP_WINDOW_MS = 5 * 60 * 1000; // 5 minutes
-
-function isDuplicateMeetingEvent(meetingId: string, eventType: string): boolean {
-  const key = `${meetingId}:${eventType}`;
-  const now = Date.now();
-
-  // Prune stale entries
-  for (const [k, ts] of recentMeetingEvents) {
-    if (now - ts > DEDUP_WINDOW_MS) recentMeetingEvents.delete(k);
-  }
-
-  if (recentMeetingEvents.has(key)) {
-    logger.info("Duplicate Zoom meeting event suppressed", { meetingId, eventType });
-    return true;
-  }
-
-  recentMeetingEvents.set(key, now);
-  return false;
-}
-
-/**
- * Also check Supabase for persistent dedup — in case the server restarted
- * between duplicate notifications.
- */
-async function isDuplicateInDb(meetingId: string, eventType: string): Promise<boolean> {
-  try {
-    const supabase = getSupabase();
-    const fiveMinAgo = new Date(Date.now() - DEDUP_WINDOW_MS).toISOString();
-
-    const { data } = await supabase
-      .from("webhook_events")
-      .select("id")
-      .eq("source", "zoom_meeting")
-      .eq("event_type", eventType)
-      .gte("received_at", fiveMinAgo)
-      .limit(10);
-
-    // Check if any existing event has the same meeting ID in payload
-    if (data && data.length > 0) {
-      // Quick check — if we already stored one for this event type recently, it's a dup
-      // We do a more precise check by looking at the payload
-      const { data: matchingEvents } = await supabase
-        .from("webhook_events")
-        .select("id, payload")
-        .eq("source", "zoom_meeting")
-        .eq("event_type", eventType)
-        .gte("received_at", fiveMinAgo);
-
-      if (matchingEvents) {
-        for (const evt of matchingEvents) {
-          const p = evt.payload as Record<string, unknown>;
-          const obj = (p?.payload as Record<string, unknown>)?.object as Record<string, unknown>;
-          if (obj && String(obj.id) === String(meetingId)) {
-            logger.info("Duplicate Zoom meeting event found in DB", { meetingId, eventType });
-            return true;
-          }
-        }
-      }
-    }
-    return false;
-  } catch (err) {
-    logger.warn("Dedup DB check failed, proceeding", { error: String(err) });
-    return false;
-  }
-}
-
-// Zoom sends webhooks for phone calls, meetings, and recordings
+// Zoom sends webhooks for phone calls, meetings, and recordings.
+// All dedup now happens at the DB via identity_key — no in-memory Maps.
 zoomRouter.post("/", async (req: Request, res: Response) => {
   try {
     const payload = req.body;
@@ -104,40 +42,28 @@ zoomRouter.post("/", async (req: Request, res: Response) => {
     const eventType = payload.event || "unknown";
     logger.info("Received Zoom webhook", { eventType });
 
-    // Determine if this is a phone or meeting event
-    let source: "zoom_phone" | "zoom_meeting" = "zoom_meeting";
-    if (eventType.startsWith("phone.")) {
-      source = "zoom_phone";
-    }
+    const isPhone = eventType.startsWith("phone.");
+    const source: "zoom_phone" | "zoom_meeting" = isPhone ? "zoom_phone" : "zoom_meeting";
 
-    // --- DEDUP: Suppress duplicate Zoom scheduler / meeting notifications ---
-    if (source === "zoom_meeting") {
-      const meetingId =
-        payload.payload?.object?.id || payload.payload?.object?.uuid;
-      if (meetingId) {
-        // In-memory dedup first (fast)
-        if (isDuplicateMeetingEvent(String(meetingId), eventType)) {
-          return res.status(200).json({ received: true, deduplicated: true });
-        }
-        // DB dedup as backup (covers server restarts)
-        if (await isDuplicateInDb(String(meetingId), eventType)) {
-          return res.status(200).json({ received: true, deduplicated: true });
-        }
-      }
-    }
-
-    // For call/meeting ended events, try to fetch the transcript
-    const enrichedPayload = { ...payload };
-
+    // Skip noisy non-actionable meeting events. Only `recording.transcript_completed`
+    // carries the data we need for the pipeline.
     if (
-      eventType === "phone.callee_ended" ||
-      eventType === "phone.caller_ended" ||
-      eventType === "phone.call_end"
+      source === "zoom_meeting" &&
+      eventType !== "recording.transcript_completed"
     ) {
+      logger.info("Skipping non-actionable Zoom meeting event", { eventType });
+      return res.status(200).json({ received: true, skipped: true });
+    }
+
+    const enrichedPayload: Record<string, unknown> = { ...payload };
+
+    // ============================================================
+    // PHONE CALL BRANCH
+    // ============================================================
+    if (isPhone) {
       const callId =
         payload.payload?.object?.call_id || payload.payload?.object?.id;
       if (callId) {
-        // Fetch transcript and call details in parallel
         const [transcript, callDetails] = await Promise.all([
           zoomService.getPhoneCallTranscript(callId),
           zoomService.getPhoneCallDetails(callId),
@@ -145,11 +71,10 @@ zoomRouter.post("/", async (req: Request, res: Response) => {
         if (transcript) enrichedPayload.transcript = transcript;
         if (callDetails) enrichedPayload.call_details = callDetails;
 
-        // --- LEADMAGIC ENRICHMENT: Match phone number to lead ---
+        // LeadMagic enrichment from phone + name
         const externalNumber = getExternalPhoneNumber(callDetails, payload);
         const externalName = getExternalCallerName(callDetails, payload);
         if (externalNumber || externalName) {
-          // Use whatever we have from Zoom to enrich via LeadMagic
           const enriched = await enrichContact({
             phone: externalNumber || undefined,
             first_name: externalName ? externalName.split(" ")[0] : undefined,
@@ -170,59 +95,156 @@ zoomRouter.post("/", async (req: Request, res: Response) => {
             logger.info("Enriched Zoom phone call with LeadMagic data", {
               callId,
               phone: externalNumber,
-              name: `${enriched.first_name} ${enriched.last_name}`,
               email: enriched.email,
-              company: enriched.company,
             });
           }
         }
       }
+
+      const identityKey = computeIdentityKey("zoom_phone", enrichedPayload);
+      if (!identityKey) {
+        const eventId = await storeWebhookEvent("zoom_phone", eventType, enrichedPayload, null);
+        await addIdentityReviewRow(
+          eventId,
+          "zoom_phone_no_external_number",
+          buildIdentityHint({
+            id: eventId,
+            source: "zoom_phone",
+            event_type: eventType,
+            payload: enrichedPayload,
+            received_at: new Date().toISOString(),
+            processed: false,
+          })
+        );
+        return res.status(200).json({ received: true, queued_for_review: true });
+      }
+
+      const eventId = await storeWebhookEvent("zoom_phone", eventType, enrichedPayload, identityKey);
+      return res.status(200).json({ received: true, event_id: eventId });
     }
 
-    if (
-      eventType === "meeting.ended" ||
-      eventType === "recording.completed" ||
-      eventType === "recording.transcript_completed"
-    ) {
-      const meetingId =
-        payload.payload?.object?.id || payload.payload?.object?.uuid;
-      if (meetingId) {
-        // Fetch transcript and AI summary in parallel
-        const [transcript, aiSummary] = await Promise.all([
-          zoomService.getMeetingTranscript(String(meetingId)),
-          zoomService.getMeetingSummary(String(meetingId)),
-        ]);
-        if (transcript) enrichedPayload.transcript = transcript;
-        if (aiSummary?.summary_url) enrichedPayload.zoom_ai_summary_url = aiSummary.summary_url;
-        if (aiSummary?.summary) enrichedPayload.zoom_ai_summary = aiSummary.summary;
+    // ============================================================
+    // MEETING BRANCH (recording.transcript_completed only)
+    // ============================================================
+    const meetingIdRaw =
+      payload.payload?.object?.id || payload.payload?.object?.uuid;
+    const meetingId = meetingIdRaw ? String(meetingIdRaw) : null;
+    const meetingTopic = (payload.payload?.object?.topic as string | undefined) || null;
 
-        // Extract external attendee emails from the meeting payload
-        // (topic, agenda, participants, invitees) — skip any that match our own workspace
-        const obj = (payload.payload as Record<string, unknown>)?.object as Record<string, unknown> | undefined;
-        const ownDomain = (process.env.OWN_EMAIL_DOMAIN || "").toLowerCase();
-        const blob = JSON.stringify({
-          topic: obj?.topic,
-          agenda: obj?.agenda,
-          participants: obj?.participant || obj?.participants,
-          invitees: obj?.invitees,
-          host_email: obj?.host_email,
-          transcript,
-          summary: aiSummary?.summary,
-        });
-        const emailRe = /[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/g;
-        const found = Array.from(new Set((blob.match(emailRe) || []).map(e => e.toLowerCase())))
-          .filter(e => !ownDomain || !e.endsWith(`@${ownDomain}`))
-          .filter(e => !e.includes("@zoom.us"));
-        if (found.length > 0) {
-          enrichedPayload.extracted_emails = found;
-          logger.info("Extracted attendee emails from Zoom meeting", { meetingId, emails: found });
+    if (!meetingId) {
+      logger.warn("Zoom meeting webhook has no meeting id", { eventType });
+      return res.status(200).json({ received: true, skipped: "no_meeting_id" });
+    }
+
+    // Pull transcript + AI summary
+    const [transcript, aiSummary] = await Promise.all([
+      zoomService.getMeetingTranscript(meetingId),
+      zoomService.getMeetingSummary(meetingId),
+    ]);
+    if (transcript) enrichedPayload.transcript = transcript;
+    if (aiSummary?.summary_url) enrichedPayload.zoom_ai_summary_url = aiSummary.summary_url;
+    if (aiSummary?.summary) enrichedPayload.zoom_ai_summary = aiSummary.summary;
+
+    // ---- Identity cascade ----
+    let attendeeEmail: string | null = null;
+    let resolvedVia: string | null = null;
+    let gmailMessageId: string | null = null;
+
+    // 1. meeting_links cache
+    const cached = await lookupMeetingLink(meetingId);
+    if (cached?.attendee_email) {
+      attendeeEmail = cached.attendee_email;
+      gmailMessageId = cached.gmail_message_id;
+      resolvedVia = "meeting_links_cache";
+    }
+
+    // 2. Gmail sent-mail search
+    if (!attendeeEmail) {
+      try {
+        const hits = await gmailService.searchMessages(
+          `in:sent zoom.us/j/${meetingId}`,
+          3
+        );
+        for (const hit of hits) {
+          const email = await gmailService.extractAttendeeEmailFromMessage(hit.id);
+          if (email) {
+            attendeeEmail = email;
+            gmailMessageId = hit.id;
+            resolvedVia = "gmail_sent_search";
+            break;
+          }
         }
+      } catch (err) {
+        logger.warn("Gmail sent-mail lookup failed", { meetingId, error: String(err) });
       }
     }
 
-    const eventId = await storeWebhookEvent(source, eventType, enrichedPayload);
+    // 3. Zoom meeting settings (meeting_invitees)
+    if (!attendeeEmail) {
+      try {
+        const settings = await zoomService.getMeetingSettings(meetingId);
+        const ownDomain = (process.env.OWN_EMAIL_DOMAIN || "salesglidergrowth.com").toLowerCase();
+        const firstExternal = settings?.invitees.find(
+          (i) => i.email && !i.email.toLowerCase().endsWith(`@${ownDomain}`)
+        );
+        if (firstExternal?.email) {
+          attendeeEmail = firstExternal.email.toLowerCase();
+          resolvedVia = "zoom_meeting_settings";
+        }
+      } catch (err) {
+        logger.warn("Zoom getMeetingSettings failed", { meetingId, error: String(err) });
+      }
+    }
 
-    res.status(200).json({ received: true, event_id: eventId });
+    // 4. Transcript "my email is" regex
+    if (!attendeeEmail && transcript) {
+      const ownDomain = (process.env.OWN_EMAIL_DOMAIN || "salesglidergrowth.com").toLowerCase();
+      const re = /[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}/g;
+      const matches = Array.from(new Set((transcript.match(re) || []).map((e) => e.toLowerCase())));
+      const external = matches.find(
+        (e) => !e.endsWith(`@${ownDomain}`) && !e.includes("@zoom.us") && !e.includes("calendar-notification@google.com")
+      );
+      if (external) {
+        attendeeEmail = external;
+        resolvedVia = "transcript_regex";
+      }
+    }
+
+    // 5. Fail to review queue
+    if (!attendeeEmail) {
+      const eventId = await storeWebhookEvent("zoom_meeting", eventType, enrichedPayload, null);
+      await addIdentityReviewRow(eventId, "zoom_meeting_no_attendee_email", {
+        first_name: meetingTopic || undefined,
+      });
+      logger.warn("Zoom meeting identity cascade exhausted", { meetingId, meetingTopic });
+      return res.status(200).json({ received: true, queued_for_review: true });
+    }
+
+    // Stash resolved attendee for downstream consumers
+    enrichedPayload.resolved_attendee_email = attendeeEmail;
+    enrichedPayload.resolved_via = resolvedVia;
+    enrichedPayload.gmail_invite_message_id = gmailMessageId;
+
+    // Populate meeting_links cache for future events on this meeting id
+    if (resolvedVia !== "meeting_links_cache") {
+      const { upsertMeetingLink } = await import("../services/identity");
+      await upsertMeetingLink({
+        zoom_meeting_id: meetingId,
+        attendee_email: attendeeEmail,
+        gmail_message_id: gmailMessageId,
+        meeting_topic: meetingTopic,
+      });
+    }
+
+    const identityKey = emailKey(attendeeEmail);
+    const eventId = await storeWebhookEvent("zoom_meeting", eventType, enrichedPayload, identityKey);
+    logger.info("Zoom meeting identity resolved", {
+      meetingId,
+      attendeeEmail,
+      resolvedVia,
+      identityKey,
+    });
+    return res.status(200).json({ received: true, event_id: eventId, identity_key: identityKey });
   } catch (err) {
     logger.error("Zoom webhook error", { error: String(err) });
     res.status(500).json({ error: "Internal server error" });
@@ -232,7 +254,6 @@ zoomRouter.post("/", async (req: Request, res: Response) => {
 /**
  * Determine the external (non-you) phone number and name from a call.
  * Uses extension_type to distinguish internal users from external PSTN callers.
- * Zoom payload structure: object.caller = { phone_number, name, extension_type }
  */
 function getExternalPhoneNumber(
   callDetails: Record<string, unknown> | null | undefined,
@@ -242,7 +263,6 @@ function getExternalPhoneNumber(
   const caller = obj?.caller as Record<string, unknown> | undefined;
   const callee = obj?.callee as Record<string, unknown> | undefined;
 
-  // First try call details from Zoom API (flat structure)
   if (callDetails) {
     const direction = (callDetails.direction || "") as string;
     const callerNumber = (callDetails.caller_number || "") as string;
@@ -251,8 +271,6 @@ function getExternalPhoneNumber(
     if (direction === "inbound" && callerNumber) return callerNumber;
   }
 
-  // Then use webhook payload (nested structure: caller/callee objects)
-  // External party has extension_type "pstn", internal has "user"
   if (callee?.extension_type === "pstn" && callee?.phone_number) {
     return callee.phone_number as string;
   }
@@ -260,7 +278,6 @@ function getExternalPhoneNumber(
     return caller.phone_number as string;
   }
 
-  // Fallback: return whichever has a real phone number (10+ digits)
   const calleeNum = (callee?.phone_number || "") as string;
   const callerNum = (caller?.phone_number || "") as string;
   if (calleeNum.length > 6) return calleeNum;
@@ -269,9 +286,6 @@ function getExternalPhoneNumber(
   return null;
 }
 
-/**
- * Get the external party's name from the call.
- */
 function getExternalCallerName(
   callDetails: Record<string, unknown> | null | undefined,
   payload: Record<string, unknown>
@@ -286,7 +300,6 @@ function getExternalCallerName(
     if (direction === "inbound") return (callDetails.caller_name || "") as string;
   }
 
-  // External party has extension_type "pstn"
   if (callee?.extension_type === "pstn" && callee?.name) return callee.name as string;
   if (caller?.extension_type === "pstn" && caller?.name) return caller.name as string;
 

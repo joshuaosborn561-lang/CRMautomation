@@ -262,6 +262,39 @@ export async function getMeetingSummary(meetingId: string): Promise<{
   }
 }
 
+// --- Meeting Settings (invitees fallback for identity cascade) ---
+
+/**
+ * Fetch meeting settings, including `meeting_invitees[]` for the identity
+ * cascade fallback. Requires user-scope `meeting:read`, no admin scope.
+ * Returns null on 404 or any error.
+ */
+export async function getMeetingSettings(meetingId: string): Promise<{
+  invitees: Array<{ email: string }>;
+  topic?: string;
+} | null> {
+  const encodedId = meetingId.includes("/") || meetingId.includes("=")
+    ? encodeURIComponent(encodeURIComponent(meetingId))
+    : meetingId;
+
+  try {
+    const data = (await zoomFetch(`/meetings/${encodedId}`)) as {
+      topic?: string;
+      settings?: {
+        meeting_invitees?: Array<{ email: string }>;
+      };
+    };
+    return {
+      invitees: data.settings?.meeting_invitees || [],
+      topic: data.topic,
+    };
+  } catch (err) {
+    if (err instanceof Error && err.message.includes("404")) return null;
+    logger.warn("Could not fetch meeting settings", { meetingId, error: String(err) });
+    return null;
+  }
+}
+
 // --- Webhook Verification ---
 
 import crypto from "crypto";
