@@ -1,6 +1,4 @@
 import { logger } from "../utils/logger";
-import { enrichPerson as apolloEnrich } from "../services/apollo";
-import { enrichContact, enrichByLinkedIn } from "../services/leadmagic";
 import {
   getUnprocessedEvents,
   markEventProcessed,
@@ -14,19 +12,18 @@ import {
   createDeal,
   updateDealStage,
   createNote,
-  createTask,
   setPersonDescription,
   setDealDescription,
 } from "../services/attio";
 import {
   resolveOrCreateIdentity,
   updateIdentityAttioIds,
+  getOrEnrichIdentity,
 } from "../services/identity";
 import {
   classifyEvent,
   extractContactFromEvent,
   buildNoteBody,
-  type ExtractedContact,
 } from "../services/rules";
 import type { WebhookEvent } from "@crm-autopilot/shared";
 
@@ -80,17 +77,39 @@ async function processSingleEvent(event: WebhookEvent): Promise<void> {
 
   // 1. Rule-based classification (no LLM).
   const classification = classifyEvent(event);
-  const contact = extractContactFromEvent(event);
+  const seed = extractContactFromEvent(event);
 
-  // 2. Fill gaps in contact fields via LeadMagic, then Apollo email fallback.
-  await enrichContactFields(contact);
-
-  // 3. Resolve-or-create identity row (atomic, DB-serialized).
+  // 2. Resolve-or-create identity row (atomic, DB-serialized).
   const identity = await resolveOrCreateIdentity(identityKey, event.source);
+
+  // 3. Cache-first enrichment. Reads identity_map; only calls
+  //    LeadMagic/Apollo on a true miss (enriched_at IS NULL).
+  const enriched = await getOrEnrichIdentity(identity, {
+    email: seed.email,
+    first_name: seed.first_name,
+    last_name: seed.last_name,
+    company: seed.company,
+    phone: seed.phone,
+    linkedin_url: seed.linkedin_url,
+    title: seed.title,
+  });
+
+  const contact = {
+    email: enriched.email || seed.email || "",
+    first_name: enriched.first_name || seed.first_name,
+    last_name: enriched.last_name || seed.last_name,
+    company: enriched.company || seed.company,
+    phone: enriched.phone || seed.phone,
+    linkedin_url: enriched.linkedin_url || seed.linkedin_url,
+    title: enriched.title || seed.title,
+  };
+
   logger.info("Identity resolved", {
     identityKey,
     identityId: identity.id,
     existingAttioPerson: identity.attio_person_id,
+    enrichmentFromCache: enriched.from_cache,
+    enrichmentSource: enriched.source,
   });
 
   // 4. Ensure Attio person exists.
@@ -224,62 +243,3 @@ async function processSingleEvent(event: WebhookEvent): Promise<void> {
   });
 }
 
-/**
- * Fill missing contact fields. Order of preference:
- *   1. LeadMagic by email
- *   2. LeadMagic by LinkedIn
- *   3. Apollo /people/match by email
- */
-async function enrichContactFields(contact: ExtractedContact): Promise<void> {
-  const missingAny =
-    !contact.phone || !contact.linkedin_url || !contact.title || !contact.company;
-  if (!missingAny) return;
-
-  try {
-    if (contact.email) {
-      const lm = await enrichContact({
-        email: contact.email,
-        first_name: contact.first_name,
-        last_name: contact.last_name,
-        company: contact.company,
-        linkedin_url: contact.linkedin_url,
-        phone: contact.phone,
-      });
-      if (lm.enriched) {
-        contact.first_name = contact.first_name || lm.first_name;
-        contact.last_name = contact.last_name || lm.last_name;
-        contact.company = contact.company || lm.company;
-        contact.title = contact.title || lm.title;
-        contact.linkedin_url = contact.linkedin_url || lm.linkedin_url;
-        contact.phone = contact.phone || lm.phone;
-      }
-    } else if (contact.linkedin_url) {
-      const lm = await enrichByLinkedIn(contact.linkedin_url);
-      if (lm) {
-        contact.email = contact.email || lm.email;
-        contact.first_name = contact.first_name || lm.first_name;
-        contact.last_name = contact.last_name || lm.last_name;
-        contact.company = contact.company || lm.company_name;
-        contact.title = contact.title || lm.professional_title;
-        contact.phone = contact.phone || lm.mobile_number;
-      }
-    }
-  } catch (err) {
-    logger.warn("LeadMagic enrichment failed", { error: String(err) });
-  }
-
-  // Apollo fallback — email-only
-  if ((!contact.phone || !contact.linkedin_url || !contact.title) && contact.email) {
-    try {
-      const ap = await apolloEnrich({ email: contact.email });
-      if (ap) {
-        contact.phone = contact.phone || ap.phone;
-        contact.linkedin_url = contact.linkedin_url || ap.linkedin_url;
-        contact.title = contact.title || ap.title;
-        contact.company = contact.company || ap.company;
-      }
-    } catch (err) {
-      logger.warn("Apollo enrichment failed", { error: String(err) });
-    }
-  }
-}

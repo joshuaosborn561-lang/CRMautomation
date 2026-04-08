@@ -158,24 +158,30 @@ zoomRouter.post("/", async (req: Request, res: Response) => {
       resolvedVia = "meeting_links_cache";
     }
 
-    // 2. Gmail sent-mail search
+    // 2. Gmail search — Zoom sends the user a confirmation email whose body
+    //    contains the invitee's address. Try a few query variants.
     if (!attendeeEmail) {
-      try {
-        const hits = await gmailService.searchMessages(
-          `in:sent zoom.us/j/${meetingId}`,
-          3
-        );
-        for (const hit of hits) {
-          const email = await gmailService.extractAttendeeEmailFromMessage(hit.id);
-          if (email) {
-            attendeeEmail = email;
-            gmailMessageId = hit.id;
-            resolvedVia = "gmail_sent_search";
-            break;
+      const queries = [
+        `from:zoom.us ${meetingId}`,
+        `from:no-reply@zoom.us ${meetingId}`,
+        `"${meetingId}"`,
+      ];
+      for (const q of queries) {
+        if (attendeeEmail) break;
+        try {
+          const hits = await gmailService.searchMessages(q, 5);
+          for (const hit of hits) {
+            const email = await gmailService.extractAttendeeEmailFromMessage(hit.id);
+            if (email) {
+              attendeeEmail = email;
+              gmailMessageId = hit.id;
+              resolvedVia = `gmail_search:${q}`;
+              break;
+            }
           }
+        } catch (err) {
+          logger.warn("Gmail lookup failed", { meetingId, q, error: String(err) });
         }
-      } catch (err) {
-        logger.warn("Gmail sent-mail lookup failed", { meetingId, error: String(err) });
       }
     }
 

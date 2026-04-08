@@ -223,24 +223,44 @@ export async function searchMessages(
 }
 
 /**
- * Convenience: given a message id, fetch and return the `To:` header email
- * (stripped of display name and own-domain addresses).
+ * Given a message id, scan the body and headers for the attendee email.
+ *
+ * For Zoom-scheduled meetings, the user receives a confirmation email from
+ * Zoom (no-reply@zoom.us) that contains the invitee's email address in the
+ * body. This function extracts the first non-own-domain, non-Zoom, non-Google
+ * calendar address from: body text → subject → To: header.
  */
 export async function extractAttendeeEmailFromMessage(messageId: string): Promise<string | null> {
+  const ownDomain = (process.env.OWN_EMAIL_DOMAIN || "salesglidergrowth.com").toLowerCase();
+  const EMAIL_RE = /[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}/g;
+
+  const isExternal = (addr: string): boolean => {
+    const a = addr.toLowerCase();
+    if (a.endsWith(`@${ownDomain}`)) return false;
+    if (a.endsWith("@zoom.us") || a.endsWith(".zoom.us")) return false;
+    if (a.includes("no-reply@") || a.includes("noreply@")) return false;
+    if (a.includes("calendar-notification@google.com")) return false;
+    if (a.includes("mailer-daemon")) return false;
+    if (a.includes("@google.com")) return false;
+    return true;
+  };
+
   try {
     const msg = await getMessage(messageId);
-    const ownDomain = (process.env.OWN_EMAIL_DOMAIN || "salesglidergrowth.com").toLowerCase();
-    const toHeader = msg.to || "";
-    // Split on commas for multi-recipient invites
-    const candidates = toHeader.split(/,\s*/);
-    for (const raw of candidates) {
-      const m = raw.match(/[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}/);
-      if (!m) continue;
-      const addr = m[0].toLowerCase();
-      if (addr.endsWith(`@${ownDomain}`)) continue;
-      if (addr.endsWith("@zoom.us")) continue;
-      if (addr.includes("calendar-notification@google.com")) continue;
-      return addr;
+    // 1. Scan the body first — Zoom confirmation emails embed the invitee here.
+    const bodyMatches = (msg.body || "").match(EMAIL_RE) || [];
+    for (const raw of bodyMatches) {
+      if (isExternal(raw)) return raw.toLowerCase();
+    }
+    // 2. Subject line
+    const subjectMatches = (msg.subject || "").match(EMAIL_RE) || [];
+    for (const raw of subjectMatches) {
+      if (isExternal(raw)) return raw.toLowerCase();
+    }
+    // 3. To: header (for the case where the user forwarded an invite themselves)
+    const toMatches = (msg.to || "").match(EMAIL_RE) || [];
+    for (const raw of toMatches) {
+      if (isExternal(raw)) return raw.toLowerCase();
     }
   } catch (err) {
     logger.warn("extractAttendeeEmailFromMessage failed", { messageId, error: String(err) });

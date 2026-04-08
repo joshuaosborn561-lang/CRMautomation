@@ -119,8 +119,10 @@ gmailRouter.post("/", async (req: Request, res: Response) => {
         const message = await gmailService.getMessage(change.messageId);
 
         // --- Opportunistically populate meeting_links cache ---
-        // If the body contains a zoom.us/j/{id} URL, record the
-        // meeting id → attendee email mapping for future Zoom webhooks.
+        // Any Gmail message containing a zoom.us/j/{id} URL can yield a
+        // (meeting_id → attendee_email) mapping. Handles both:
+        //   (a) user-sent invites   — From=user, To=prospect
+        //   (b) Zoom confirmations  — From=zoom.us, prospect in body
         try {
           const zoomIds = extractZoomMeetingIds(
             `${message.body || ""} ${message.subject || ""}`
@@ -130,8 +132,32 @@ gmailRouter.post("/", async (req: Request, res: Response) => {
             const fromAddr = extractEmailAddress(message.from)?.toLowerCase() || "";
             const toAddr = extractEmailAddress(message.to)?.toLowerCase() || "";
             const fromIsOwn = fromAddr.endsWith(`@${ownDomain}`);
-            const attendee = fromIsOwn ? toAddr : fromAddr;
-            if (attendee && !attendee.endsWith(`@${ownDomain}`)) {
+            const fromIsZoom = fromAddr.endsWith("@zoom.us") || fromAddr.includes("no-reply@zoom");
+
+            let attendee: string | null = null;
+            if (fromIsZoom) {
+              // Zoom confirmation — scan body for first non-own, non-zoom email.
+              const candidates = (message.body || "").match(
+                /[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}/g
+              ) || [];
+              for (const c of candidates) {
+                const cl = c.toLowerCase();
+                if (cl.endsWith(`@${ownDomain}`)) continue;
+                if (cl.endsWith("@zoom.us")) continue;
+                if (cl.includes("no-reply") || cl.includes("noreply")) continue;
+                if (cl.includes("@google.com")) continue;
+                attendee = cl;
+                break;
+              }
+            } else if (fromIsOwn) {
+              // User-sent invite — counterparty is the To address.
+              if (toAddr && !toAddr.endsWith(`@${ownDomain}`)) attendee = toAddr;
+            } else {
+              // Received from prospect — counterparty is the From address.
+              if (fromAddr && !fromAddr.endsWith(`@${ownDomain}`)) attendee = fromAddr;
+            }
+
+            if (attendee) {
               for (const zid of zoomIds) {
                 await upsertMeetingLink({
                   zoom_meeting_id: zid,
@@ -143,6 +169,7 @@ gmailRouter.post("/", async (req: Request, res: Response) => {
               logger.info("Gmail: cached meeting_links from body", {
                 zoomIds,
                 attendee,
+                source: fromIsZoom ? "zoom_confirmation" : fromIsOwn ? "sent_invite" : "received",
               });
             }
           }

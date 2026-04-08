@@ -1,5 +1,7 @@
 import { getSupabase } from "../utils/supabase";
 import { logger } from "../utils/logger";
+import { enrichContact, enrichByLinkedIn } from "./leadmagic";
+import { enrichPerson as apolloEnrich } from "./apollo";
 import type { EventSource, WebhookEvent } from "@crm-autopilot/shared";
 
 // ============================================================
@@ -129,29 +131,63 @@ export function extractEmailAddress(header: string): string | null {
 // the same key serialize at the DB layer.
 // ============================================================
 
+export interface EnrichedFields {
+  email: string | null;
+  first_name: string | null;
+  last_name: string | null;
+  phone: string | null;
+  linkedin_url: string | null;
+  company: string | null;
+  title: string | null;
+  source: string | null;
+  at: string | null;
+}
+
 export interface ResolvedIdentity {
   id: string;
   attio_person_id: string | null;
   attio_deal_id: string | null;
   attio_company_id: string | null;
   is_new: boolean;
+  enriched: EnrichedFields;
+}
+
+const IDENTITY_SELECT =
+  "id, attio_person_id, attio_deal_id, attio_company_id, " +
+  "enriched_email, enriched_first_name, enriched_last_name, " +
+  "enriched_phone, enriched_linkedin_url, enriched_company, " +
+  "enriched_title, enriched_source, enriched_at";
+
+function rowToIdentity(data: Record<string, unknown>, isNew: boolean): ResolvedIdentity {
+  return {
+    id: data.id as string,
+    attio_person_id: (data.attio_person_id as string | null) || null,
+    attio_deal_id: (data.attio_deal_id as string | null) || null,
+    attio_company_id: (data.attio_company_id as string | null) || null,
+    is_new: isNew,
+    enriched: {
+      email: (data.enriched_email as string | null) || null,
+      first_name: (data.enriched_first_name as string | null) || null,
+      last_name: (data.enriched_last_name as string | null) || null,
+      phone: (data.enriched_phone as string | null) || null,
+      linkedin_url: (data.enriched_linkedin_url as string | null) || null,
+      company: (data.enriched_company as string | null) || null,
+      title: (data.enriched_title as string | null) || null,
+      source: (data.enriched_source as string | null) || null,
+      at: (data.enriched_at as string | null) || null,
+    },
+  };
 }
 
 export async function findIdentity(identityKey: string): Promise<ResolvedIdentity | null> {
   const supabase = getSupabase();
   const { data, error } = await supabase
     .from("identity_map")
-    .select("id, attio_person_id, attio_deal_id, attio_company_id")
+    .select(IDENTITY_SELECT)
     .eq("identity_key", identityKey)
     .maybeSingle();
   if (error || !data) return null;
-  return {
-    id: data.id,
-    attio_person_id: data.attio_person_id,
-    attio_deal_id: data.attio_deal_id,
-    attio_company_id: data.attio_company_id,
-    is_new: false,
-  };
+  return rowToIdentity(data as unknown as Record<string, unknown>, false);
 }
 
 /**
@@ -175,7 +211,7 @@ export async function resolveOrCreateIdentity(
       { identity_key: identityKey, source },
       { onConflict: "identity_key", ignoreDuplicates: false }
     )
-    .select("id, attio_person_id, attio_deal_id, attio_company_id")
+    .select(IDENTITY_SELECT)
     .single();
 
   if (error || !data) {
@@ -185,13 +221,158 @@ export async function resolveOrCreateIdentity(
     throw new Error(`resolveOrCreateIdentity failed for ${identityKey}: ${error?.message || "unknown"}`);
   }
 
-  return {
-    id: data.id,
-    attio_person_id: data.attio_person_id,
-    attio_deal_id: data.attio_deal_id,
-    attio_company_id: data.attio_company_id,
-    is_new: !data.attio_person_id,
+  const row = data as unknown as Record<string, unknown>;
+  return rowToIdentity(row, !row.attio_person_id);
+}
+
+// ============================================================
+// Cache-first enrichment.
+// Always reads identity_map before calling LeadMagic/Apollo.
+// If enriched_at IS NOT NULL the cached fields are returned
+// and NO external API is called.
+// ============================================================
+
+export interface EnrichSeed {
+  email?: string | null;
+  first_name?: string | null;
+  last_name?: string | null;
+  company?: string | null;
+  phone?: string | null;
+  linkedin_url?: string | null;
+  title?: string | null;
+}
+
+export interface EnrichResult extends EnrichedFields {
+  from_cache: boolean;
+}
+
+/**
+ * Return the cached enrichment for an identity row, or run LeadMagic
+ * (then Apollo as email fallback) and persist the result back to
+ * identity_map. Only called by the pipeline and the dry-run job.
+ */
+export async function getOrEnrichIdentity(
+  identity: ResolvedIdentity,
+  seed: EnrichSeed
+): Promise<EnrichResult> {
+  // Cache hit — return as-is.
+  if (identity.enriched.at) {
+    return { ...identity.enriched, from_cache: true };
+  }
+
+  // Merge seed fields (from the webhook payload) with whatever the cache had.
+  const merged: EnrichedFields = {
+    email: seed.email || identity.enriched.email || null,
+    first_name: seed.first_name || identity.enriched.first_name || null,
+    last_name: seed.last_name || identity.enriched.last_name || null,
+    phone: seed.phone || identity.enriched.phone || null,
+    linkedin_url: seed.linkedin_url || identity.enriched.linkedin_url || null,
+    company: seed.company || identity.enriched.company || null,
+    title: seed.title || identity.enriched.title || null,
+    source: null,
+    at: null,
   };
+
+  let enrichmentSource: string | null = null;
+
+  // 1. LeadMagic by email
+  if (merged.email) {
+    try {
+      const lm = await enrichContact({
+        email: merged.email,
+        first_name: merged.first_name || undefined,
+        last_name: merged.last_name || undefined,
+        company: merged.company || undefined,
+        linkedin_url: merged.linkedin_url || undefined,
+        phone: merged.phone || undefined,
+      });
+      if (lm.enriched) {
+        merged.first_name = merged.first_name || lm.first_name || null;
+        merged.last_name = merged.last_name || lm.last_name || null;
+        merged.company = merged.company || lm.company || null;
+        merged.title = merged.title || lm.title || null;
+        merged.linkedin_url = merged.linkedin_url || lm.linkedin_url || null;
+        merged.phone = merged.phone || lm.phone || null;
+        enrichmentSource = "leadmagic_email";
+      }
+    } catch (err) {
+      logger.warn("LeadMagic email enrich failed", { error: String(err) });
+    }
+  }
+
+  // 2. LeadMagic by LinkedIn
+  if (!enrichmentSource && merged.linkedin_url) {
+    try {
+      const lm = await enrichByLinkedIn(merged.linkedin_url);
+      if (lm) {
+        merged.email = merged.email || lm.email || null;
+        merged.first_name = merged.first_name || lm.first_name || null;
+        merged.last_name = merged.last_name || lm.last_name || null;
+        merged.company = merged.company || lm.company_name || null;
+        merged.title = merged.title || lm.professional_title || null;
+        merged.phone = merged.phone || lm.mobile_number || null;
+        enrichmentSource = "leadmagic_linkedin";
+      }
+    } catch (err) {
+      logger.warn("LeadMagic linkedin enrich failed", { error: String(err) });
+    }
+  }
+
+  // 3. Apollo email fallback (email only — no cascades)
+  if (!enrichmentSource && merged.email) {
+    try {
+      const ap = await apolloEnrich({ email: merged.email });
+      if (ap) {
+        merged.phone = merged.phone || ap.phone || null;
+        merged.linkedin_url = merged.linkedin_url || ap.linkedin_url || null;
+        merged.title = merged.title || ap.title || null;
+        merged.company = merged.company || ap.company || null;
+        enrichmentSource = "apollo_email";
+      }
+    } catch (err) {
+      logger.warn("Apollo enrich failed", { error: String(err) });
+    }
+  }
+
+  // Persist whatever we ended up with (even if no external enricher hit —
+  // this still caches the seed values so next call is a pure SELECT).
+  merged.source = enrichmentSource || "seed_only";
+  merged.at = new Date().toISOString();
+
+  const supabase = getSupabase();
+  const { error } = await supabase
+    .from("identity_map")
+    .update({
+      enriched_email: merged.email,
+      enriched_first_name: merged.first_name,
+      enriched_last_name: merged.last_name,
+      enriched_phone: merged.phone,
+      enriched_linkedin_url: merged.linkedin_url,
+      enriched_company: merged.company,
+      enriched_title: merged.title,
+      enriched_source: merged.source,
+      enriched_at: merged.at,
+      updated_at: merged.at,
+    })
+    .eq("id", identity.id);
+  if (error) {
+    logger.warn("Failed to persist enrichment cache", { identityId: identity.id, error: error.message });
+  }
+
+  // Mutate the passed-in identity so subsequent code sees the cached values.
+  identity.enriched = {
+    email: merged.email,
+    first_name: merged.first_name,
+    last_name: merged.last_name,
+    phone: merged.phone,
+    linkedin_url: merged.linkedin_url,
+    company: merged.company,
+    title: merged.title,
+    source: merged.source,
+    at: merged.at,
+  };
+
+  return { ...identity.enriched, from_cache: false };
 }
 
 export async function updateIdentityAttioIds(
