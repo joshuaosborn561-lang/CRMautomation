@@ -12,8 +12,13 @@ import {
   computeIdentityKey,
   resolveOrCreateIdentity,
   getOrEnrichIdentity,
+  emailKey,
+  upsertMeetingLink,
+  lookupMeetingLink,
 } from "../services/identity";
 import { classifyEvent, extractContactFromEvent } from "../services/rules";
+import * as gmailService from "../services/gmail";
+import * as zoomService from "../services/zoom";
 import type { EventSource, WebhookEvent } from "@crm-autopilot/shared";
 
 // ============================================================
@@ -357,7 +362,6 @@ export async function replay(): Promise<ReplayReport> {
   logger.warn("FULL REBUILD — REPLAY starting");
   const supabase = getSupabase();
 
-  // Re-tag webhook_events with identity_key before the pipeline consumes them.
   const { data: events, error } = await supabase
     .from("webhook_events")
     .select("id, source, payload")
@@ -371,13 +375,125 @@ export async function replay(): Promise<ReplayReport> {
     errors: 0,
   };
 
+  const ownDomain = (process.env.OWN_EMAIL_DOMAIN || "salesglidergrowth.com").toLowerCase();
+
   for (const row of (events || []) as Array<{
     id: string;
     source: EventSource;
     payload: Record<string, unknown>;
   }>) {
     try {
-      const key = computeIdentityKey(row.source, row.payload);
+      let payload = row.payload;
+
+      // For zoom_meeting events stored before the Gmail cascade existed,
+      // the payload has no resolved_attendee_email. Re-run the cascade now
+      // using the meeting ID that's always been in the payload.
+      if (row.source === "zoom_meeting" && !payload.resolved_attendee_email) {
+        const obj = (payload.payload as Record<string, unknown> | undefined)
+          ?.object as Record<string, unknown> | undefined;
+        const meetingId = obj?.id ? String(obj.id) : null;
+
+        if (meetingId) {
+          let attendeeEmail: string | null = null;
+          let resolvedVia: string | null = null;
+
+          // 1. meeting_links cache
+          const cached = await lookupMeetingLink(meetingId);
+          if (cached?.attendee_email) {
+            attendeeEmail = cached.attendee_email;
+            resolvedVia = "meeting_links_cache";
+          }
+
+          // 2. Gmail: Zoom sends a confirmation email whose body contains
+          //    the invitee's name + email. Search the inbox for that email.
+          if (!attendeeEmail) {
+            const queries = [
+              `from:zoom.us ${meetingId}`,
+              `from:no-reply@zoom.us ${meetingId}`,
+              `"${meetingId}"`,
+            ];
+            for (const q of queries) {
+              if (attendeeEmail) break;
+              try {
+                const hits = await gmailService.searchMessages(q, 5);
+                for (const hit of hits) {
+                  const email = await gmailService.extractAttendeeEmailFromMessage(hit.id);
+                  if (email) {
+                    attendeeEmail = email;
+                    resolvedVia = `gmail_search:${q}`;
+                    // Populate cache for future lookups
+                    await upsertMeetingLink({
+                      zoom_meeting_id: meetingId,
+                      attendee_email: email,
+                      gmail_message_id: hit.id,
+                      meeting_topic: obj?.topic as string | undefined,
+                    });
+                    break;
+                  }
+                }
+              } catch (err) {
+                logger.warn("Replay Gmail search failed", { meetingId, q, error: String(err) });
+              }
+            }
+          }
+
+          // 3. Zoom meeting settings fallback
+          if (!attendeeEmail) {
+            try {
+              const settings = await zoomService.getMeetingSettings(meetingId);
+              const firstExternal = settings?.invitees.find(
+                (i) => i.email && !i.email.toLowerCase().endsWith(`@${ownDomain}`)
+              );
+              if (firstExternal?.email) {
+                attendeeEmail = firstExternal.email.toLowerCase();
+                resolvedVia = "zoom_meeting_settings";
+              }
+            } catch (err) {
+              logger.warn("Replay Zoom settings failed", { meetingId, error: String(err) });
+            }
+          }
+
+          // 4. Transcript email regex
+          if (!attendeeEmail && payload.transcript) {
+            const re = /[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}/g;
+            const matches = Array.from(
+              new Set(
+                (String(payload.transcript).match(re) || []).map((e) => e.toLowerCase())
+              )
+            );
+            const external = matches.find(
+              (e) =>
+                !e.endsWith(`@${ownDomain}`) &&
+                !e.endsWith("@zoom.us") &&
+                !e.includes("calendar-notification@google.com")
+            );
+            if (external) {
+              attendeeEmail = external;
+              resolvedVia = "transcript_regex";
+            }
+          }
+
+          if (attendeeEmail) {
+            payload = { ...payload, resolved_attendee_email: attendeeEmail, resolved_via: resolvedVia };
+            // Write the resolved email back into the stored payload so future
+            // reads don't need to re-run the cascade.
+            await supabase
+              .from("webhook_events")
+              .update({ payload })
+              .eq("id", row.id);
+            logger.info("Replay: resolved zoom_meeting attendee", {
+              meetingId,
+              attendeeEmail,
+              resolvedVia,
+            });
+          }
+        }
+
+        // Pace Gmail calls — stay well under quota.
+        await sleep(300);
+      }
+
+      const key = computeIdentityKey(row.source, payload);
       await supabase
         .from("webhook_events")
         .update({
@@ -386,17 +502,18 @@ export async function replay(): Promise<ReplayReport> {
           processed: false,
         })
         .eq("id", row.id);
+
       if (key) report.resolved_events += 1;
       else report.unresolved_events += 1;
     } catch (err) {
       report.errors += 1;
       logger.warn("Replay tag failed", { id: row.id, error: String(err) });
     }
-    // Gmail quota hygiene — tiny pause between events.
+
     await sleep(50);
   }
 
-  // Now actually run the pipeline to push events into Attio.
+  // Push tagged events through the pipeline to Attio.
   const { processEventQueue } = await import("../processors/event-pipeline");
   await processEventQueue();
 

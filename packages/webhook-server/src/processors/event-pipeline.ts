@@ -94,6 +94,17 @@ async function processSingleEvent(event: WebhookEvent): Promise<void> {
     title: seed.title,
   });
 
+  // Skip zoom_phone calls we couldn't enrich — phone-only records
+  // with no name/email/company are noise, not real CRM contacts.
+  if (event.source === "zoom_phone" && !enriched.email) {
+    logger.info("Skipping unenrichable zoom_phone event (no email from LeadMagic)", {
+      eventId: event.id,
+      identityKey,
+    });
+    await markEventProcessed(event.id);
+    return;
+  }
+
   const contact = {
     email: enriched.email || seed.email || "",
     first_name: enriched.first_name || seed.first_name,
