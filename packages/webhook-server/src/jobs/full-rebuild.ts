@@ -78,6 +78,7 @@ export interface DryRunReport {
     resolved_via_cache: number;
     resolved_via_gmail: number;
     resolved_via_zoom_settings: number;
+    resolved_via_zoom_participants: number;
     resolved_via_transcript: number;
     still_unresolved: number;
   };
@@ -99,6 +100,60 @@ const ACTIONABLE_EVENT_TYPES: Record<string, Set<string>> = {
 function isActionable(source: EventSource, eventType: string): boolean {
   const actionable = ACTIONABLE_EVENT_TYPES[source];
   return !actionable || actionable.has(eventType);
+}
+
+type GmailSearchQuery = {
+  q: string;
+  maxResults: number;
+};
+
+function buildGmailQueriesForMeeting(meetingId: string, topic?: string): GmailSearchQuery[] {
+  const meetingIdDigits = meetingId.replace(/\D/g, "");
+  const idVariants = Array.from(new Set([meetingId, meetingIdDigits].filter(Boolean)));
+
+  const topicHints = new Set<string>();
+  if (topic) {
+    const clean = topic.replace(/\s+/g, " ").trim();
+    if (clean.length > 4) topicHints.add(clean);
+    const dashParts = clean.split(" - ").map((p) => p.trim()).filter(Boolean);
+    if (dashParts.length > 1) topicHints.add(dashParts.slice(1).join(" - "));
+  }
+
+  const out: GmailSearchQuery[] = [];
+  const seen = new Set<string>();
+  const push = (q: string, maxResults: number) => {
+    if (!q || seen.has(q)) return;
+    seen.add(q);
+    out.push({ q, maxResults });
+  };
+
+  for (const id of idVariants) {
+    push(`from:zoom.us ${id}`, 8);
+    push(`from:*.zoom.us ${id}`, 8);
+    push(`from:no-reply@zoom.us ${id}`, 8);
+    push(`"${id}"`, 8);
+  }
+  for (const hint of topicHints) {
+    push(`from:zoom.us "${hint}"`, 5);
+    push(`from:no-reply@zoom.us "${hint}"`, 5);
+  }
+  return out;
+}
+
+function extractFirstExternalEmail(
+  text: string | null | undefined,
+  ownDomain: string
+): string | null {
+  if (!text) return null;
+  const re = /[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}/g;
+  const matches = Array.from(new Set((text.match(re) || []).map((e) => e.toLowerCase())));
+  const external = matches.find(
+    (e) =>
+      !e.endsWith(`@${ownDomain}`) &&
+      !e.endsWith("@zoom.us") &&
+      !e.includes("calendar-notification@google.com")
+  );
+  return external || null;
 }
 
 /**
@@ -127,6 +182,7 @@ async function resolveZoomMeetingAttendee(row: {
     | Record<string, unknown>
     | undefined;
   const meetingId = obj?.id ? String(obj.id) : null;
+  const meetingUuid = obj?.uuid ? String(obj.uuid) : null;
   if (!meetingId) return { email: null, via: null, updated_payload: payload };
 
   const ownDomain = (process.env.OWN_EMAIL_DOMAIN || "salesglidergrowth.com").toLowerCase();
@@ -143,16 +199,14 @@ async function resolveZoomMeetingAttendee(row: {
 
   // 2. Gmail inbox search — Zoom confirmation email from no-reply@zoom.us
   if (!attendeeEmail) {
-    const queries = [
-      `from:zoom.us ${meetingId}`,
-      `from:*.zoom.us ${meetingId}`,
-      `from:no-reply@zoom.us ${meetingId}`,
-      `"${meetingId}"`,
-    ];
-    for (const q of queries) {
+    const queries = buildGmailQueriesForMeeting(
+      meetingId,
+      typeof obj?.topic === "string" ? obj.topic : undefined
+    );
+    for (const { q, maxResults } of queries) {
       if (attendeeEmail) break;
       try {
-        const hits = await gmailService.searchMessages(q, 5);
+        const hits = await gmailService.searchMessages(q, maxResults);
         for (const hit of hits) {
           const email = await gmailService.extractAttendeeEmailFromMessage(hit.id);
           if (email) {
@@ -192,13 +246,22 @@ async function resolveZoomMeetingAttendee(row: {
   // 3b. Zoom participants fallback for completed meetings.
   if (!attendeeEmail) {
     try {
-      const participants = await zoomService.getMeetingParticipants(meetingId);
-      const uuid = obj?.uuid ? String(obj.uuid) : "";
-      const participantsWithFallback =
-        participants.length === 0 && uuid && uuid !== meetingId
-          ? await zoomService.getMeetingParticipants(uuid)
-          : participants;
-      const firstExternal = participants.find(
+      const idsToTry = Array.from(new Set([meetingId, meetingUuid].filter(Boolean))) as string[];
+      let participantsWithFallback: Array<{
+        id?: string;
+        name?: string;
+        user_email?: string;
+        email?: string;
+      }> = [];
+      for (const id of idsToTry) {
+        const got = await zoomService.getMeetingParticipants(id);
+        if (got.length > 0) {
+          participantsWithFallback = got;
+          break;
+        }
+      }
+
+      const firstExternal = participantsWithFallback.find(
         (p) =>
           (p.email || p.user_email) &&
           !String(p.email || p.user_email).toLowerCase().endsWith(`@${ownDomain}`) &&
@@ -213,21 +276,24 @@ async function resolveZoomMeetingAttendee(row: {
     }
   }
 
-  // 4. Transcript regex
-  if (!attendeeEmail && payload.transcript) {
-    const re = /[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}/g;
-    const matches = Array.from(
-      new Set((String(payload.transcript).match(re) || []).map((e) => e.toLowerCase()))
-    );
-    const external = matches.find(
-      (e) =>
-        !e.endsWith(`@${ownDomain}`) &&
-        !e.endsWith("@zoom.us") &&
-        !e.includes("calendar-notification@google.com")
-    );
-    if (external) {
-      attendeeEmail = external;
+  // 4. Transcript regex: stored transcript, then live Zoom transcript fetch.
+  if (!attendeeEmail) {
+    const fromPayload = extractFirstExternalEmail(String(payload.transcript || ""), ownDomain);
+    if (fromPayload) {
+      attendeeEmail = fromPayload;
       resolvedVia = "transcript_regex";
+    } else {
+      const idsToTry = Array.from(new Set([meetingUuid, meetingId].filter(Boolean))) as string[];
+      for (const id of idsToTry) {
+        const transcript = await zoomService.getMeetingTranscript(id);
+        const extracted = extractFirstExternalEmail(transcript, ownDomain);
+        if (extracted) {
+          attendeeEmail = extracted;
+          resolvedVia = "transcript_regex";
+          payload = { ...payload, transcript };
+          break;
+        }
+      }
     }
   }
 
@@ -267,6 +333,7 @@ export async function dryRun(): Promise<DryRunReport> {
     resolved_via_cache: 0,
     resolved_via_gmail: 0,
     resolved_via_zoom_settings: 0,
+    resolved_via_zoom_participants: 0,
     resolved_via_transcript: 0,
     still_unresolved: 0,
   };
@@ -299,6 +366,7 @@ export async function dryRun(): Promise<DryRunReport> {
         if (resolution.via === "meeting_links_cache") meetingSummary.resolved_via_cache += 1;
         else if (resolution.via?.startsWith("gmail_search")) meetingSummary.resolved_via_gmail += 1;
         else if (resolution.via === "zoom_meeting_settings") meetingSummary.resolved_via_zoom_settings += 1;
+        else if (resolution.via === "zoom_participants") meetingSummary.resolved_via_zoom_participants += 1;
         else if (resolution.via === "transcript_regex") meetingSummary.resolved_via_transcript += 1;
       } else {
         meetingSummary.still_unresolved += 1;
@@ -609,8 +677,6 @@ export async function replay(): Promise<ReplayReport> {
     errors: 0,
   };
 
-  const ownDomain = (process.env.OWN_EMAIL_DOMAIN || "salesglidergrowth.com").toLowerCase();
-
   for (const row of (events || []) as Array<{
     id: string;
     source: EventSource;
@@ -619,129 +685,11 @@ export async function replay(): Promise<ReplayReport> {
     try {
       let payload = row.payload;
 
-      // For zoom_meeting events stored before the Gmail cascade existed,
-      // the payload has no resolved_attendee_email. Re-run the cascade now
-      // using the meeting ID that's always been in the payload.
+      // For zoom_meeting events stored before the cascade existed,
+      // re-run the same robust resolver used by dry-run.
       if (row.source === "zoom_meeting" && !payload.resolved_attendee_email) {
-        const obj = (payload.payload as Record<string, unknown> | undefined)
-          ?.object as Record<string, unknown> | undefined;
-        const meetingId = obj?.id ? String(obj.id) : null;
-
-        if (meetingId) {
-          let attendeeEmail: string | null = null;
-          let resolvedVia: string | null = null;
-
-          // 1. meeting_links cache
-          const cached = await lookupMeetingLink(meetingId);
-          if (cached?.attendee_email) {
-            attendeeEmail = cached.attendee_email;
-            resolvedVia = "meeting_links_cache";
-          }
-
-          // 2. Gmail: Zoom sends a confirmation email whose body contains
-          //    the invitee's name + email. Search the inbox for that email.
-          if (!attendeeEmail) {
-            const queries = [
-              `from:zoom.us ${meetingId}`,
-              `from:*.zoom.us ${meetingId}`,
-              `from:no-reply@zoom.us ${meetingId}`,
-              `"${meetingId}"`,
-            ];
-            for (const q of queries) {
-              if (attendeeEmail) break;
-              try {
-                const hits = await gmailService.searchMessages(q, 5);
-                for (const hit of hits) {
-                  const email = await gmailService.extractAttendeeEmailFromMessage(hit.id);
-                  if (email) {
-                    attendeeEmail = email;
-                    resolvedVia = `gmail_search:${q}`;
-                    // Populate cache for future lookups
-                    await upsertMeetingLink({
-                      zoom_meeting_id: meetingId,
-                      attendee_email: email,
-                      gmail_message_id: hit.id,
-                      meeting_topic: obj?.topic as string | undefined,
-                    });
-                    break;
-                  }
-                }
-              } catch (err) {
-                logger.warn("Replay Gmail search failed", { meetingId, q, error: String(err) });
-              }
-            }
-          }
-
-          // 3. Zoom meeting settings fallback
-          if (!attendeeEmail) {
-            try {
-              const settings = await zoomService.getMeetingSettings(meetingId);
-              const firstExternal = settings?.invitees.find(
-                (i) => i.email && !i.email.toLowerCase().endsWith(`@${ownDomain}`)
-              );
-              if (firstExternal?.email) {
-                attendeeEmail = firstExternal.email.toLowerCase();
-                resolvedVia = "zoom_meeting_settings";
-              }
-            } catch (err) {
-              logger.warn("Replay Zoom settings failed", { meetingId, error: String(err) });
-            }
-          }
-
-          // 3b. Zoom participants fallback for completed meetings.
-          if (!attendeeEmail) {
-            try {
-              const participants = await zoomService.getMeetingParticipants(meetingId);
-              const firstExternal = participants.find(
-                (p) =>
-                  (p.email || p.user_email) &&
-                  !String(p.email || p.user_email).toLowerCase().endsWith(`@${ownDomain}`) &&
-                  !String(p.email || p.user_email).toLowerCase().endsWith("@zoom.us")
-              );
-              if (firstExternal) {
-                attendeeEmail = String(firstExternal.email || firstExternal.user_email).toLowerCase();
-                resolvedVia = "zoom_participants";
-              }
-            } catch (err) {
-              logger.warn("Replay Zoom participants failed", { meetingId, error: String(err) });
-            }
-          }
-
-          // 4. Transcript email regex
-          if (!attendeeEmail && payload.transcript) {
-            const re = /[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}/g;
-            const matches = Array.from(
-              new Set(
-                (String(payload.transcript).match(re) || []).map((e) => e.toLowerCase())
-              )
-            );
-            const external = matches.find(
-              (e) =>
-                !e.endsWith(`@${ownDomain}`) &&
-                !e.endsWith("@zoom.us") &&
-                !e.includes("calendar-notification@google.com")
-            );
-            if (external) {
-              attendeeEmail = external;
-              resolvedVia = "transcript_regex";
-            }
-          }
-
-          if (attendeeEmail) {
-            payload = { ...payload, resolved_attendee_email: attendeeEmail, resolved_via: resolvedVia };
-            // Write the resolved email back into the stored payload so future
-            // reads don't need to re-run the cascade.
-            await supabase
-              .from("webhook_events")
-              .update({ payload })
-              .eq("id", row.id);
-            logger.info("Replay: resolved zoom_meeting attendee", {
-              meetingId,
-              attendeeEmail,
-              resolvedVia,
-            });
-          }
-        }
+        const resolution = await resolveZoomMeetingAttendee({ id: row.id, payload });
+        payload = resolution.updated_payload;
 
         // Pace Gmail calls — stay well under quota.
         await sleep(300);
