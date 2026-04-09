@@ -720,12 +720,13 @@ app.get("/api/debug/zoom-transcripts", async (_req, res) => {
   try {
     const { getSupabase } = await import("./utils/supabase");
     const supabase = getSupabase();
+    const limit = Math.min(500, Math.max(1, Number(_req.query.limit || 200)));
     const { data } = await supabase
       .from("webhook_events")
       .select("id, event_type, payload, received_at")
       .eq("source", "zoom_meeting")
       .order("received_at", { ascending: false })
-      .limit(50);
+      .limit(limit);
     const rows = (data || []).map((row: any) => {
       const obj = row.payload?.payload?.object || {};
       return {
@@ -741,7 +742,8 @@ app.get("/api/debug/zoom-transcripts", async (_req, res) => {
         has_transcript_text: typeof row.payload?.transcript === "string" && row.payload.transcript.length > 0,
       };
     });
-    res.json({ count: rows.length, rows });
+    const actionable = rows.filter((r) => r.event_type === "recording.transcript_completed");
+    res.json({ count: rows.length, actionable_transcripts: actionable.length, rows });
   } catch (err) {
     res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
   }
@@ -764,10 +766,29 @@ app.get("/api/debug/test-gmail-cascade", async (req, res) => {
 
     const supabase = getSupabase();
     let meetingId = (req.query.meetingId as string) || "";
+    const rowIdParam = (req.query.eventId as string) || (req.query.rowId as string) || "";
     let sourceRowId: string | null = null;
     let sourceTopic: string | null = null;
 
     // Auto-pick first unresolved transcript if no meetingId given.
+    if (!meetingId && rowIdParam) {
+      const { data: byId } = await supabase
+        .from("webhook_events")
+        .select("id, payload")
+        .eq("id", rowIdParam)
+        .maybeSingle();
+      if (!byId) {
+        return res.status(404).json({ error: "event_not_found", event_id: rowIdParam });
+      }
+      const obj = (byId as any).payload?.payload?.object || {};
+      meetingId = obj.id ? String(obj.id) : "";
+      sourceRowId = (byId as any).id;
+      sourceTopic = obj.topic || null;
+      if (!meetingId) {
+        return res.status(400).json({ error: "event_has_no_meeting_id", event_id: rowIdParam });
+      }
+    }
+
     if (!meetingId) {
       const { data } = await supabase
         .from("webhook_events")
@@ -844,6 +865,17 @@ app.get("/api/debug/test-gmail-cascade", async (req, res) => {
       trace.step3_zoom_meeting_settings = settings || "null_or_missing";
     } catch (zErr) {
       trace.step3_zoom_meeting_settings = { error: String(zErr) };
+    }
+
+    // Step 3b: Zoom participants (past meeting participant list)
+    try {
+      const participants = await zoomService.getMeetingParticipants(meetingId);
+      trace.step3b_zoom_participants = {
+        count: participants.length,
+        first_25: participants.slice(0, 25),
+      };
+    } catch (zErr) {
+      trace.step3b_zoom_participants = { error: String(zErr) };
     }
 
     // Step 4: transcript regex (if we have a transcript stored on the row)

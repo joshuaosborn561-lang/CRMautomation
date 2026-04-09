@@ -1,7 +1,5 @@
 import { getSupabase } from "../utils/supabase";
 import { logger } from "../utils/logger";
-import { enrichContact, enrichByLinkedIn } from "./leadmagic";
-import { enrichPerson as apolloEnrich } from "./apollo";
 import type { EventSource, WebhookEvent } from "@crm-autopilot/shared";
 
 // ============================================================
@@ -260,7 +258,9 @@ export async function getOrEnrichIdentity(
     return { ...identity.enriched, from_cache: true };
   }
 
-  // Merge seed fields (from the webhook payload) with whatever the cache had.
+  // Source-of-truth enrichment only: rely on webhook-provided identity fields
+  // (email, phone, linkedin, names/company/title) and cache them.
+  // No LeadMagic/Apollo calls in the main pipeline.
   const merged: EnrichedFields = {
     email: seed.email || identity.enriched.email || null,
     first_name: seed.first_name || identity.enriched.first_name || null,
@@ -269,75 +269,9 @@ export async function getOrEnrichIdentity(
     linkedin_url: seed.linkedin_url || identity.enriched.linkedin_url || null,
     company: seed.company || identity.enriched.company || null,
     title: seed.title || identity.enriched.title || null,
-    source: null,
-    at: null,
+    source: "source_identity",
+    at: new Date().toISOString(),
   };
-
-  let enrichmentSource: string | null = null;
-
-  // 1. LeadMagic by email
-  if (merged.email) {
-    try {
-      const lm = await enrichContact({
-        email: merged.email,
-        first_name: merged.first_name || undefined,
-        last_name: merged.last_name || undefined,
-        company: merged.company || undefined,
-        linkedin_url: merged.linkedin_url || undefined,
-        phone: merged.phone || undefined,
-      });
-      if (lm.enriched) {
-        merged.first_name = merged.first_name || lm.first_name || null;
-        merged.last_name = merged.last_name || lm.last_name || null;
-        merged.company = merged.company || lm.company || null;
-        merged.title = merged.title || lm.title || null;
-        merged.linkedin_url = merged.linkedin_url || lm.linkedin_url || null;
-        merged.phone = merged.phone || lm.phone || null;
-        enrichmentSource = "leadmagic_email";
-      }
-    } catch (err) {
-      logger.warn("LeadMagic email enrich failed", { error: String(err) });
-    }
-  }
-
-  // 2. LeadMagic by LinkedIn
-  if (!enrichmentSource && merged.linkedin_url) {
-    try {
-      const lm = await enrichByLinkedIn(merged.linkedin_url);
-      if (lm) {
-        merged.email = merged.email || lm.email || null;
-        merged.first_name = merged.first_name || lm.first_name || null;
-        merged.last_name = merged.last_name || lm.last_name || null;
-        merged.company = merged.company || lm.company_name || null;
-        merged.title = merged.title || lm.professional_title || null;
-        merged.phone = merged.phone || lm.mobile_number || null;
-        enrichmentSource = "leadmagic_linkedin";
-      }
-    } catch (err) {
-      logger.warn("LeadMagic linkedin enrich failed", { error: String(err) });
-    }
-  }
-
-  // 3. Apollo email fallback (email only — no cascades)
-  if (!enrichmentSource && merged.email) {
-    try {
-      const ap = await apolloEnrich({ email: merged.email });
-      if (ap) {
-        merged.phone = merged.phone || ap.phone || null;
-        merged.linkedin_url = merged.linkedin_url || ap.linkedin_url || null;
-        merged.title = merged.title || ap.title || null;
-        merged.company = merged.company || ap.company || null;
-        enrichmentSource = "apollo_email";
-      }
-    } catch (err) {
-      logger.warn("Apollo enrich failed", { error: String(err) });
-    }
-  }
-
-  // Persist whatever we ended up with (even if no external enricher hit —
-  // this still caches the seed values so next call is a pure SELECT).
-  merged.source = enrichmentSource || "seed_only";
-  merged.at = new Date().toISOString();
 
   const supabase = getSupabase();
   const { error } = await supabase

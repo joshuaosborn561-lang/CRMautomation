@@ -295,6 +295,63 @@ export async function getMeetingSettings(meetingId: string): Promise<{
   }
 }
 
+// --- Meeting Participants (fallback for attendee email identity) ---
+
+/**
+ * Fetch meeting participants (from past meetings/reporting data).
+ * Returns a flat list of participants with whatever identity fields Zoom provides.
+ * Non-fatal: on error, returns [].
+ */
+export async function getMeetingParticipants(meetingId: string): Promise<Array<{
+  id?: string;
+  name?: string;
+  user_email?: string;
+  email?: string;
+}>> {
+  const encodedId = meetingId.includes("/") || meetingId.includes("=")
+    ? encodeURIComponent(encodeURIComponent(meetingId))
+    : meetingId;
+  try {
+    const first = (await zoomFetch(`/past_meetings/${encodedId}/participants?page_size=300`)) as {
+      participants?: Array<{
+        id?: string;
+        name?: string;
+        user_email?: string;
+        email?: string;
+      }>;
+      next_page_token?: string;
+    };
+    const all: Array<{
+      id?: string;
+      name?: string;
+      user_email?: string;
+      email?: string;
+    }> = [...(first.participants || [])];
+    let token = first.next_page_token || "";
+    let guard = 0;
+    while (token && guard < 5) {
+      guard += 1;
+      const next = (await zoomFetch(
+        `/past_meetings/${encodedId}/participants?page_size=300&next_page_token=${encodeURIComponent(token)}`
+      )) as {
+        participants?: Array<{
+          id?: string;
+          name?: string;
+          user_email?: string;
+          email?: string;
+        }>;
+        next_page_token?: string;
+      };
+      all.push(...(next.participants || []));
+      token = next.next_page_token || "";
+    }
+    return all;
+  } catch (err) {
+    logger.warn("Could not fetch meeting participants", { meetingId, error: String(err) });
+    return [];
+  }
+}
+
 // --- Webhook Verification ---
 
 import crypto from "crypto";

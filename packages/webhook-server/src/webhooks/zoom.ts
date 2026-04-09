@@ -2,12 +2,10 @@ import { Router, Request, Response } from "express";
 import { storeWebhookEvent, addIdentityReviewRow } from "../services/event-store";
 import { verifyZoomWebhook, handleZoomChallenge } from "../services/zoom";
 import * as zoomService from "../services/zoom";
-import { enrichContact } from "../services/leadmagic";
 import * as gmailService from "../services/gmail";
 import {
   computeIdentityKey,
   emailKey,
-  phoneKey,
   lookupMeetingLink,
   buildIdentityHint,
 } from "../services/identity";
@@ -70,35 +68,6 @@ zoomRouter.post("/", async (req: Request, res: Response) => {
         ]);
         if (transcript) enrichedPayload.transcript = transcript;
         if (callDetails) enrichedPayload.call_details = callDetails;
-
-        // LeadMagic enrichment from phone + name
-        const externalNumber = getExternalPhoneNumber(callDetails, payload);
-        const externalName = getExternalCallerName(callDetails, payload);
-        if (externalNumber || externalName) {
-          const enriched = await enrichContact({
-            phone: externalNumber || undefined,
-            first_name: externalName ? externalName.split(" ")[0] : undefined,
-            last_name: externalName ? externalName.split(" ").slice(1).join(" ") : undefined,
-          });
-          if (enriched.enriched) {
-            enrichedPayload.enriched_contact = {
-              email: enriched.email,
-              first_name: enriched.first_name,
-              last_name: enriched.last_name,
-              company: enriched.company,
-              title: enriched.title,
-              linkedin_url: enriched.linkedin_url,
-              phone: externalNumber,
-              industry: enriched.industry,
-              company_size: enriched.company_size,
-            };
-            logger.info("Enriched Zoom phone call with LeadMagic data", {
-              callId,
-              phone: externalNumber,
-              email: enriched.email,
-            });
-          }
-        }
       }
 
       const identityKey = computeIdentityKey("zoom_phone", enrichedPayload);
@@ -163,6 +132,7 @@ zoomRouter.post("/", async (req: Request, res: Response) => {
     if (!attendeeEmail) {
       const queries = [
         `from:zoom.us ${meetingId}`,
+        `(from:zoom.us OR from:no-reply@zoom.us) ${meetingId}`,
         `from:no-reply@zoom.us ${meetingId}`,
         `"${meetingId}"`,
       ];
@@ -199,6 +169,37 @@ zoomRouter.post("/", async (req: Request, res: Response) => {
         }
       } catch (err) {
         logger.warn("Zoom getMeetingSettings failed", { meetingId, error: String(err) });
+      }
+    }
+
+    // 3b. Zoom participants fallback. For completed meetings this is often
+    // the most reliable source of attendee email when invitees[] is empty.
+    if (!attendeeEmail) {
+      try {
+        const participants = await zoomService.getMeetingParticipants(meetingId);
+        const uuid = (payload.payload?.object?.uuid as string | undefined) || "";
+        const participantsWithFallback =
+          participants.length === 0 && uuid && uuid !== meetingId
+            ? await zoomService.getMeetingParticipants(uuid)
+            : participants;
+        const ownDomain = (process.env.OWN_EMAIL_DOMAIN || "salesglidergrowth.com").toLowerCase();
+        const firstExternal = participantsWithFallback.find((p) => {
+          const addr = String(p.email || p.user_email || "").toLowerCase();
+          return Boolean(
+            addr &&
+              !addr.endsWith(`@${ownDomain}`) &&
+              !addr.endsWith("@zoom.us")
+          );
+        });
+        const participantEmail = String(
+          firstExternal?.email || firstExternal?.user_email || ""
+        ).toLowerCase();
+        if (participantEmail) {
+          attendeeEmail = participantEmail;
+          resolvedVia = "zoom_participants";
+        }
+      } catch (err) {
+        logger.warn("Zoom getMeetingParticipants failed", { meetingId, error: String(err) });
       }
     }
 
@@ -257,57 +258,3 @@ zoomRouter.post("/", async (req: Request, res: Response) => {
   }
 });
 
-/**
- * Determine the external (non-you) phone number and name from a call.
- * Uses extension_type to distinguish internal users from external PSTN callers.
- */
-function getExternalPhoneNumber(
-  callDetails: Record<string, unknown> | null | undefined,
-  payload: Record<string, unknown>
-): string | null {
-  const obj = (payload.payload as Record<string, unknown>)?.object as Record<string, unknown> | undefined;
-  const caller = obj?.caller as Record<string, unknown> | undefined;
-  const callee = obj?.callee as Record<string, unknown> | undefined;
-
-  if (callDetails) {
-    const direction = (callDetails.direction || "") as string;
-    const callerNumber = (callDetails.caller_number || "") as string;
-    const calleeNumber = (callDetails.callee_number || "") as string;
-    if (direction === "outbound" && calleeNumber) return calleeNumber;
-    if (direction === "inbound" && callerNumber) return callerNumber;
-  }
-
-  if (callee?.extension_type === "pstn" && callee?.phone_number) {
-    return callee.phone_number as string;
-  }
-  if (caller?.extension_type === "pstn" && caller?.phone_number) {
-    return caller.phone_number as string;
-  }
-
-  const calleeNum = (callee?.phone_number || "") as string;
-  const callerNum = (caller?.phone_number || "") as string;
-  if (calleeNum.length > 6) return calleeNum;
-  if (callerNum.length > 6) return callerNum;
-
-  return null;
-}
-
-function getExternalCallerName(
-  callDetails: Record<string, unknown> | null | undefined,
-  payload: Record<string, unknown>
-): string {
-  const obj = (payload.payload as Record<string, unknown>)?.object as Record<string, unknown> | undefined;
-  const caller = obj?.caller as Record<string, unknown> | undefined;
-  const callee = obj?.callee as Record<string, unknown> | undefined;
-
-  if (callDetails) {
-    const direction = (callDetails.direction || "") as string;
-    if (direction === "outbound") return (callDetails.callee_name || "") as string;
-    if (direction === "inbound") return (callDetails.caller_name || "") as string;
-  }
-
-  if (callee?.extension_type === "pstn" && callee?.name) return callee.name as string;
-  if (caller?.extension_type === "pstn" && caller?.name) return caller.name as string;
-
-  return "";
-}

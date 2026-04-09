@@ -94,8 +94,7 @@ async function processSingleEvent(event: WebhookEvent): Promise<void> {
   // 2. Resolve-or-create identity row (atomic, DB-serialized).
   const identity = await resolveOrCreateIdentity(identityKey, event.source);
 
-  // 3. Cache-first enrichment. Reads identity_map; only calls
-  //    LeadMagic/Apollo on a true miss (enriched_at IS NULL).
+  // 3. Cache-first source enrichment (email/linkedin/seed fields only).
   const enriched = await getOrEnrichIdentity(identity, {
     email: seed.email,
     first_name: seed.first_name,
@@ -106,10 +105,10 @@ async function processSingleEvent(event: WebhookEvent): Promise<void> {
     title: seed.title,
   });
 
-  // Skip zoom_phone calls we couldn't enrich — phone-only records
-  // with no name/email/company are noise, not real CRM contacts.
-  if (event.source === "zoom_phone" && !enriched.email) {
-    logger.info("Skipping unenrichable zoom_phone event (no email from LeadMagic)", {
+  // Keep CRM focused on email/linkedin identities:
+  // zoom_phone-only records create noise and duplicate placeholders.
+  if (event.source === "zoom_phone") {
+    logger.info("Skipping zoom_phone event for CRM person/deal creation", {
       eventId: event.id,
       identityKey,
     });

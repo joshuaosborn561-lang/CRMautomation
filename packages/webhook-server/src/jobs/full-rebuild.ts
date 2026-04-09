@@ -145,6 +145,7 @@ async function resolveZoomMeetingAttendee(row: {
   if (!attendeeEmail) {
     const queries = [
       `from:zoom.us ${meetingId}`,
+      `from:*.zoom.us ${meetingId}`,
       `from:no-reply@zoom.us ${meetingId}`,
       `"${meetingId}"`,
     ];
@@ -185,6 +186,25 @@ async function resolveZoomMeetingAttendee(row: {
       }
     } catch (err) {
       logger.warn("Dry-run Zoom settings failed", { meetingId, error: String(err) });
+    }
+  }
+
+  // 3b. Zoom participants fallback for completed meetings.
+  if (!attendeeEmail) {
+    try {
+      const participants = await zoomService.getMeetingParticipants(meetingId);
+      const firstExternal = participants.find(
+        (p) =>
+          (p.email || p.user_email) &&
+          !String(p.email || p.user_email).toLowerCase().endsWith(`@${ownDomain}`) &&
+          !String(p.email || p.user_email).toLowerCase().endsWith("@zoom.us")
+      );
+      if (firstExternal) {
+        attendeeEmail = String(firstExternal.email || firstExternal.user_email).toLowerCase();
+        resolvedVia = "zoom_participants";
+      }
+    } catch (err) {
+      logger.warn("Dry-run Zoom participants failed", { meetingId, error: String(err) });
     }
   }
 
@@ -349,9 +369,7 @@ export async function dryRun(): Promise<DryRunReport> {
       seed.title = seed.title || ext.title;
     }
 
-    // Cache-first: resolveOrCreateIdentity then getOrEnrichIdentity.
-    // This CREATES the identity_map row if missing — which is fine for
-    // dry-run because replay will just read the same row.
+    // Cache-first source enrichment: resolveOrCreateIdentity then cache seed fields.
     const identity = await resolveOrCreateIdentity(group.key, latest.source);
     const enriched = await getOrEnrichIdentity(identity, {
       email: seed.email || null,
@@ -376,8 +394,7 @@ export async function dryRun(): Promise<DryRunReport> {
         enriched.first_name ||
         enriched.last_name
     );
-    const zoomPhoneUnenrichable =
-      latest.source === "zoom_phone" && !enriched.email;
+    const zoomPhoneUnenrichable = latest.source === "zoom_phone";
     if (zoomPhoneUnenrichable) {
       skippedUnenrichable.zoom_phone_no_email += 1;
       skippedUnenrichable.total += 1;
@@ -431,7 +448,7 @@ export async function dryRun(): Promise<DryRunReport> {
     enrichment_summary: {
       from_cache: fromCache,
       freshly_enriched: freshlyEnriched,
-      cache_miss_api_calls: freshlyEnriched,
+      cache_miss_api_calls: 0,
     },
     meeting_resolution_summary: meetingSummary,
     contacts,
@@ -621,6 +638,7 @@ export async function replay(): Promise<ReplayReport> {
           if (!attendeeEmail) {
             const queries = [
               `from:zoom.us ${meetingId}`,
+              `from:*.zoom.us ${meetingId}`,
               `from:no-reply@zoom.us ${meetingId}`,
               `"${meetingId}"`,
             ];
@@ -662,6 +680,25 @@ export async function replay(): Promise<ReplayReport> {
               }
             } catch (err) {
               logger.warn("Replay Zoom settings failed", { meetingId, error: String(err) });
+            }
+          }
+
+          // 3b. Zoom participants fallback for completed meetings.
+          if (!attendeeEmail) {
+            try {
+              const participants = await zoomService.getMeetingParticipants(meetingId);
+              const firstExternal = participants.find(
+                (p) =>
+                  (p.email || p.user_email) &&
+                  !String(p.email || p.user_email).toLowerCase().endsWith(`@${ownDomain}`) &&
+                  !String(p.email || p.user_email).toLowerCase().endsWith("@zoom.us")
+              );
+              if (firstExternal) {
+                attendeeEmail = String(firstExternal.email || firstExternal.user_email).toLowerCase();
+                resolvedVia = "zoom_participants";
+              }
+            } catch (err) {
+              logger.warn("Replay Zoom participants failed", { meetingId, error: String(err) });
             }
           }
 

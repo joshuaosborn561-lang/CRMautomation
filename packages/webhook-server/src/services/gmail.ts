@@ -90,6 +90,11 @@ export async function getMessage(messageId: string): Promise<{
       parts?: Array<{
         mimeType: string;
         body?: { data?: string };
+        parts?: Array<{
+          mimeType: string;
+          body?: { data?: string };
+          parts?: Array<unknown>;
+        }>;
       }>;
     };
   };
@@ -98,25 +103,56 @@ export async function getMessage(messageId: string): Promise<{
   const getHeader = (name: string) =>
     headers.find((h) => h.name.toLowerCase() === name.toLowerCase())?.value || "";
 
-  // Decode body from base64url
-  let body = "";
-  if (data.payload.body?.data) {
-    body = Buffer.from(data.payload.body.data, "base64url").toString("utf-8");
-  } else if (data.payload.parts) {
-    const textPart = data.payload.parts.find(
-      (p) => p.mimeType === "text/plain"
-    );
-    const htmlPart = data.payload.parts.find(
-      (p) => p.mimeType === "text/html"
-    );
-    const part = textPart || htmlPart;
-    if (part?.body?.data) {
-      body = Buffer.from(part.body.data, "base64url").toString("utf-8");
+  type GmailPart = {
+    mimeType?: string;
+    body?: { data?: string };
+    parts?: GmailPart[];
+  };
+  const decodeBase64Url = (encoded?: string): string => {
+    if (!encoded) return "";
+    try {
+      return Buffer.from(encoded, "base64url").toString("utf-8");
+    } catch {
+      return "";
     }
+  };
+  const collectBodies = (parts: GmailPart[] | undefined, mime: string, out: string[]): void => {
+    for (const part of parts || []) {
+      if ((part.mimeType || "").toLowerCase().startsWith(mime) && part.body?.data) {
+        out.push(decodeBase64Url(part.body.data));
+      }
+      if (part.parts?.length) collectBodies(part.parts, mime, out);
+    }
+  };
+
+  // Decode text + html bodies. Keep mailto addresses before stripping tags.
+  const plainBodies: string[] = [];
+  const htmlBodies: string[] = [];
+  collectBodies(data.payload.parts as GmailPart[] | undefined, "text/plain", plainBodies);
+  collectBodies(data.payload.parts as GmailPart[] | undefined, "text/html", htmlBodies);
+  if (plainBodies.length === 0 && htmlBodies.length === 0 && data.payload.body?.data) {
+    plainBodies.push(decodeBase64Url(data.payload.body.data));
   }
 
-  // Strip HTML tags if we got HTML
-  body = body.replace(/<[^>]*>/g, " ").replace(/\s+/g, " ").trim();
+  const plainText = plainBodies.join("\n");
+  const htmlText = htmlBodies.join("\n");
+  const htmlMailtoAddresses = Array.from(
+    htmlText.matchAll(/mailto:([^"'<>?\s]+)/gi)
+  )
+    .map((m) => {
+      try {
+        return decodeURIComponent(m[1]);
+      } catch {
+        return m[1];
+      }
+    })
+    .filter(Boolean);
+  const htmlAsText = htmlText.replace(/<[^>]*>/g, " ");
+  const body = [plainText, htmlMailtoAddresses.join(" "), htmlAsText]
+    .filter((s) => s && s.trim().length > 0)
+    .join(" ")
+    .replace(/\s+/g, " ")
+    .trim();
 
   return {
     id: data.id,
