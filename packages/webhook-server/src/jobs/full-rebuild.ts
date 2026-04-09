@@ -57,6 +57,11 @@ export interface DryRunReport {
   projected_person_count: number;
   events_by_source: Record<string, number>;
   events_skipped_noise: number;
+  contacts_skipped_unenrichable: {
+    zoom_phone_no_email: number;
+    empty_ghost: number;
+    total: number;
+  };
   unresolved_events: Array<{
     event_id: string;
     source: string;
@@ -297,6 +302,11 @@ export async function dryRun(): Promise<DryRunReport> {
   const deals: ProjectedDeal[] = [];
   let fromCache = 0;
   let freshlyEnriched = 0;
+  const skippedUnenrichable = {
+    zoom_phone_no_email: 0,
+    empty_ghost: 0,
+    total: 0,
+  };
 
   for (const group of groups.values()) {
     // Build a synthetic WebhookEvent from the most recent event in the group.
@@ -356,6 +366,29 @@ export async function dryRun(): Promise<DryRunReport> {
     if (enriched.from_cache) fromCache += 1;
     else freshlyEnriched += 1;
 
+    // Mirror the pipeline's skip gates. These contacts will never land
+    // in Attio at replay time, so they must not show up in the dry-run
+    // projection either.
+    const hasAnyUsefulField = Boolean(
+      enriched.email ||
+        enriched.phone ||
+        enriched.linkedin_url ||
+        enriched.first_name ||
+        enriched.last_name
+    );
+    const zoomPhoneUnenrichable =
+      latest.source === "zoom_phone" && !enriched.email;
+    if (zoomPhoneUnenrichable) {
+      skippedUnenrichable.zoom_phone_no_email += 1;
+      skippedUnenrichable.total += 1;
+      continue;
+    }
+    if (!hasAnyUsefulField) {
+      skippedUnenrichable.empty_ghost += 1;
+      skippedUnenrichable.total += 1;
+      continue;
+    }
+
     contacts.push({
       identity_key: group.key,
       event_count: group.events.length,
@@ -393,6 +426,7 @@ export async function dryRun(): Promise<DryRunReport> {
     projected_person_count: contacts.length,
     events_by_source: eventsBySource,
     events_skipped_noise: skippedNoise,
+    contacts_skipped_unenrichable: skippedUnenrichable,
     unresolved_events: unresolved,
     enrichment_summary: {
       from_cache: fromCache,

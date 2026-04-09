@@ -714,6 +714,174 @@ app.get("/api/debug/sample-events", async (_req, res) => {
   }
 });
 
+// Debug: list all stored zoom_meeting events with their meeting IDs + resolution status.
+// Read-only. Used to pick a meeting ID to test the Gmail cascade against.
+app.get("/api/debug/zoom-transcripts", async (_req, res) => {
+  try {
+    const { getSupabase } = await import("./utils/supabase");
+    const supabase = getSupabase();
+    const { data } = await supabase
+      .from("webhook_events")
+      .select("id, event_type, payload, received_at")
+      .eq("source", "zoom_meeting")
+      .order("received_at", { ascending: false })
+      .limit(50);
+    const rows = (data || []).map((row: any) => {
+      const obj = row.payload?.payload?.object || {};
+      return {
+        id: row.id,
+        event_type: row.event_type,
+        received_at: row.received_at,
+        meeting_id: obj.id ? String(obj.id) : null,
+        meeting_uuid: obj.uuid || null,
+        topic: obj.topic || null,
+        host_id: obj.host_id || null,
+        resolved_attendee_email: row.payload?.resolved_attendee_email || null,
+        resolved_via: row.payload?.resolved_via || null,
+        has_transcript_text: typeof row.payload?.transcript === "string" && row.payload.transcript.length > 0,
+      };
+    });
+    res.json({ count: rows.length, rows });
+  } catch (err) {
+    res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+  }
+});
+
+// Debug: run the Gmail+Zoom identity cascade for ONE meeting ID and return
+// a step-by-step trace. Non-destructive — does not write to webhook_events
+// or meeting_links. Used to diagnose why the dry-run's meeting resolution
+// returns 0.
+//
+// Usage:
+//   GET /api/debug/test-gmail-cascade?meetingId=84095267037
+//   GET /api/debug/test-gmail-cascade            (auto-picks first unresolved transcript)
+app.get("/api/debug/test-gmail-cascade", async (req, res) => {
+  try {
+    const { getSupabase } = await import("./utils/supabase");
+    const gmailService = await import("./services/gmail");
+    const zoomService = await import("./services/zoom");
+    const { lookupMeetingLink } = await import("./services/identity");
+
+    const supabase = getSupabase();
+    let meetingId = (req.query.meetingId as string) || "";
+    let sourceRowId: string | null = null;
+    let sourceTopic: string | null = null;
+
+    // Auto-pick first unresolved transcript if no meetingId given.
+    if (!meetingId) {
+      const { data } = await supabase
+        .from("webhook_events")
+        .select("id, payload")
+        .eq("source", "zoom_meeting")
+        .eq("event_type", "recording.transcript_completed")
+        .order("received_at", { ascending: false })
+        .limit(10);
+      const pick = (data || []).find((row: any) => !row.payload?.resolved_attendee_email);
+      if (!pick) {
+        return res.json({ error: "no_unresolved_transcripts_found" });
+      }
+      const obj = pick.payload?.payload?.object || {};
+      meetingId = obj.id ? String(obj.id) : "";
+      sourceRowId = pick.id;
+      sourceTopic = obj.topic || null;
+      if (!meetingId) return res.json({ error: "picked_row_has_no_meeting_id", row_id: pick.id });
+    }
+
+    const ownDomain = (process.env.OWN_EMAIL_DOMAIN || "salesglidergrowth.com").toLowerCase();
+    const trace: Record<string, unknown> = {
+      meeting_id: meetingId,
+      source_row_id: sourceRowId,
+      source_topic: sourceTopic,
+      own_domain: ownDomain,
+    };
+
+    // Step 1: meeting_links cache
+    const cached = await lookupMeetingLink(meetingId);
+    trace.step1_meeting_links_cache = cached || "miss";
+
+    // Step 2: Gmail — three query variants, per-message body extraction
+    const queries = [
+      `from:zoom.us ${meetingId}`,
+      `from:no-reply@zoom.us ${meetingId}`,
+      `"${meetingId}"`,
+    ];
+    const gmailResults: Array<Record<string, unknown>> = [];
+    for (const q of queries) {
+      try {
+        const hits = await gmailService.searchMessages(q, 5);
+        const perMessage: Array<Record<string, unknown>> = [];
+        for (const hit of hits) {
+          try {
+            const msg = await gmailService.getMessage(hit.id);
+            const extracted = await gmailService.extractAttendeeEmailFromMessage(hit.id);
+            perMessage.push({
+              message_id: hit.id,
+              thread_id: hit.threadId,
+              from: msg.from,
+              to: msg.to,
+              subject: msg.subject,
+              snippet: msg.snippet,
+              body_first_400: (msg.body || "").slice(0, 400),
+              extracted_email: extracted,
+            });
+          } catch (msgErr) {
+            perMessage.push({
+              message_id: hit.id,
+              error: String(msgErr),
+            });
+          }
+        }
+        gmailResults.push({ query: q, hit_count: hits.length, messages: perMessage });
+      } catch (qErr) {
+        gmailResults.push({ query: q, error: String(qErr) });
+      }
+    }
+    trace.step2_gmail = gmailResults;
+
+    // Step 3: Zoom meeting settings
+    try {
+      const settings = await zoomService.getMeetingSettings(meetingId);
+      trace.step3_zoom_meeting_settings = settings || "null_or_missing";
+    } catch (zErr) {
+      trace.step3_zoom_meeting_settings = { error: String(zErr) };
+    }
+
+    // Step 4: transcript regex (if we have a transcript stored on the row)
+    if (sourceRowId) {
+      const { data: row } = await supabase
+        .from("webhook_events")
+        .select("payload")
+        .eq("id", sourceRowId)
+        .maybeSingle();
+      const transcript = row?.payload?.transcript;
+      if (typeof transcript === "string" && transcript.length > 0) {
+        const re = /[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}/g;
+        const matches = Array.from(new Set((transcript.match(re) || []).map((e) => e.toLowerCase())));
+        const external = matches.filter(
+          (e) =>
+            !e.endsWith(`@${ownDomain}`) &&
+            !e.endsWith("@zoom.us") &&
+            !e.includes("calendar-notification@google.com")
+        );
+        trace.step4_transcript = {
+          transcript_length: transcript.length,
+          all_matches: matches,
+          external_matches: external,
+          first_external: external[0] || null,
+        };
+      } else {
+        trace.step4_transcript = "no_transcript_text_on_row";
+      }
+    } else {
+      trace.step4_transcript = "no_source_row_passed";
+    }
+
+    res.json(trace);
+  } catch (err) {
+    res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+  }
+});
+
 // Re-enrich zoom_phone events with LeadMagic (for events that missed enrichment at webhook time)
 app.post("/api/re-enrich", async (_req, res) => {
   try {
