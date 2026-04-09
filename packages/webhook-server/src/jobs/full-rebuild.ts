@@ -109,7 +109,23 @@ type GmailSearchQuery = {
 
 function buildGmailQueriesForMeeting(meetingId: string, topic?: string): GmailSearchQuery[] {
   const meetingIdDigits = meetingId.replace(/\D/g, "");
-  const idVariants = Array.from(new Set([meetingId, meetingIdDigits].filter(Boolean)));
+  const formattedDigits = new Set<string>([meetingIdDigits]);
+  if (meetingIdDigits.length === 11) {
+    formattedDigits.add(
+      `${meetingIdDigits.slice(0, 3)} ${meetingIdDigits.slice(3, 7)} ${meetingIdDigits.slice(7)}`
+    );
+    formattedDigits.add(
+      `${meetingIdDigits.slice(0, 3)}-${meetingIdDigits.slice(3, 7)}-${meetingIdDigits.slice(7)}`
+    );
+  } else if (meetingIdDigits.length === 10) {
+    formattedDigits.add(
+      `${meetingIdDigits.slice(0, 3)} ${meetingIdDigits.slice(3, 6)} ${meetingIdDigits.slice(6)}`
+    );
+    formattedDigits.add(
+      `${meetingIdDigits.slice(0, 3)}-${meetingIdDigits.slice(3, 6)}-${meetingIdDigits.slice(6)}`
+    );
+  }
+  const idVariants = Array.from(new Set([meetingId, ...formattedDigits].filter(Boolean)));
 
   const topicHints = new Set<string>();
   if (topic) {
@@ -132,6 +148,11 @@ function buildGmailQueriesForMeeting(meetingId: string, topic?: string): GmailSe
     push(`from:*.zoom.us ${id}`, 8);
     push(`from:no-reply@zoom.us ${id}`, 8);
     push(`"${id}"`, 8);
+  }
+  if (meetingIdDigits) {
+    push(`from:zoom.us "zoom.us/j/${meetingIdDigits}"`, 8);
+    push(`from:no-reply@zoom.us "zoom.us/j/${meetingIdDigits}"`, 8);
+    push(`"zoom.us/j/${meetingIdDigits}"`, 8);
   }
   for (const hint of topicHints) {
     push(`from:zoom.us "${hint}"`, 5);
