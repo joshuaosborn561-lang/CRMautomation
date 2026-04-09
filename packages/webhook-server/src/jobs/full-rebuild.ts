@@ -56,6 +56,7 @@ export interface DryRunReport {
   total_events: number;
   projected_person_count: number;
   events_by_source: Record<string, number>;
+  events_skipped_noise: number;
   unresolved_events: Array<{
     event_id: string;
     source: string;
@@ -67,8 +68,147 @@ export interface DryRunReport {
     freshly_enriched: number;
     cache_miss_api_calls: number;
   };
+  meeting_resolution_summary: {
+    meetings_checked: number;
+    resolved_via_cache: number;
+    resolved_via_gmail: number;
+    resolved_via_zoom_settings: number;
+    resolved_via_transcript: number;
+    still_unresolved: number;
+  };
   contacts: ProjectedContact[];
   deals: ProjectedDeal[];
+}
+
+/**
+ * Only event types that should actually produce contacts+deals.
+ * All other zoom_meeting event types (meeting.started, meeting.ended,
+ * recording.completed, meeting.ended_backfill) are ingestion noise —
+ * only transcript_completed carries the data we care about.
+ */
+const ACTIONABLE_EVENT_TYPES: Record<string, Set<string>> = {
+  zoom_meeting: new Set(["recording.transcript_completed"]),
+  // All other sources: every event type is actionable by default.
+};
+
+function isActionable(source: EventSource, eventType: string): boolean {
+  const actionable = ACTIONABLE_EVENT_TYPES[source];
+  return !actionable || actionable.has(eventType);
+}
+
+/**
+ * Re-run the Gmail identity cascade for a zoom_meeting payload whose stored
+ * row pre-dates the cascade logic. Writes the resolved email back into
+ * webhook_events.payload so subsequent calls see it. Non-destructive to Attio.
+ */
+async function resolveZoomMeetingAttendee(row: {
+  id: string;
+  payload: Record<string, unknown>;
+}): Promise<{
+  email: string | null;
+  via: string | null;
+  updated_payload: Record<string, unknown>;
+}> {
+  let payload = row.payload;
+  if (payload.resolved_attendee_email) {
+    return {
+      email: payload.resolved_attendee_email as string,
+      via: (payload.resolved_via as string) || "pre_resolved",
+      updated_payload: payload,
+    };
+  }
+
+  const obj = (payload.payload as Record<string, unknown> | undefined)?.object as
+    | Record<string, unknown>
+    | undefined;
+  const meetingId = obj?.id ? String(obj.id) : null;
+  if (!meetingId) return { email: null, via: null, updated_payload: payload };
+
+  const ownDomain = (process.env.OWN_EMAIL_DOMAIN || "salesglidergrowth.com").toLowerCase();
+
+  let attendeeEmail: string | null = null;
+  let resolvedVia: string | null = null;
+
+  // 1. meeting_links cache
+  const cached = await lookupMeetingLink(meetingId);
+  if (cached?.attendee_email) {
+    attendeeEmail = cached.attendee_email;
+    resolvedVia = "meeting_links_cache";
+  }
+
+  // 2. Gmail inbox search — Zoom confirmation email from no-reply@zoom.us
+  if (!attendeeEmail) {
+    const queries = [
+      `from:zoom.us ${meetingId}`,
+      `from:no-reply@zoom.us ${meetingId}`,
+      `"${meetingId}"`,
+    ];
+    for (const q of queries) {
+      if (attendeeEmail) break;
+      try {
+        const hits = await gmailService.searchMessages(q, 5);
+        for (const hit of hits) {
+          const email = await gmailService.extractAttendeeEmailFromMessage(hit.id);
+          if (email) {
+            attendeeEmail = email;
+            resolvedVia = `gmail_search:${q}`;
+            await upsertMeetingLink({
+              zoom_meeting_id: meetingId,
+              attendee_email: email,
+              gmail_message_id: hit.id,
+              meeting_topic: obj?.topic as string | undefined,
+            });
+            break;
+          }
+        }
+      } catch (err) {
+        logger.warn("Dry-run Gmail search failed", { meetingId, q, error: String(err) });
+      }
+    }
+  }
+
+  // 3. Zoom meeting settings fallback
+  if (!attendeeEmail) {
+    try {
+      const settings = await zoomService.getMeetingSettings(meetingId);
+      const firstExternal = settings?.invitees.find(
+        (i) => i.email && !i.email.toLowerCase().endsWith(`@${ownDomain}`)
+      );
+      if (firstExternal?.email) {
+        attendeeEmail = firstExternal.email.toLowerCase();
+        resolvedVia = "zoom_meeting_settings";
+      }
+    } catch (err) {
+      logger.warn("Dry-run Zoom settings failed", { meetingId, error: String(err) });
+    }
+  }
+
+  // 4. Transcript regex
+  if (!attendeeEmail && payload.transcript) {
+    const re = /[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}/g;
+    const matches = Array.from(
+      new Set((String(payload.transcript).match(re) || []).map((e) => e.toLowerCase()))
+    );
+    const external = matches.find(
+      (e) =>
+        !e.endsWith(`@${ownDomain}`) &&
+        !e.endsWith("@zoom.us") &&
+        !e.includes("calendar-notification@google.com")
+    );
+    if (external) {
+      attendeeEmail = external;
+      resolvedVia = "transcript_regex";
+    }
+  }
+
+  if (attendeeEmail) {
+    payload = { ...payload, resolved_attendee_email: attendeeEmail, resolved_via: resolvedVia };
+    // Persist back to webhook_events so subsequent reads are instant.
+    const supabase = getSupabase();
+    await supabase.from("webhook_events").update({ payload }).eq("id", row.id);
+  }
+
+  return { email: attendeeEmail, via: resolvedVia, updated_payload: payload };
 }
 
 export async function dryRun(): Promise<DryRunReport> {
@@ -90,6 +230,16 @@ export async function dryRun(): Promise<DryRunReport> {
 
   const eventsBySource: Record<string, number> = {};
   const unresolved: DryRunReport["unresolved_events"] = [];
+  let skippedNoise = 0;
+
+  const meetingSummary = {
+    meetings_checked: 0,
+    resolved_via_cache: 0,
+    resolved_via_gmail: 0,
+    resolved_via_zoom_settings: 0,
+    resolved_via_transcript: 0,
+    still_unresolved: 0,
+  };
 
   // Group events by identity_key
   interface Group {
@@ -101,7 +251,31 @@ export async function dryRun(): Promise<DryRunReport> {
 
   for (const row of rows) {
     eventsBySource[row.source] = (eventsBySource[row.source] || 0) + 1;
-    const key = computeIdentityKey(row.source, row.payload);
+
+    // Skip non-actionable event types (meeting lifecycle noise).
+    if (!isActionable(row.source, row.event_type)) {
+      skippedNoise += 1;
+      continue;
+    }
+
+    // For zoom_meeting transcripts: run the identity cascade now so
+    // historical events resolve. Writes back to webhook_events.payload.
+    let effectivePayload = row.payload;
+    if (row.source === "zoom_meeting") {
+      meetingSummary.meetings_checked += 1;
+      const resolution = await resolveZoomMeetingAttendee(row);
+      effectivePayload = resolution.updated_payload;
+      if (resolution.email) {
+        if (resolution.via === "meeting_links_cache") meetingSummary.resolved_via_cache += 1;
+        else if (resolution.via?.startsWith("gmail_search")) meetingSummary.resolved_via_gmail += 1;
+        else if (resolution.via === "zoom_meeting_settings") meetingSummary.resolved_via_zoom_settings += 1;
+        else if (resolution.via === "transcript_regex") meetingSummary.resolved_via_transcript += 1;
+      } else {
+        meetingSummary.still_unresolved += 1;
+      }
+    }
+
+    const key = computeIdentityKey(row.source, effectivePayload);
     if (!key) {
       unresolved.push({
         event_id: row.id,
@@ -111,6 +285,8 @@ export async function dryRun(): Promise<DryRunReport> {
       });
       continue;
     }
+    // Mutate the row so extractContactFromEvent sees the resolved payload.
+    row.payload = effectivePayload;
     const group = groups.get(key) || { key, events: [], sources: new Set<string>() };
     group.events.push(row);
     group.sources.add(row.source);
@@ -216,12 +392,14 @@ export async function dryRun(): Promise<DryRunReport> {
     total_events: rows.length,
     projected_person_count: contacts.length,
     events_by_source: eventsBySource,
+    events_skipped_noise: skippedNoise,
     unresolved_events: unresolved,
     enrichment_summary: {
       from_cache: fromCache,
       freshly_enriched: freshlyEnriched,
       cache_miss_api_calls: freshlyEnriched,
     },
+    meeting_resolution_summary: meetingSummary,
     contacts,
     deals,
   };

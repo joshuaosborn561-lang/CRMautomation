@@ -64,6 +64,18 @@ export async function processEventQueue(): Promise<void> {
 }
 
 async function processSingleEvent(event: WebhookEvent): Promise<void> {
+  // Gate: only actionable zoom_meeting events produce contacts+deals.
+  // meeting.started / meeting.ended / recording.completed / meeting.ended_backfill
+  // are lifecycle noise — skip them entirely.
+  if (event.source === "zoom_meeting" && event.event_type !== "recording.transcript_completed") {
+    logger.info("Skipping non-actionable zoom_meeting event", {
+      eventId: event.id,
+      eventType: event.event_type,
+    });
+    await markEventProcessed(event.id);
+    return;
+  }
+
   // Events without an identity key are already in review_queue — nothing to do here.
   const identityKey = (event as unknown as { identity_key?: string | null }).identity_key;
   if (!identityKey) {
