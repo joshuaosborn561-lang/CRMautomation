@@ -193,6 +193,11 @@ async function resolveZoomMeetingAttendee(row: {
   if (!attendeeEmail) {
     try {
       const participants = await zoomService.getMeetingParticipants(meetingId);
+      const uuid = obj?.uuid ? String(obj.uuid) : "";
+      const participantsWithFallback =
+        participants.length === 0 && uuid && uuid !== meetingId
+          ? await zoomService.getMeetingParticipants(uuid)
+          : participants;
       const firstExternal = participants.find(
         (p) =>
           (p.email || p.user_email) &&
