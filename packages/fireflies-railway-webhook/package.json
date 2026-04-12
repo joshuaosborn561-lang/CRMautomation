@@ -1,0 +1,20 @@
+{
+  "name": "fireflies-railway-webhook",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Fireflies webhook -> Gemini classification -> HubSpot updates (Railway)",
+  "main": "server.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node server.js",
+    "payload:hubspot-test": "node scripts/print-webhook-payload-for-hubspot-test.js",
+    "test:classify": "node scripts/test-gemini-classification.js",
+    "test:ci-rules": "node scripts/ci-rule-tests.js"
+  },
+  "dependencies": {
+    "@google/generative-ai": "0.24.0",
+    "dotenv": "16.4.5",
+    "express": "4.21.2",
+    "node-fetch": "2.7.0"
+  }
+}
