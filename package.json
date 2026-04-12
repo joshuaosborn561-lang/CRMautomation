@@ -9,7 +9,9 @@
     "dev:query": "npm run dev --workspace=packages/query-app",
     "build": "npm run build --workspaces",
     "build:server": "npm run build --workspace=packages/webhook-server",
-    "build:query": "npm run build --workspace=packages/query-app"
+    "build:query": "npm run build --workspace=packages/query-app",
+    "start:fireflies": "npm run start --workspace=fireflies-railway-webhook",
+    "test:fireflies-rules": "npm run test:ci-rules --workspace=fireflies-railway-webhook"
   },
   "engines": {
     "node": ">=20.0.0"

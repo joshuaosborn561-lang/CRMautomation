@@ -1,0 +1,33 @@
+name: fireflies-railway-webhook
+
+on:
+  push:
+    branches: [main, master]
+    paths:
+      - "packages/fireflies-railway-webhook/**"
+      - ".github/workflows/fireflies-railway-webhook.yml"
+  pull_request:
+    branches: [main, master]
+    paths:
+      - "packages/fireflies-railway-webhook/**"
+
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: packages/fireflies-railway-webhook
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+          cache-dependency-path: packages/fireflies-railway-webhook/package-lock.json
+      - run: npm ci
+      - run: npm run test:ci-rules
+      - name: Gemini tests (optional secret)
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        run: |
+          if [ -n "$GEMINI_API_KEY" ]; then npm run test:classify; else echo "Skip test:classify"; fi
