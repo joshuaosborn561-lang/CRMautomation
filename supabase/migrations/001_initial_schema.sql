@@ -41,7 +41,7 @@ CREATE INDEX idx_interaction_log_sentiment ON interaction_log(contact_email, sen
 CREATE INDEX idx_interaction_log_occurred ON interaction_log(occurred_at DESC);
 
 -- ============================================================
--- Review Queue (pending Attio writes in review mode)
+-- Review Queue (pending CRM writes in review mode)
 -- ============================================================
 CREATE TABLE review_queue (
   id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),

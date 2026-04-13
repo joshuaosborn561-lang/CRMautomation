@@ -77,34 +77,3 @@ export interface NurtureCandidate {
     days_silent: number;
     nurture_reason: string;
 }
-export interface AttioContact {
-    id?: string;
-    email: string;
-    first_name?: string;
-    last_name?: string;
-    company?: string;
-    phone?: string;
-    linkedin_url?: string;
-    title?: string;
-}
-export interface AttioDeal {
-    id?: string;
-    name: string;
-    stage: DealStage;
-    contact_id: string;
-    company?: string;
-    value?: number;
-    term_months?: number;
-}
-export interface AttioNote {
-    parent_object: "deals" | "contacts" | "people";
-    parent_id: string;
-    title: string;
-    content: string;
-}
-export interface AttioTask {
-    title: string;
-    description: string;
-    linked_deal_id?: string;
-    due_date?: string;
-}

@@ -10,16 +10,16 @@ CREATE TABLE IF NOT EXISTS identity_map (
   id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
   identity_key TEXT NOT NULL UNIQUE,
   source TEXT NOT NULL,
-  attio_person_id TEXT,
-  attio_deal_id TEXT,
-  attio_company_id TEXT,
+  hubspot_contact_id TEXT,
+  hubspot_deal_id TEXT,
+  hubspot_company_id TEXT,
   confidence TEXT CHECK (confidence IN ('verified','inferred','manual')) DEFAULT 'verified',
   merged_into UUID REFERENCES identity_map(id),
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
-CREATE INDEX IF NOT EXISTS idx_identity_map_attio_person ON identity_map(attio_person_id);
+CREATE INDEX IF NOT EXISTS idx_identity_map_hubspot_contact ON identity_map(hubspot_contact_id);
 CREATE INDEX IF NOT EXISTS idx_identity_map_source ON identity_map(source);
 
 ALTER TABLE identity_map ENABLE ROW LEVEL SECURITY;
@@ -94,7 +94,7 @@ CREATE OR REPLACE FUNCTION resolve_or_create_identity(
   p_identity_key TEXT,
   p_source TEXT
 )
-RETURNS TABLE (id UUID, attio_person_id TEXT, attio_deal_id TEXT, attio_company_id TEXT, is_new BOOLEAN) AS $$
+RETURNS TABLE (id UUID, hubspot_contact_id TEXT, hubspot_deal_id TEXT, hubspot_company_id TEXT, is_new BOOLEAN) AS $$
 DECLARE
   v_row identity_map%ROWTYPE;
 BEGIN
@@ -103,7 +103,7 @@ BEGIN
 
   SELECT * INTO v_row FROM identity_map WHERE identity_key = p_identity_key;
   IF FOUND THEN
-    RETURN QUERY SELECT v_row.id, v_row.attio_person_id, v_row.attio_deal_id, v_row.attio_company_id, FALSE;
+    RETURN QUERY SELECT v_row.id, v_row.hubspot_contact_id, v_row.hubspot_deal_id, v_row.hubspot_company_id, FALSE;
     RETURN;
   END IF;
 
@@ -111,6 +111,6 @@ BEGIN
   VALUES (p_identity_key, p_source)
   RETURNING * INTO v_row;
 
-  RETURN QUERY SELECT v_row.id, v_row.attio_person_id, v_row.attio_deal_id, v_row.attio_company_id, TRUE;
+  RETURN QUERY SELECT v_row.id, v_row.hubspot_contact_id, v_row.hubspot_deal_id, v_row.hubspot_company_id, TRUE;
 END;
 $$ LANGUAGE plpgsql;

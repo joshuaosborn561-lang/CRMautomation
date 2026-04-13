@@ -12,6 +12,13 @@
 - `HUBSPOT_STAGE_DISCOVERY_COMPLETED`
 - `HUBSPOT_STAGE_NURTURE`
 - `SLACK_WEBHOOK_URL` (optional at runtime; if unset the app will skip Slack notification)
+- `CALENDLY_API_KEY` (optional today, reserved for Calendly enrichment path)
+
+## CRM architecture
+
+- This repository is now Fireflies + HubSpot centered.
+- Legacy webhook-server/query-app components were removed from the working branch.
+- The active ingestion route is `POST /fireflies-webhook` in `server.js`.
 
 ## Recommended (optional) environment variable
 - `HUBSPOT_STAGE_DISCOVERY_SCHEDULED`
