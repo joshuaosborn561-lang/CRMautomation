@@ -161,6 +161,30 @@ function extractSentenceCount(transcript) {
   return Number.isFinite(count) ? count : count == null ? null : Number(count);
 }
 
+function buildFirefliesSummaryNote(extracted, classification, label, dateStr) {
+  const lines = [];
+  lines.push(`Meeting classified as ${classification} by ${label} on ${dateStr}`);
+  if (extracted.durationMinutes != null) {
+    lines.push(`Duration: ${extracted.durationMinutes} minutes`);
+  }
+  if (extracted.sentenceCount != null) {
+    lines.push(`Sentence count: ${extracted.sentenceCount}`);
+  }
+  const speakerCount = Array.isArray(extracted.speakerNames)
+    ? extracted.speakerNames.filter(Boolean).length
+    : 0;
+  if (speakerCount > 0) {
+    lines.push(`Speakers: ${speakerCount}`);
+  }
+  const overview =
+    typeof extracted.overview === "string" ? extracted.overview.trim() : "";
+  if (overview) {
+    lines.push("");
+    lines.push(overview);
+  }
+  return lines.join("\n");
+}
+
 function pickProspectEmail(attendees, webhookPayload) {
   const lower = (s) => (typeof s === "string" ? s.trim().toLowerCase() : "");
   const possibleMyEmail =
@@ -660,18 +684,17 @@ async function processWebhook(payload, ctx = {}) {
       return;
     }
 
+    const noteBody = buildFirefliesSummaryNote(extracted, classification, label, dateStr);
+
     if (classification === "COMPLETED") {
-      await createContactNote(
-        contact.id,
-        `Meeting classified as COMPLETED by ${label} on ${dateStr}`,
-      );
+      await createContactNote(contact.id, noteBody);
       await updateDealStage(deal.id, HUBSPOT_STAGE_DISCOVERY_COMPLETED);
       recordSuccessfulCompletion(meetingId, classification);
       logLine(cid, "info", "DONE_COMPLETED", `${prospectEmail} contact=${contact.id} deal=${deal.id}`);
       return;
     }
 
-    await createContactNote(contact.id, `Meeting classified as NO_SHOW by ${label} on ${dateStr}`);
+    await createContactNote(contact.id, noteBody);
     await updateDealStage(deal.id, HUBSPOT_STAGE_NURTURE);
 
     const props = contact.properties || {};
