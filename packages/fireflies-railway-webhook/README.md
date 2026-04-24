@@ -22,8 +22,9 @@
 
 ## Recommended (optional) environment variable
 - `HUBSPOT_STAGE_DISCOVERY_SCHEDULED`
-  - If set, the app will only update the deal that is **currently in this stage** within `HUBSPOT_PIPELINE_ID`.
-  - If not set, the app will fall back to the **first associated deal in the pipeline**.
+  - **Optional.** Comma‑separated internal stage IDs are allowed (e.g. `repliedId,discoveryBookedId`). The app will **prefer** a contact’s deal in one of those stages within `HUBSPOT_PIPELINE_ID`.
+  - If **no** deal matches (wrong stage, stale ID, or Calendly/HubSpot moved the deal first), the app **falls back** to the **most recently modified** deal for that contact **in the same pipeline** so Fireflies can still set **Nurture** (no-show) or **Discovery Completed** instead of `SKIP_NO_TARGET_DEAL`.
+  - If **unset**, the most recently modified deal in the pipeline is used when multiple exist.
 
 ## Reliability / tuning (optional)
 
