@@ -20,9 +20,12 @@ const {
   HUBSPOT_PIPELINE_ID,
   HUBSPOT_STAGE_DISCOVERY_COMPLETED,
   HUBSPOT_STAGE_NURTURE,
+  HUBSPOT_STAGE_NO_SHOW,
   SLACK_WEBHOOK_URL,
   HUBSPOT_STAGE_DISCOVERY_SCHEDULED,
 } = process.env;
+
+let warnedNurtureFallbackForNoShow = false;
 
 const FIREFLIES_INITIAL_WAIT_MS = Number(process.env.FIREFLIES_INITIAL_WAIT_MS || 15000);
 const FIREFLIES_RETRY_WAIT_MS = Number(process.env.FIREFLIES_RETRY_WAIT_MS || 30000);
@@ -84,6 +87,62 @@ function uniqNonEmpty(arr) {
   return Array.from(
     new Set((arr || []).map((x) => (typeof x === "string" ? x.trim() : "")).filter(Boolean)),
   );
+}
+
+/** Comma-separated stage IDs in env, e.g. "stageA,stageB" (same pipeline). */
+function parseCommaSeparatedStageIds(raw) {
+  if (raw == null || String(raw).trim() === "") return [];
+  return String(raw)
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean);
+}
+
+function dealLastModifiedMs(deal) {
+  const v = deal?.properties?.hs_lastmodifieddate;
+  if (v == null) return 0;
+  const t = Date.parse(String(v));
+  return Number.isFinite(t) ? t : 0;
+}
+
+/**
+ * Picks the deal in the list with the latest `hs_lastmodifieddate` (tie-break: first in list order).
+ * Used to prefer the "active" open deal for a contact when the exact stage is unknown.
+ */
+function pickNewestAssociatedDeal(deals) {
+  if (!deals?.length) return null;
+  if (deals.length === 1) return deals[0];
+  let best = deals[0];
+  let bestMs = dealLastModifiedMs(best);
+  for (let i = 1; i < deals.length; i += 1) {
+    const ms = dealLastModifiedMs(deals[i]);
+    if (ms >= bestMs) {
+      best = deals[i];
+      bestMs = ms;
+    }
+  }
+  return best;
+}
+
+/**
+ * HubSpot internal id for the "No show" (no one attended) deal stage in your pipeline.
+ * Prefer HUBSPOT_STAGE_NO_SHOW; HUBSPOT_STAGE_NURTURE is accepted as a legacy alias only.
+ */
+function resolveNoShowStageId() {
+  const explicit = (HUBSPOT_STAGE_NO_SHOW && String(HUBSPOT_STAGE_NO_SHOW).trim()) || "";
+  if (explicit) return explicit;
+  const legacy = (HUBSPOT_STAGE_NURTURE && String(HUBSPOT_STAGE_NURTURE).trim()) || "";
+  if (legacy) {
+    if (!warnedNurtureFallbackForNoShow) {
+      warnedNurtureFallbackForNoShow = true;
+      console.warn(
+        "[hubspot] HUBSPOT_STAGE_NO_SHOW is not set; using HUBSPOT_STAGE_NURTURE for no-shows. " +
+          "Set HUBSPOT_STAGE_NO_SHOW to your HubSpot 'No show' deal stage id.",
+      );
+    }
+    return legacy;
+  }
+  return "";
 }
 
 function extractAttendees(transcript) {
@@ -472,13 +531,23 @@ async function batchReadDeals(dealIds) {
   const json = await hubspotFetch("/crm/v3/objects/deals/batch/read", {
     method: "POST",
     body: JSON.stringify({
-      properties: ["dealstage", "pipeline", "dealname"],
+      properties: ["dealstage", "pipeline", "dealname", "hs_lastmodifieddate"],
       inputs: dealIds.map((id) => ({ id })),
     }),
   });
   return json?.results || [];
 }
 
+/**
+ * Picks a deal in HUBSPOT_PIPELINE_ID to attach Fireflies outcome to.
+ *
+ * 1. If HUBSPOT_STAGE_DISCOVERY_SCHEDULED is set, try deals whose stage is in the list
+ *    (supports comma‑separated IDs, e.g. "stageReplied,stageCalBooked,stageSched").
+ * 2. If none match (wrong stage, stale env ID, or deal never moved to that exact stage),
+ *    fall back to the most recently updated deal in that pipeline — so no‑show / completed
+ *    still moves a real open deal instead of logging SKIP_NO_TARGET_DEAL.
+ * 3. If DISCOVERY_SCHEDULED is unset, any deal in the pipeline (newest if multiple).
+ */
 async function findTargetDealForUpdate(contactId) {
   requireEnv("HUBSPOT_PIPELINE_ID");
   const dealIds = await getDealsAssociatedToContact(contactId);
@@ -486,23 +555,29 @@ async function findTargetDealForUpdate(contactId) {
 
   const deals = await batchReadDeals(dealIds);
 
-  const desiredStage = HUBSPOT_STAGE_DISCOVERY_SCHEDULED || null;
+  const inPipeline = deals.filter((d) => d?.properties?.pipeline === HUBSPOT_PIPELINE_ID);
+  if (!inPipeline.length) return null;
 
-  const candidates = deals.filter((d) => {
-    const pipeline = d?.properties?.pipeline || null;
-    const stage = d?.properties?.dealstage || null;
-    if (pipeline !== HUBSPOT_PIPELINE_ID) return false;
-    if (desiredStage) return stage === desiredStage;
-    return true;
-  });
+  const stageHints = parseCommaSeparatedStageIds(HUBSPOT_STAGE_DISCOVERY_SCHEDULED);
 
-  if (!candidates.length) return null;
-  if (!desiredStage) {
+  if (stageHints.length) {
+    const inHintedStage = inPipeline.filter((d) => stageHints.includes(d?.properties?.dealstage));
+    if (inHintedStage.length) {
+      return pickNewestAssociatedDeal(inHintedStage);
+    }
     console.warn(
-      "[hubspot] HUBSPOT_STAGE_DISCOVERY_SCHEDULED not set; using first deal in pipeline as fallback",
+      "[hubspot] no deal in configured stage(s) " +
+        `${stageHints.join(",")} for contact ${contactId}; ` +
+        "using most-recent deal in pipeline " + HUBSPOT_PIPELINE_ID,
+    );
+  } else {
+    console.warn(
+      "[hubspot] HUBSPOT_STAGE_DISCOVERY_SCHEDULED not set; using most-recent deal in pipeline " +
+        HUBSPOT_PIPELINE_ID,
     );
   }
-  return candidates[0];
+
+  return pickNewestAssociatedDeal(inPipeline);
 }
 
 async function updateDealStage(dealId, newStage) {
@@ -583,12 +658,23 @@ async function validateHubSpotStagesAtStartup() {
     );
   }
   const stageIds = new Set((pipe.stages || []).map((s) => s.id));
+  const noShowStageId = resolveNoShowStageId();
+  if (!noShowStageId) {
+    throw new Error(
+      'Set HUBSPOT_STAGE_NO_SHOW to your HubSpot "No show" deal stage internal id (Settings → Objects → Deals → Pipelines, copy stage id). ' +
+        "If unset, HUBSPOT_STAGE_NURTURE is used as a legacy alias for no-shows only.",
+    );
+  }
+
   const required = [
     ["HUBSPOT_STAGE_DISCOVERY_COMPLETED", HUBSPOT_STAGE_DISCOVERY_COMPLETED],
-    ["HUBSPOT_STAGE_NURTURE", HUBSPOT_STAGE_NURTURE],
+    ["HUBSPOT_STAGE_NO_SHOW (or legacy HUBSPOT_STAGE_NURTURE)", noShowStageId],
   ];
-  if (HUBSPOT_STAGE_DISCOVERY_SCHEDULED) {
-    required.push(["HUBSPOT_STAGE_DISCOVERY_SCHEDULED", HUBSPOT_STAGE_DISCOVERY_SCHEDULED]);
+  const scheduledList = parseCommaSeparatedStageIds(HUBSPOT_STAGE_DISCOVERY_SCHEDULED);
+  for (let i = 0; i < scheduledList.length; i += 1) {
+    const id = scheduledList[i];
+    const name = scheduledList.length > 1 ? `HUBSPOT_STAGE_DISCOVERY_SCHEDULED[${i}]` : "HUBSPOT_STAGE_DISCOVERY_SCHEDULED";
+    required.push([name, id]);
   }
   for (const [name, id] of required) {
     if (!id) continue;
@@ -619,7 +705,15 @@ async function processWebhook(payload, ctx = {}) {
     requireEnv("HUBSPOT_ACCESS_TOKEN");
     requireEnv("HUBSPOT_PIPELINE_ID");
     requireEnv("HUBSPOT_STAGE_DISCOVERY_COMPLETED");
-    requireEnv("HUBSPOT_STAGE_NURTURE");
+    if (!resolveNoShowStageId()) {
+      logLine(
+        cid,
+        "error",
+        "CONFIG",
+        "Missing HUBSPOT_STAGE_NO_SHOW (or legacy HUBSPOT_STAGE_NURTURE) for no-show deal moves",
+      );
+      return;
+    }
 
     const meetingId = pickMeetingId(payload);
     if (!meetingId) {
@@ -694,8 +788,9 @@ async function processWebhook(payload, ctx = {}) {
       return;
     }
 
+    const noShowStage = resolveNoShowStageId();
     await createContactNote(contact.id, noteBody);
-    await updateDealStage(deal.id, HUBSPOT_STAGE_NURTURE);
+    await updateDealStage(deal.id, noShowStage);
 
     const props = contact.properties || {};
     const first = props.firstname || "";
@@ -706,7 +801,7 @@ async function processWebhook(payload, ctx = {}) {
     const contactRef = `HubSpot contact ID ${contact.id} (${props.email || prospectEmail})`;
     const slackText =
       `🚨 No-show: ${[first, last].filter(Boolean).join(" ")}${company ? ` from ${company}` : ""} did not join the discovery call. ` +
-      `Their deal has been moved to Nurture. ${contactRef}`;
+      `Their deal has been moved to the No show stage. ${contactRef}`;
 
     try {
       await sendSlackNoShowMessage(slackText);

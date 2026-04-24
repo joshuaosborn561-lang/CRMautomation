@@ -30,7 +30,7 @@ Implementation lives in:
 - `HUBSPOT_ACCESS_TOKEN`
 - `HUBSPOT_PIPELINE_ID`
 - `HUBSPOT_STAGE_DISCOVERY_COMPLETED`
-- `HUBSPOT_STAGE_NURTURE`
+- `HUBSPOT_STAGE_NO_SHOW` (no-shows; `HUBSPOT_STAGE_NURTURE` is an optional legacy alias)
 - `GEMINI_API_KEY`
 
 Optional:

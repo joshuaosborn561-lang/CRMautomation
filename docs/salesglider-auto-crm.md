@@ -87,7 +87,7 @@ Flow:
 Stage mapping (configured via env vars):
 
 - If `COMPLETED` → deal moves to **Discovery Completed**
-- If `NO_SHOW` → deal moves to **Nurture** (HubSpot workflows may create follow-up tasks + nurture enrollment)
+- If `NO_SHOW` → deal moves to **No show** (separate from long-term nurture; HubSpot workflows may still add tasks)
 
 Environment variables (service):
 
@@ -97,7 +97,7 @@ Environment variables (service):
 - `HUBSPOT_PIPELINE_ID`
 - `HUBSPOT_STAGE_DISCOVERY_SCHEDULED` (optional but recommended)
 - `HUBSPOT_STAGE_DISCOVERY_COMPLETED`
-- `HUBSPOT_STAGE_NURTURE`
+- `HUBSPOT_STAGE_NO_SHOW` (or legacy `HUBSPOT_STAGE_NURTURE` if unset)
 - `SLACK_WEBHOOK_URL` (optional)
 
 ## Event → action map (who owns it)
@@ -108,7 +108,7 @@ Environment variables (service):
 | LinkedIn accept/reply | Zapier (HeyReach → HS) | Contact + note; deal at **Replied** |
 | Prospect books discovery | Cal.com native | Deal → **Discovery Scheduled**; Zoom link generated |
 | Discovery call occurs | Fireflies native | Transcript/summary logged (native behavior) |
-| Post-call Fireflies webhook | Railway endpoint | Deal → **Discovery Completed** or **Nurture** + HubSpot note |
+| Post-call Fireflies webhook | Railway endpoint | Deal → **Discovery Completed** or **No show** + HubSpot note |
 | No-show follow-up | HubSpot workflows | Tasks + nurture enrollment |
 | Zoom Phone calls | Zoom Phone native | Call logged with recording on contact |
 | Gmail thread | HubSpot Gmail sync | Email on contact timeline |
