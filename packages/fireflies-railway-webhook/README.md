@@ -10,7 +10,8 @@
 - `HUBSPOT_ACCESS_TOKEN`
 - `HUBSPOT_PIPELINE_ID`
 - `HUBSPOT_STAGE_DISCOVERY_COMPLETED`
-- `HUBSPOT_STAGE_NURTURE`
+- `HUBSPOT_STAGE_NO_SHOW` — internal id of the **No show** deal stage (Settings → Data management → Objects → Deals → Pipelines → open your pipeline → copy the stage’s internal id for “No show”)
+- `HUBSPOT_STAGE_NURTURE` — **optional; legacy only.** If `HUBSPOT_STAGE_NO_SHOW` is unset, no-shows use this id (log warns once; set `HUBSPOT_STAGE_NO_SHOW` to your real No show stage)
 - `SLACK_WEBHOOK_URL` (optional at runtime; if unset the app will skip Slack notification)
 - `CALENDLY_API_KEY` (optional today, reserved for Calendly enrichment path)
 
@@ -23,7 +24,7 @@
 ## Recommended (optional) environment variable
 - `HUBSPOT_STAGE_DISCOVERY_SCHEDULED`
   - **Optional.** Comma‑separated internal stage IDs are allowed (e.g. `repliedId,discoveryBookedId`). The app will **prefer** a contact’s deal in one of those stages within `HUBSPOT_PIPELINE_ID`.
-  - If **no** deal matches (wrong stage, stale ID, or Calendly/HubSpot moved the deal first), the app **falls back** to the **most recently modified** deal for that contact **in the same pipeline** so Fireflies can still set **Nurture** (no-show) or **Discovery Completed** instead of `SKIP_NO_TARGET_DEAL`.
+  - If **no** deal matches (wrong stage, stale ID, or Calendly/HubSpot moved the deal first), the app **falls back** to the **most recently modified** deal for that contact **in the same pipeline** so Fireflies can still set **No show** or **Discovery Completed** instead of `SKIP_NO_TARGET_DEAL`.
   - If **unset**, the most recently modified deal in the pipeline is used when multiple exist.
 
 ## Reliability / tuning (optional)

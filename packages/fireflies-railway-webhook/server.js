@@ -20,9 +20,12 @@ const {
   HUBSPOT_PIPELINE_ID,
   HUBSPOT_STAGE_DISCOVERY_COMPLETED,
   HUBSPOT_STAGE_NURTURE,
+  HUBSPOT_STAGE_NO_SHOW,
   SLACK_WEBHOOK_URL,
   HUBSPOT_STAGE_DISCOVERY_SCHEDULED,
 } = process.env;
+
+let warnedNurtureFallbackForNoShow = false;
 
 const FIREFLIES_INITIAL_WAIT_MS = Number(process.env.FIREFLIES_INITIAL_WAIT_MS || 15000);
 const FIREFLIES_RETRY_WAIT_MS = Number(process.env.FIREFLIES_RETRY_WAIT_MS || 30000);
@@ -119,6 +122,27 @@ function pickNewestAssociatedDeal(deals) {
     }
   }
   return best;
+}
+
+/**
+ * HubSpot internal id for the "No show" (no one attended) deal stage in your pipeline.
+ * Prefer HUBSPOT_STAGE_NO_SHOW; HUBSPOT_STAGE_NURTURE is accepted as a legacy alias only.
+ */
+function resolveNoShowStageId() {
+  const explicit = (HUBSPOT_STAGE_NO_SHOW && String(HUBSPOT_STAGE_NO_SHOW).trim()) || "";
+  if (explicit) return explicit;
+  const legacy = (HUBSPOT_STAGE_NURTURE && String(HUBSPOT_STAGE_NURTURE).trim()) || "";
+  if (legacy) {
+    if (!warnedNurtureFallbackForNoShow) {
+      warnedNurtureFallbackForNoShow = true;
+      console.warn(
+        "[hubspot] HUBSPOT_STAGE_NO_SHOW is not set; using HUBSPOT_STAGE_NURTURE for no-shows. " +
+          "Set HUBSPOT_STAGE_NO_SHOW to your HubSpot 'No show' deal stage id.",
+      );
+    }
+    return legacy;
+  }
+  return "";
 }
 
 function extractAttendees(transcript) {
@@ -634,9 +658,17 @@ async function validateHubSpotStagesAtStartup() {
     );
   }
   const stageIds = new Set((pipe.stages || []).map((s) => s.id));
+  const noShowStageId = resolveNoShowStageId();
+  if (!noShowStageId) {
+    throw new Error(
+      'Set HUBSPOT_STAGE_NO_SHOW to your HubSpot "No show" deal stage internal id (Settings → Objects → Deals → Pipelines, copy stage id). ' +
+        "If unset, HUBSPOT_STAGE_NURTURE is used as a legacy alias for no-shows only.",
+    );
+  }
+
   const required = [
     ["HUBSPOT_STAGE_DISCOVERY_COMPLETED", HUBSPOT_STAGE_DISCOVERY_COMPLETED],
-    ["HUBSPOT_STAGE_NURTURE", HUBSPOT_STAGE_NURTURE],
+    ["HUBSPOT_STAGE_NO_SHOW (or legacy HUBSPOT_STAGE_NURTURE)", noShowStageId],
   ];
   const scheduledList = parseCommaSeparatedStageIds(HUBSPOT_STAGE_DISCOVERY_SCHEDULED);
   for (let i = 0; i < scheduledList.length; i += 1) {
@@ -673,7 +705,15 @@ async function processWebhook(payload, ctx = {}) {
     requireEnv("HUBSPOT_ACCESS_TOKEN");
     requireEnv("HUBSPOT_PIPELINE_ID");
     requireEnv("HUBSPOT_STAGE_DISCOVERY_COMPLETED");
-    requireEnv("HUBSPOT_STAGE_NURTURE");
+    if (!resolveNoShowStageId()) {
+      logLine(
+        cid,
+        "error",
+        "CONFIG",
+        "Missing HUBSPOT_STAGE_NO_SHOW (or legacy HUBSPOT_STAGE_NURTURE) for no-show deal moves",
+      );
+      return;
+    }
 
     const meetingId = pickMeetingId(payload);
     if (!meetingId) {
@@ -748,8 +788,9 @@ async function processWebhook(payload, ctx = {}) {
       return;
     }
 
+    const noShowStage = resolveNoShowStageId();
     await createContactNote(contact.id, noteBody);
-    await updateDealStage(deal.id, HUBSPOT_STAGE_NURTURE);
+    await updateDealStage(deal.id, noShowStage);
 
     const props = contact.properties || {};
     const first = props.firstname || "";
@@ -760,7 +801,7 @@ async function processWebhook(payload, ctx = {}) {
     const contactRef = `HubSpot contact ID ${contact.id} (${props.email || prospectEmail})`;
     const slackText =
       `🚨 No-show: ${[first, last].filter(Boolean).join(" ")}${company ? ` from ${company}` : ""} did not join the discovery call. ` +
-      `Their deal has been moved to Nurture. ${contactRef}`;
+      `Their deal has been moved to the No show stage. ${contactRef}`;
 
     try {
       await sendSlackNoShowMessage(slackText);

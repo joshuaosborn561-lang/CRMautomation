@@ -10,7 +10,7 @@ const CLASSIFICATION_RULES = {
  *
  * If Fireflies omits speaker diarization (0 speakers) but sentence count and duration
  * clearly indicate a real conversation, we still classify COMPLETED so good meetings
- * are not pushed to Nurture on a bad or overcautious model answer.
+ * are not pushed to the No show stage on a bad or overcautious model answer.
  */
 function ruleBasedMeetingClassification(extracted) {
   if (!extracted || typeof extracted !== "object") return null;
